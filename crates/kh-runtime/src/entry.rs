@@ -33,6 +33,27 @@ pub enum EntryError {
 /// - no Rust objects requiring Drop need to run after the jump (or the trap
 ///   path exits the process).
 pub unsafe fn jump_to_guest(entry: u64, sp: u64) -> Result<(), EntryError> {
+    // SAFETY: same invariants; extra arg regs zeroed.
+    unsafe { jump_to_guest_args(entry, sp, 0, 0, 0, 0) }
+}
+
+/// Like [`jump_to_guest`], but places `x0`–`x3` before the branch (pthread start).
+///
+/// Does not return: guest must `exit` the process or `bsdthread_terminate` the
+/// host thread (trap backend redirects to host `pthread_exit`).
+///
+/// # Safety
+///
+/// Same as [`jump_to_guest`], plus argument registers must match the guest
+/// entry convention (Darwin `_pthread_start`: pthread, port, func, arg).
+pub unsafe fn jump_to_guest_args(
+    entry: u64,
+    sp: u64,
+    x0: u64,
+    x1: u64,
+    x2: u64,
+    x3: u64,
+) -> Result<(), EntryError> {
     if entry == 0 {
         return Err(EntryError::InvalidEntry(entry));
     }
@@ -42,7 +63,7 @@ pub unsafe fn jump_to_guest(entry: u64, sp: u64) -> Result<(), EntryError> {
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (entry, sp);
+        let _ = (entry, sp, x0, x1, x2, x3);
         return Err(EntryError::UnsupportedArch);
     }
 
@@ -53,10 +74,22 @@ pub unsafe fn jump_to_guest(entry: u64, sp: u64) -> Result<(), EntryError> {
         unsafe {
             std::arch::asm!(
                 "mov sp, {sp}",
+                "mov x0, {arg0}",
+                "mov x1, {arg1}",
+                "mov x2, {arg2}",
+                "mov x3, {arg3}",
+                "mov x4, xzr",
+                "mov x5, xzr",
+                "mov x6, xzr",
+                "mov x7, xzr",
                 "mov x29, xzr",
                 "mov x30, xzr",
                 "br {entry}",
                 sp = in(reg) sp,
+                arg0 = in(reg) x0,
+                arg1 = in(reg) x1,
+                arg2 = in(reg) x2,
+                arg3 = in(reg) x3,
                 entry = in(reg) entry,
                 options(noreturn),
             );

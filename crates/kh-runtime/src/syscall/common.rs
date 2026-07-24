@@ -21,13 +21,15 @@ pub struct SyscallArgs {
     pub pc: u64,
     /// Syscall number (`x16`).
     pub number: u32,
-    /// `x0` … `x5` argument registers.
+    /// `x0` … `x6` argument registers (Darwin allows up to 8; we need 7 for
+    /// `bsdthread_register`).
     pub x0: u64,
     pub x1: u64,
     pub x2: u64,
     pub x3: u64,
     pub x4: u64,
     pub x5: u64,
+    pub x6: u64,
 }
 
 /// Result of dispatching one syscall.
@@ -72,6 +74,17 @@ impl SyscallResult {
         Self {
             name: "exit",
             outcome: TrapOutcome::Exit { code },
+            retval: None,
+            error: false,
+        }
+    }
+
+    /// End the current guest **thread** only (`bsdthread_terminate`).
+    #[must_use]
+    pub const fn thread_exit(name: &'static str) -> Self {
+        Self {
+            name,
+            outcome: TrapOutcome::ThreadExit,
             retval: None,
             error: false,
         }

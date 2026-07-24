@@ -51,6 +51,14 @@ pub enum BsdSyscall {
     Sigprocmask,
     /// `sigaction`.
     Sigaction,
+    /// `bsdthread_create`.
+    BsdthreadCreate,
+    /// `bsdthread_terminate`.
+    BsdthreadTerminate,
+    /// `bsdthread_register`.
+    BsdthreadRegister,
+    /// `thread_selfid`.
+    ThreadSelfid,
 }
 
 impl BsdSyscall {
@@ -82,6 +90,10 @@ impl BsdSyscall {
             Self::Sysctlbyname => "sysctlbyname",
             Self::Sigprocmask => "sigprocmask",
             Self::Sigaction => "sigaction",
+            Self::BsdthreadCreate => "bsdthread_create",
+            Self::BsdthreadTerminate => "bsdthread_terminate",
+            Self::BsdthreadRegister => "bsdthread_register",
+            Self::ThreadSelfid => "thread_selfid",
         }
     }
 
@@ -113,6 +125,10 @@ impl BsdSyscall {
             // Prefer 64-bit variants as primary; aliases in lookup.
             Self::Stat => 338,
             Self::Fstat => 339,
+            Self::BsdthreadCreate => 360,
+            Self::BsdthreadTerminate => 361,
+            Self::BsdthreadRegister => 366,
+            Self::ThreadSelfid => 372,
             Self::Openat => 463,
         }
     }
@@ -145,6 +161,10 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         266 => Some(BsdSyscall::ClockGettime),
         274 => Some(BsdSyscall::Sysctlbyname),
         327 => Some(BsdSyscall::Issetugid),
+        360 => Some(BsdSyscall::BsdthreadCreate),
+        361 => Some(BsdSyscall::BsdthreadTerminate),
+        366 => Some(BsdSyscall::BsdthreadRegister),
+        372 => Some(BsdSyscall::ThreadSelfid),
         463 => Some(BsdSyscall::Openat),
         _ => None,
     }
@@ -186,6 +206,10 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (327, "issetugid"),
         (338, "stat"),
         (339, "fstat"),
+        (360, "bsdthread_create"),
+        (361, "bsdthread_terminate"),
+        (366, "bsdthread_register"),
+        (372, "thread_selfid"),
         (463, "openat"),
     ]
 }

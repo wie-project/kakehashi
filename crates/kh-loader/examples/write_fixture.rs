@@ -11,8 +11,9 @@ use std::process::ExitCode;
 
 use kh_loader::fixture::{
     ROUNDTRIP_PAYLOAD, arm64_dylib_add, arm64_dylib_ctor, arm64_libsystem_stub,
-    call_dylib_chained_exit, call_dylib_exit, call_libsystem_exit, ctor_main_exit,
-    errno_unknown_then_exit, memory_file_roundtrip, minimal_arm64_execute, mmap_touch_exit,
+    bsdthread_create_join, call_dylib_chained_exit, call_dylib_exit, call_libsystem_exit,
+    ctor_main_exit, errno_unknown_then_exit, memory_file_roundtrip, minimal_arm64_execute,
+    mmap_touch_exit,
 };
 
 fn main() -> ExitCode {
@@ -31,6 +32,10 @@ fn main() -> ExitCode {
                 errno_unknown_then_exit(),
             ),
             (root.join("mmap_touch_exit.macho"), mmap_touch_exit()),
+            (
+                root.join("bsdthread_create_join.macho"),
+                bsdthread_create_join(),
+            ),
             (
                 root.join("memory_file_roundtrip.macho"),
                 memory_file_roundtrip(),
@@ -62,6 +67,10 @@ fn main() -> ExitCode {
             errno_unknown_then_exit(),
         )],
         Some("mmap") => vec![(root.join("mmap_touch_exit.macho"), mmap_touch_exit())],
+        Some("thread" | "bsdthread") => vec![(
+            root.join("bsdthread_create_join.macho"),
+            bsdthread_create_join(),
+        )],
         Some("roundtrip") => vec![
             (
                 root.join("memory_file_roundtrip.macho"),
@@ -100,7 +109,7 @@ fn main() -> ExitCode {
         }
         Some(other) => {
             eprintln!(
-                "unknown fixture '{other}'; use all|minimal|errno|mmap|roundtrip|dylib|ctor|libsystem|chained|*.macho"
+                "unknown fixture '{other}'; use all|minimal|errno|mmap|thread|roundtrip|dylib|ctor|libsystem|chained|*.macho"
             );
             return ExitCode::from(2);
         }

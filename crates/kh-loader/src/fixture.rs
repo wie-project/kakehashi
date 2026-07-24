@@ -1870,6 +1870,154 @@ pub fn errno_unknown_then_exit() -> Vec<u8> {
     arm64_execute_with_text(&text)
 }
 
+/// Micro program: `bsdthread_register` + `bsdthread_create` worker, join via flag, `exit(0)`.
+///
+/// Worker (via registered start trampoline) writes `T\\n`, stores a flag, then
+/// `bsdthread_terminate`. Main spins on the flag (no syscall) and exits 0.
+/// Live only on Linux aarch64 (host pthread spawn).
+#[must_use]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::as_conversions,
+    clippy::too_many_lines
+)]
+pub fn bsdthread_create_join() -> Vec<u8> {
+    // Instruction stream built linearly; ADR/CBZ patched with final offsets.
+    let mut text: Vec<u8> = Vec::with_capacity(256);
+    let emit = |text: &mut Vec<u8>, w: u32| push_u32(text, w);
+    #[allow(clippy::integer_division)]
+    let icount = |text: &[u8]| text.len() / 4;
+
+    // --- main ---
+    // sub sp, sp, #16 ; str xzr, [sp]  (flag = 0)
+    emit(&mut text, sub_imm(31, 31, 16));
+    emit(&mut text, str_x_uoff(31, 31, 0)); // str xzr, [sp]
+
+    // bsdthread_register(start, 0, 0, 0, 0, 0, 0)
+    let adr_start_idx = icount(&text);
+    emit(&mut text, 0); // ADR x0, start
+    emit(&mut text, movz(1, 0));
+    emit(&mut text, movz(2, 0));
+    emit(&mut text, movz(3, 0));
+    emit(&mut text, movz(4, 0));
+    emit(&mut text, movz(5, 0));
+    emit(&mut text, movz(6, 0));
+    emit(&mut text, movz(0x10, 366));
+    emit(&mut text, svc80());
+    let bcs_reg = icount(&text);
+    emit(&mut text, 0); // b.cs fail
+
+    // mmap(0, 0x4000, PROT_RW=3, MAP_ANON|PRIVATE=0x1002, -1, 0)
+    emit(&mut text, movz(0, 0));
+    emit(&mut text, movz(1, 0x4000));
+    emit(&mut text, movz(2, 3));
+    emit(&mut text, movz(3, 0x1002));
+    emit(&mut text, 0x9280_0004); // movn x4, #0
+    emit(&mut text, movz(5, 0));
+    emit(&mut text, movz(0x10, 197));
+    emit(&mut text, svc80());
+    let bcs_map = icount(&text);
+    emit(&mut text, 0); // b.cs fail
+    emit(&mut text, mov_reg(19, 0)); // x19 = stack base
+
+    // raw_top = base + 0x4000. Guest SP must sit *inside* the map so the
+    // kernel can push a SIGTRAP frame (SP == exclusive end is unmapped).
+    // sp = raw_top - 0x20; pthread = raw_top - 0x200 (below initial SP).
+    emit(&mut text, add_imm_lsl12(20, 19, 4)); // x20 = raw_top
+    emit(&mut text, sub_imm(2, 20, 0x20)); // x2 = sp
+    emit(&mut text, sub_imm(3, 20, 0x200)); // x3 = pthread
+
+    // bsdthread_create(worker, flag_ptr, sp, pthread, 0)
+    let adr_worker_idx = icount(&text);
+    emit(&mut text, 0); // ADR x0, worker
+    emit(&mut text, add_imm(1, 31, 0)); // x1 = sp (flag)
+    // x2, x3 already set
+    emit(&mut text, movz(4, 0));
+    emit(&mut text, movz(0x10, 360));
+    emit(&mut text, svc80());
+    let bcs_create = icount(&text);
+    emit(&mut text, 0); // b.cs fail
+
+    // spin: ldrb w0, [sp]; cbz w0, spin
+    let spin_idx = icount(&text);
+    emit(&mut text, ldrb_x(0, 31)); // ldrb w0, [sp]
+    let cbz_idx = icount(&text);
+    emit(&mut text, 0); // cbz w0, spin
+
+    // exit(0)
+    emit(&mut text, movz(0, 0));
+    emit(&mut text, movz(0x10, 1));
+    emit(&mut text, svc80());
+
+    // fail: exit(1)
+    let fail_idx = icount(&text);
+    emit(&mut text, movz(0, 1));
+    emit(&mut text, movz(0x10, 1));
+    emit(&mut text, svc80());
+
+    // --- worker(flag_ptr in x0) ---
+    let worker_idx = icount(&text);
+    emit(&mut text, mov_reg(19, 0)); // x19 = flag
+    emit(&mut text, movz(0, 1)); // fd=1
+    let adr_msg_idx = icount(&text);
+    emit(&mut text, 0); // ADR x1, msg
+    emit(&mut text, movz(2, 2)); // len
+    emit(&mut text, movz(0x10, 4)); // write
+    emit(&mut text, svc80());
+    emit(&mut text, 0x5280_0000 | (1_u32 << 5)); // movz w0, #1
+    emit(&mut text, strb_x(0, 19)); // strb w0, [x19]
+    emit(&mut text, 0xD503_3BBF); // dmb ish
+    emit(&mut text, 0xD65F_03C0); // ret
+
+    // --- start trampoline (x0=pthread, x1=port, x2=func, x3=arg) ---
+    let start_idx = icount(&text);
+    emit(&mut text, 0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
+    emit(&mut text, mov_reg(0, 3)); // x0 = arg
+    emit(&mut text, 0xD63F_0000 | (2_u32 << 5)); // blr x2
+    emit(&mut text, movz(0, 0));
+    emit(&mut text, movz(1, 0));
+    emit(&mut text, movz(2, 0));
+    emit(&mut text, movz(3, 0));
+    emit(&mut text, movz(0x10, 361)); // bsdthread_terminate
+    emit(&mut text, svc80());
+    emit(&mut text, 0x1400_0000); // b .  (hang)
+
+    // msg: "T\n"
+    let msg_off = text.len();
+    text.extend_from_slice(b"T\n");
+    while !text.len().is_multiple_of(4) {
+        text.push(0);
+    }
+
+    // --- patches ---
+    let fail_imm = i32::try_from(fail_idx).unwrap_or(0) - i32::try_from(bcs_reg).unwrap_or(0);
+    patch_u32(&mut text, bcs_reg, b_cond(0x2, fail_imm)); // CS
+    let fail_imm = i32::try_from(fail_idx).unwrap_or(0) - i32::try_from(bcs_map).unwrap_or(0);
+    patch_u32(&mut text, bcs_map, b_cond(0x2, fail_imm));
+    let fail_imm = i32::try_from(fail_idx).unwrap_or(0) - i32::try_from(bcs_create).unwrap_or(0);
+    patch_u32(&mut text, bcs_create, b_cond(0x2, fail_imm));
+
+    let spin_imm = i32::try_from(spin_idx).unwrap_or(0) - i32::try_from(cbz_idx).unwrap_or(0);
+    patch_u32(&mut text, cbz_idx, cbz_w(0, spin_imm));
+
+    let start_byte =
+        (i32::try_from(start_idx).unwrap_or(0) - i32::try_from(adr_start_idx).unwrap_or(0)) * 4;
+    patch_u32(&mut text, adr_start_idx, adr(0, start_byte));
+
+    let worker_byte =
+        (i32::try_from(worker_idx).unwrap_or(0) - i32::try_from(adr_worker_idx).unwrap_or(0)) * 4;
+    patch_u32(&mut text, adr_worker_idx, adr(0, worker_byte));
+
+    let msg_byte = i32::try_from(msg_off).unwrap_or(0)
+        - (i32::try_from(adr_msg_idx).unwrap_or(0) * 4);
+    patch_u32(&mut text, adr_msg_idx, adr(1, msg_byte));
+
+    arm64_execute_with_text(&text)
+}
+
 /// Micro program: anonymous `mmap` + write byte + `munmap` + `exit(0)`.
 ///
 /// Exercises memory syscalls without needing a bottle root.
@@ -2147,6 +2295,18 @@ const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     0x9100_0000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
 }
 
+/// `ADD Xd, Xn, #imm12, LSL #12` (64-bit).
+const fn add_imm_lsl12(rd: u32, rn: u32, imm12: u32) -> u32 {
+    0x9100_0000 | (1 << 22) | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+}
+
+/// `CBZ Wt, #imm` (`imm` in **instructions**, signed).
+#[allow(clippy::as_conversions, clippy::cast_sign_loss)]
+const fn cbz_w(rt: u32, imm_instr: i32) -> u32 {
+    let imm19 = imm_instr.cast_unsigned() & 0x7_FFFF;
+    0x3400_0000 | (imm19 << 5) | (rt & 0x1F)
+}
+
 /// `MOV Xd, Xm` via `ORR Xd, XZR, Xm`.
 const fn mov_reg(rd: u32, rm: u32) -> u32 {
     0xAA00_03E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
@@ -2312,6 +2472,14 @@ mod tests {
             let mach = Mach::parse(&bytes).expect("goblin parse");
             assert!(matches!(mach, Mach::Binary(_)));
         }
+    }
+
+    #[test]
+    fn goblin_accepts_bsdthread_fixture() {
+        let bytes = bsdthread_create_join();
+        let mach = Mach::parse(&bytes).expect("goblin parse");
+        assert!(matches!(mach, Mach::Binary(_)));
+        assert!(bytes.len() > 100);
     }
 
     #[test]

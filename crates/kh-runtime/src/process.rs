@@ -19,6 +19,26 @@ pub(crate) struct SoftSigAct {
     pub flags: i32,
 }
 
+/// Values from Darwin `bsdthread_register` (libpthread start trampoline, etc.).
+///
+/// Extra fields are retained for future workq/TLS wiring even when unused today.
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
+pub(crate) struct BsdThreadReg {
+    /// Userland start trampoline (`_pthread_start`).
+    pub threadstart: u64,
+    /// Workqueue thread entry (unused in micro; stored for completeness).
+    pub wqthread: u64,
+    /// Registration flags from libpthread.
+    pub flags: u32,
+    /// Stack address hint (unused in micro).
+    pub stack_addr_hint: u64,
+    /// TSD offset within the pthread structure.
+    pub tsd_offset: u32,
+    /// Dispatch queue offset within the pthread structure.
+    pub dispatchqueue_offset: u32,
+}
+
 impl SoftSigAct {
     pub(crate) const fn zero() -> Self {
         Self {
@@ -85,6 +105,7 @@ pub struct ProcessState {
     bottle_root: Option<PathBuf>,
     sig_mask: u32,
     sigactions: [SoftSigAct; 32],
+    bsdthread: Option<BsdThreadReg>,
     syscall_count: u64,
     max_syscalls: u64,
 }
@@ -98,18 +119,30 @@ impl ProcessState {
             bottle_root: None,
             sig_mask: 0,
             sigactions: [SoftSigAct::zero(); 32],
+            bsdthread: None,
             syscall_count: 0,
             max_syscalls: 256,
         }
     }
 
-    /// Resets FD table, soft signals, and counters. Preserves bottle root.
+    /// Resets FD table, soft signals, thread reg, and counters. Preserves bottle root.
     pub fn reset_run(&mut self, max_syscalls: usize) {
         self.fds.reset();
         self.sig_mask = 0;
         self.sigactions = [SoftSigAct::zero(); 32];
+        self.bsdthread = None;
         self.syscall_count = 0;
         self.max_syscalls = u64::try_from(max_syscalls).unwrap_or(256);
+        crate::thread::reset_thread_runtime();
+    }
+
+    #[must_use]
+    pub(crate) fn bsdthread(&self) -> Option<BsdThreadReg> {
+        self.bsdthread
+    }
+
+    pub(crate) fn set_bsdthread(&mut self, reg: BsdThreadReg) {
+        self.bsdthread = Some(reg);
     }
 
     #[must_use]

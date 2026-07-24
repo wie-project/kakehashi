@@ -69,6 +69,8 @@ pub enum TrapOutcome {
     },
     /// Guest should resume after the trap instruction.
     Continue,
+    /// Guest called `bsdthread_terminate` (or equivalent): end this host thread only.
+    ThreadExit,
 }
 
 /// Configuration for the trap backend.
@@ -296,6 +298,7 @@ unsafe extern "C" fn trap_sigaction(
     let x3 = m.regs[3];
     let x4 = m.regs[4];
     let x5 = m.regs[5];
+    let x6 = m.regs[6];
     let x16 = m.regs[16];
 
     let sys_no = u32::try_from(x16).unwrap_or(u32::MAX);
@@ -308,6 +311,7 @@ unsafe extern "C" fn trap_sigaction(
         x3,
         x4,
         x5,
+        x6,
     });
 
     push_event(TrapEvent {
@@ -337,6 +341,14 @@ unsafe extern "C" fn trap_sigaction(
         }
         TrapOutcome::Continue => {
             m.pc = pc.wrapping_add(4);
+        }
+        TrapOutcome::ThreadExit => {
+            // Redirect ucontext to a host `pthread_exit` trampoline on this
+            // thread's original stack (see `crate::thread`). Main thread
+            // (no host frame) falls back to process exit.
+            if !crate::thread::redirect_ucontext_to_host_exit(m) {
+                finish_with_exit_code(0);
+            }
         }
     }
 }

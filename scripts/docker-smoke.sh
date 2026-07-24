@@ -31,6 +31,10 @@ echo "==> kh run --expect-code 0 (errno unknown then exit)"
 echo "==> kh run --expect-code 0 (mmap+munmap+exit)"
 "${KH[@]}" run --expect-code 0 tests/fixtures/mmap_touch_exit.macho
 
+echo "==> kh run --expect-code 0 (bsdthread create + join)"
+thread_out="$("${KH[@]}" run --expect-code 0 tests/fixtures/bsdthread_create_join.macho)"
+test "${thread_out}" = "T"
+
 echo "==> kh run --expect-code 0 (file mmap roundtrip)"
 # Fresh container keeps pristine payload from the image layer.
 "${KH[@]}" run --expect-code 0 tests/fixtures/memory_file_roundtrip.macho

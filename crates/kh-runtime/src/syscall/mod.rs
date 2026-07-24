@@ -11,6 +11,7 @@
 //! - [`fs`] — access/stat/fstat
 //! - [`mem_sys`] — mmap/mprotect/munmap/msync
 //! - [`process`] — exit/getpid/issetugid
+//! - [`thread_sys`] — bsdthread_*/thread_selfid
 //! - [`time_sys`] — gettimeofday/clock_gettime
 //! - [`sysctl`] — sysctl/sysctlbyname
 //! - [`signal`] — sigprocmask/sigaction (soft)
@@ -25,6 +26,7 @@ mod process;
 mod signal;
 mod sysctl;
 mod table;
+mod thread_sys;
 mod time_sys;
 
 use crate::process as proc_state;
@@ -81,6 +83,10 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Sysctlbyname) => sysctl::handle_sysctlbyname(args),
         Some(BsdSyscall::Sigprocmask) => signal::handle_sigprocmask(args),
         Some(BsdSyscall::Sigaction) => signal::handle_sigaction(args),
+        Some(BsdSyscall::BsdthreadCreate) => thread_sys::handle_bsdthread_create(args),
+        Some(BsdSyscall::BsdthreadTerminate) => thread_sys::handle_bsdthread_terminate(args),
+        Some(BsdSyscall::BsdthreadRegister) => thread_sys::handle_bsdthread_register(args),
+        Some(BsdSyscall::ThreadSelfid) => thread_sys::handle_thread_selfid(),
         None => SyscallResult::err("unknown", ENOSYS),
     }
 }
@@ -113,6 +119,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         }
     }
 
@@ -143,6 +150,10 @@ mod tests {
         assert_eq!(lookup(202), Some(BsdSyscall::Sysctl));
         assert_eq!(lookup(266), Some(BsdSyscall::ClockGettime));
         assert_eq!(lookup(274), Some(BsdSyscall::Sysctlbyname));
+        assert_eq!(lookup(360), Some(BsdSyscall::BsdthreadCreate));
+        assert_eq!(lookup(361), Some(BsdSyscall::BsdthreadTerminate));
+        assert_eq!(lookup(366), Some(BsdSyscall::BsdthreadRegister));
+        assert_eq!(lookup(372), Some(BsdSyscall::ThreadSelfid));
         assert_eq!(lookup(463), Some(BsdSyscall::Openat));
         assert_eq!(lookup(9999), None);
     }
@@ -223,6 +234,7 @@ mod tests {
             x3: DARWIN_MAP_ANON | DARWIN_MAP_PRIVATE,
             x4: u64::MAX,
             x5: 0,
+            x6: 0,
         });
         assert_eq!(r.name, "mmap");
         assert!(!r.error, "mmap failed: {:?}", r.retval);
@@ -239,6 +251,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!r2.error);
 
@@ -251,6 +264,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!r3.error);
         registry_clear();
@@ -288,6 +302,7 @@ mod tests {
             x3: DARWIN_MAP_SHARED,
             x4: gfd,
             x5: 0,
+            x6: 0,
         });
         assert!(!map.error, "mmap file: {:?}", map.retval);
         let addr = map.retval.expect("map");
@@ -303,6 +318,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!sync.error, "msync: {:?}", sync.retval);
 
@@ -315,6 +331,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!unmap.error);
         assert!(!dispatch(args(6, gfd, 0, 0)).error);
@@ -380,6 +397,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!r.error, "sysctlbyname: {:?}", r.retval);
         let ncpu = guest_read_i32(val_va);
@@ -411,6 +429,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!r.error, "sigprocmask: {:?}", r.retval);
 
@@ -520,6 +539,7 @@ mod tests {
             x3: 0,
             x4: 0,
             x5: 0,
+            x6: 0,
         });
         assert!(!r.error, "openat: {:?}", r.retval);
         let gfd = r.retval.unwrap();

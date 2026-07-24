@@ -52,6 +52,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./target/debug/kh run --expect-code 42 tests/fixtures/call_dylib_chained.macho
 # Dylib constructor runs before main (prints "ctor"):
 ./target/debug/kh run --expect-code 0 tests/fixtures/ctor_main.macho
+# Guest worker thread (bsdthread_create) writes "T" then main joins (Linux aarch64):
+./target/debug/kh run --expect-code 0 tests/fixtures/bsdthread_create_join.macho
 # Absolute libSystem via synthetic bottle (maps + GOT call → exit 77):
 ./target/debug/kh run --dry-load --root tests/fixtures/bottle \
   tests/fixtures/call_libsystem.macho
