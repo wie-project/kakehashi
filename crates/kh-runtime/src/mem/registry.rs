@@ -1,10 +1,18 @@
-//! Process-wide guest address registry for trap-path validation and dynamic maps.
+//! Guest address-space tracking for trap-path validation and dynamic maps.
 //!
-//! Image and stack regions are registered as **borrowed** (owned by `GuestMemory`
-//! / the stack `MappedRegion`). Guest `mmap` (anonymous or file-backed) registers
-//! **owned** regions that the registry unmaps on `munmap` / `clear`.
+//! [`AddressSpace`] owns the region list for one guest process. Image and stack
+//! regions are registered as **borrowed** (owned by `GuestMemory` / the stack
+//! `MappedRegion`). Guest `mmap` registers **owned** regions that the space
+//! unmaps on `munmap` / `clear`.
+//!
+//! Trap handlers and BSD syscalls use a process-wide **active** address space
+//! installed before guest entry (see [`install_active`] / free-function
+//! wrappers). Unit tests can exercise a local [`AddressSpace`] without touching
+//! the active slot, or use the wrappers under [`test_lock`].
 
 use std::sync::Mutex;
+
+use crate::host;
 
 use super::map::{MappedRegion, VM_PROT_READ, VM_PROT_WRITE};
 
@@ -19,12 +27,13 @@ struct RegRegion {
     ptr: *mut u8,
     /// Darwin `VM_PROT_*` bits.
     prot: u32,
-    /// When true, [`clear`] / `munmap` will `munmap` the host pages.
+    /// When true, [`AddressSpace::clear`] / `munmap` will `munmap` the host pages.
     owned: bool,
 }
 
-// SAFETY: registry is process-global and only mutated under the mutex from the
-// single guest thread + setup path; pointers uniquely refer to live maps.
+// SAFETY: regions are only mutated while the owning `AddressSpace` is locked
+// (active slot mutex or exclusive local borrow); pointers uniquely refer to
+// live maps for the single guest process model.
 unsafe impl Send for RegRegion {}
 
 impl RegRegion {
@@ -48,113 +57,228 @@ impl RegRegion {
     }
 }
 
-static REGISTRY: Mutex<Vec<RegRegion>> = Mutex::new(Vec::new());
+/// Tracked guest VA ranges for one process (borrowed images + owned mmaps).
+///
+/// Independent of the active trap slot: build and test locally, then
+/// [`install_active`] before jumping to guest code.
+#[derive(Debug, Default)]
+pub struct AddressSpace {
+    regions: Vec<RegRegion>,
+}
 
-/// Clears the registry. Owned mappings are `munmap`'d; borrowed ones are not.
-pub fn clear() {
-    if let Ok(mut guard) = REGISTRY.lock() {
-        for region in guard.drain(..) {
-            if region.owned && !region.ptr.is_null() && region.len > 0 {
-                // SAFETY: owned region came from a successful mmap in this process.
-                let _ = unsafe { libc::munmap(region.ptr.cast(), region.len) };
+impl AddressSpace {
+    /// Empty address space (no tracked regions).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+        }
+    }
+
+    /// True when at least one region is registered.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.regions.is_empty()
+    }
+
+    /// Clears all regions. Owned mappings are `munmap`'d; borrowed ones are not.
+    pub fn clear(&mut self) {
+        for region in self.regions.drain(..) {
+            if region.owned {
+                let _ = host::munmap(region.ptr, region.len);
             }
         }
     }
-}
 
-/// Registers a borrowed region (image / stack). Does not take ownership.
-pub fn register_borrowed(region: &MappedRegion) {
-    push(RegRegion {
-        guest_addr: region.guest_addr,
-        len: region.host_len(),
-        ptr: host_ptr_from_addr(region.host_addr()),
-        prot: region.prot,
-        owned: false,
-    });
-}
+    /// Registers a borrowed region (image / stack). Does not take ownership.
+    pub fn register_borrowed(&mut self, region: &MappedRegion) {
+        self.regions.push(RegRegion {
+            guest_addr: region.guest_addr,
+            len: region.host_len(),
+            ptr: host_ptr_from_addr(region.host_addr()),
+            prot: region.prot,
+            owned: false,
+        });
+    }
 
-/// Registers an owned anonymous mapping created by a guest `mmap`.
-pub fn register_owned(guest_addr: u64, ptr: *mut u8, len: usize, prot: u32) {
-    push(RegRegion {
-        guest_addr,
-        len,
-        ptr,
-        prot,
-        owned: true,
-    });
-}
+    /// Registers an owned mapping created by a guest `mmap`.
+    pub fn register_owned(&mut self, guest_addr: u64, ptr: *mut u8, len: usize, prot: u32) {
+        self.regions.push(RegRegion {
+            guest_addr,
+            len,
+            ptr,
+            prot,
+            owned: true,
+        });
+    }
 
-fn push(region: RegRegion) {
-    if let Ok(mut guard) = REGISTRY.lock() {
-        guard.push(region);
+    /// Validates that `[addr, addr+len)` lies in a registered region with the
+    /// requested access. When empty (unit tests without maps), returns `true`
+    /// so pure dispatch tests do not need a full map setup.
+    #[must_use]
+    pub fn check_range(&self, addr: u64, len: usize, need_write: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if addr == 0 {
+            return false;
+        }
+        if self.regions.is_empty() {
+            return true;
+        }
+        for region in &self.regions {
+            if !region.contains_range(addr, len) {
+                continue;
+            }
+            if need_write {
+                return region.prot & VM_PROT_WRITE != 0;
+            }
+            // Readable if any of R/W is set (writable maps are readable for load).
+            return region.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0;
+        }
+        false
+    }
+
+    /// Finds the region that fully contains `[addr, addr+len)`, if any.
+    #[must_use]
+    pub fn find_covering(&self, addr: u64, len: usize) -> Option<RegRegionSnapshot> {
+        for region in &self.regions {
+            if region.contains_range(addr, len) {
+                return Some(RegRegionSnapshot {
+                    guest_addr: region.guest_addr,
+                    len: region.len,
+                    ptr: region.ptr,
+                    prot: region.prot,
+                    owned: region.owned,
+                });
+            }
+        }
+        None
+    }
+
+    /// Updates protection bits on the region covering `addr`.
+    pub fn update_prot(&mut self, addr: u64, len: usize, prot: u32) -> bool {
+        for region in &mut self.regions {
+            if region.contains_range(addr, len) {
+                region.prot = prot;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Removes and optionally unmaps an owned region that fully covers the range.
+    ///
+    /// Borrowed regions are removed from tracking **without** `munmap`.
+    pub fn remove_range(&mut self, addr: u64, len: usize) -> RemoveOutcome {
+        let idx = self.regions.iter().position(|r| r.contains_range(addr, len));
+        let Some(i) = idx else {
+            return RemoveOutcome::NotFound;
+        };
+        let region = self.regions.remove(i);
+        if region.owned {
+            if host::munmap(region.ptr, region.len) {
+                RemoveOutcome::Unmapped
+            } else {
+                RemoveOutcome::UnmapFailed
+            }
+        } else {
+            RemoveOutcome::Untracked
+        }
+    }
+
+    /// Test/helper: push a raw region (used by unit tests for RX-only maps).
+    #[cfg(test)]
+    fn push_raw(&mut self, region: RegRegion) {
+        self.regions.push(region);
     }
 }
 
-/// True when at least one region is registered (live micro-run path).
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Active address space for the trap / syscall path (single guest process).
+static ACTIVE: Mutex<AddressSpace> = Mutex::new(AddressSpace::new());
+
+/// Installs `space` as the active trap-path address space.
+///
+/// Returns the previous active space (caller may drop it to unmap owned regions).
+pub fn install_active(space: AddressSpace) -> AddressSpace {
+    match ACTIVE.lock() {
+        Ok(mut guard) => std::mem::replace(&mut *guard, space),
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            std::mem::replace(&mut *guard, space)
+        }
+    }
+}
+
+/// Takes the active address space, leaving an empty one installed.
+#[must_use]
+pub fn take_active() -> AddressSpace {
+    install_active(AddressSpace::new())
+}
+
+/// Runs `f` with exclusive access to the active address space.
+pub fn with_active_mut<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
+    match ACTIVE.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => f(&mut poisoned.into_inner()),
+    }
+}
+
+/// Runs `f` with shared access to the active address space.
+pub fn with_active<R>(f: impl FnOnce(&AddressSpace) -> R) -> R {
+    match ACTIVE.lock() {
+        Ok(guard) => f(&guard),
+        Err(poisoned) => f(&poisoned.into_inner()),
+    }
+}
+
+/// Clears the active address space. Owned mappings are `munmap`'d.
+pub fn clear() {
+    with_active_mut(AddressSpace::clear);
+}
+
+/// Registers a borrowed region on the active address space.
+pub fn register_borrowed(region: &MappedRegion) {
+    with_active_mut(|space| space.register_borrowed(region));
+}
+
+/// Registers an owned anonymous mapping on the active address space.
+pub fn register_owned(guest_addr: u64, ptr: *mut u8, len: usize, prot: u32) {
+    with_active_mut(|space| space.register_owned(guest_addr, ptr, len, prot));
+}
+
+/// True when the active space has at least one region.
 #[must_use]
 pub fn is_active() -> bool {
-    REGISTRY.lock().is_ok_and(|g| !g.is_empty())
+    with_active(AddressSpace::is_active)
 }
 
-/// Validates that `[addr, addr+len)` lies in a registered region with the
-/// requested access. When the registry is empty (unit tests), returns `true`
-/// so pure dispatch tests do not need a full map setup.
+/// Validates a range against the active address space.
 #[must_use]
 pub fn check_range(addr: u64, len: usize, need_write: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    if addr == 0 {
-        return false;
-    }
-    let Ok(guard) = REGISTRY.lock() else {
-        return false;
-    };
-    if guard.is_empty() {
-        return true;
-    }
-    for region in guard.iter() {
-        if !region.contains_range(addr, len) {
-            continue;
-        }
-        if need_write && region.prot & VM_PROT_WRITE == 0 {
-            return false;
-        }
-        if !need_write && region.prot & (VM_PROT_READ | VM_PROT_WRITE) == 0 {
-            // Execute-only or none: still allow read of identity-mapped text for
-            // path strings if R is set; require R or W.
-            return false;
-        }
-        // Readable if any of R/W/X is present on Darwin private maps we create
-        // with at least one access bit. PROT_NONE fails both.
-        if region.prot == 0 {
-            return false;
-        }
-        if !need_write && region.prot & VM_PROT_READ == 0 && region.prot & VM_PROT_WRITE == 0 {
-            // X-only: allow reads of code for C-strings in edge cases? Deny.
-            return false;
-        }
-        return true;
-    }
-    false
+    with_active(|space| space.check_range(addr, len, need_write))
 }
 
-/// Finds the region that fully contains `[addr, addr+len)`, if any.
+/// Finds a covering region in the active address space.
 #[must_use]
 pub fn find_covering(addr: u64, len: usize) -> Option<RegRegionSnapshot> {
-    let guard = REGISTRY.lock().ok()?;
-    for region in guard.iter() {
-        if region.contains_range(addr, len) {
-            return Some(RegRegionSnapshot {
-                guest_addr: region.guest_addr,
-                len: region.len,
-                ptr: region.ptr,
-                prot: region.prot,
-                owned: region.owned,
-            });
-        }
-    }
-    None
+    with_active(|space| space.find_covering(addr, len))
+}
+
+/// Updates protection on a region in the active address space.
+pub fn update_prot(addr: u64, len: usize, prot: u32) -> bool {
+    with_active_mut(|space| space.update_prot(addr, len, prot))
+}
+
+/// Removes a range from the active address space.
+pub fn remove_range(addr: u64, len: usize) -> RemoveOutcome {
+    with_active_mut(|space| space.remove_range(addr, len))
 }
 
 /// Snapshot of a registry entry (no ownership).
@@ -168,57 +292,15 @@ pub struct RegRegionSnapshot {
     pub ptr: *mut u8,
     /// Darwin prot.
     pub prot: u32,
-    /// Owned by registry.
+    /// Owned by the address space.
     pub owned: bool,
 }
 
-// SAFETY: snapshot is a POD copy of pointers managed under the registry mutex
+// SAFETY: snapshot is a POD copy of pointers managed under the active mutex
 // during the syscall that uses it.
 unsafe impl Send for RegRegionSnapshot {}
 
-/// Updates protection bits on the region covering `addr` (exact base preferred).
-pub fn update_prot(addr: u64, len: usize, prot: u32) -> bool {
-    let Ok(mut guard) = REGISTRY.lock() else {
-        return false;
-    };
-    for region in guard.iter_mut() {
-        if region.contains_range(addr, len) {
-            region.prot = prot;
-            return true;
-        }
-    }
-    false
-}
-
-/// Removes and optionally unmaps an owned region that fully covers the range.
-///
-/// Returns `true` if a region was removed. Borrowed regions are removed from
-/// the registry **without** `munmap` (caller must not free image pages).
-pub fn remove_range(addr: u64, len: usize) -> RemoveOutcome {
-    let Ok(mut guard) = REGISTRY.lock() else {
-        return RemoveOutcome::NotFound;
-    };
-    let idx = guard.iter().position(|r| r.contains_range(addr, len));
-    let Some(i) = idx else {
-        return RemoveOutcome::NotFound;
-    };
-    let region = guard.remove(i);
-    if region.owned {
-        if !region.ptr.is_null() && region.len > 0 {
-            // SAFETY: owned mmap from guest mmap handler.
-            let rc = unsafe { libc::munmap(region.ptr.cast(), region.len) };
-            if rc != 0 {
-                return RemoveOutcome::UnmapFailed;
-            }
-        }
-        RemoveOutcome::Unmapped
-    } else {
-        // Borrowed: only drop tracking; do not munmap host pages.
-        RemoveOutcome::Untracked
-    }
-}
-
-/// Result of [`remove_range`].
+/// Result of [`AddressSpace::remove_range`] / [`remove_range`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveOutcome {
     /// No covering region.
@@ -236,12 +318,10 @@ fn host_ptr_from_addr(addr: u64) -> *mut u8 {
     std::ptr::with_exposed_provenance_mut(u)
 }
 
-/// Serializes tests that mutate the process-wide registry / FD tables.
+/// Serializes tests that mutate process-wide active space / process state.
 #[cfg(test)]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::process::test_lock()
 }
 
 #[cfg(test)]
@@ -252,7 +332,14 @@ mod tests {
     use crate::mem::map::{VM_PROT_EXECUTE, map_stack};
 
     #[test]
-    fn empty_registry_allows_checks() {
+    fn empty_local_space_allows_checks() {
+        let space = AddressSpace::new();
+        assert!(!space.is_active());
+        assert!(space.check_range(0x1000, 16, false));
+    }
+
+    #[test]
+    fn empty_active_registry_allows_checks() {
         let _g = test_lock();
         clear();
         assert!(!is_active());
@@ -260,7 +347,24 @@ mod tests {
     }
 
     #[test]
-    fn stack_region_validates() {
+    fn local_stack_region_validates() {
+        let host = HostPageSize::detect().expect("host page");
+        let stack = map_stack(host, 64 * 1024).expect("stack");
+        let mut space = AddressSpace::new();
+        space.register_borrowed(&stack);
+        assert!(space.is_active());
+        let base = stack.guest_addr;
+        assert!(space.check_range(base, 64, true));
+        assert!(space.check_range(base, 64, false));
+        assert!(!space.check_range(0, 8, false));
+        let outside = base.wrapping_add(u64::try_from(stack.host_len()).unwrap_or(0));
+        assert!(!space.check_range(outside, 8, false));
+        space.clear();
+        drop(stack);
+    }
+
+    #[test]
+    fn stack_region_validates_via_active() {
         let _g = test_lock();
         clear();
         let host = HostPageSize::detect().expect("host page");
@@ -271,7 +375,6 @@ mod tests {
         assert!(check_range(base, 64, true));
         assert!(check_range(base, 64, false));
         assert!(!check_range(0, 8, false));
-        // Outside mapping.
         let outside = base.wrapping_add(u64::try_from(stack.host_len()).unwrap_or(0));
         assert!(!check_range(outside, 8, false));
         clear();
@@ -280,21 +383,38 @@ mod tests {
 
     #[test]
     fn execute_only_not_writable() {
-        let _g = test_lock();
-        clear();
         let host = HostPageSize::detect().expect("host page");
         let stack = map_stack(host, u64::from(host.bytes())).expect("stack");
-        // Re-register with RX only for the test.
-        push(RegRegion {
+        let mut space = AddressSpace::new();
+        space.push_raw(RegRegion {
             guest_addr: stack.guest_addr,
             len: stack.host_len(),
             ptr: host_ptr_from_addr(stack.host_addr()),
             prot: VM_PROT_READ | VM_PROT_EXECUTE,
             owned: false,
         });
-        assert!(check_range(stack.guest_addr, 8, false));
-        assert!(!check_range(stack.guest_addr, 8, true));
+        assert!(space.check_range(stack.guest_addr, 8, false));
+        assert!(!space.check_range(stack.guest_addr, 8, true));
+        space.clear();
+        drop(stack);
+    }
+
+    #[test]
+    fn install_active_swaps_spaces() {
+        let _g = test_lock();
         clear();
+        let host = HostPageSize::detect().expect("host page");
+        let stack = map_stack(host, 64 * 1024).expect("stack");
+        let mut space = AddressSpace::new();
+        space.register_borrowed(&stack);
+        let prev = install_active(space);
+        assert!(!prev.is_active());
+        assert!(is_active());
+        assert!(check_range(stack.guest_addr, 8, false));
+        let taken = take_active();
+        assert!(taken.is_active());
+        assert!(!is_active());
+        drop(taken);
         drop(stack);
     }
 }

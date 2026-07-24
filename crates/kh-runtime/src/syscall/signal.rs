@@ -1,11 +1,11 @@
 //! Soft `sigprocmask` / `sigaction` — track guest state without disturbing host traps.
 
-use std::sync::Mutex;
-
 use crate::mem::registry_check_range;
+use crate::process::{self, SoftSigAct};
 
 use super::common::{
-    EFAULT, EINVAL, EPERM, SyscallArgs, SyscallResult, guest_ptr, guest_ptr_mut, reg_as_i32,
+    EFAULT, EINVAL, EPERM, SyscallArgs, SyscallResult, guest_read_i32, guest_read_u32,
+    guest_read_u64, guest_write, guest_write_u32, reg_as_i32,
 };
 
 /// Darwin `how` for `sigprocmask`.
@@ -24,26 +24,6 @@ const SIGSET_SIZE: usize = 4;
 /// handler(8) + mask(4) + flags(4) = 16 bytes.
 const SIGACTION_SIZE: usize = 16;
 
-static GUEST_MASK: Mutex<u32> = Mutex::new(0);
-static SIGACTIONS: Mutex<[SigAct; 32]> = Mutex::new([SigAct::zero(); 32]);
-
-#[derive(Clone, Copy)]
-struct SigAct {
-    handler: u64,
-    mask: u32,
-    flags: i32,
-}
-
-impl SigAct {
-    const fn zero() -> Self {
-        Self {
-            handler: 0,
-            mask: 0,
-            flags: 0,
-        }
-    }
-}
-
 /// `sigprocmask(how, set, oset)`.
 pub(crate) fn handle_sigprocmask(args: SyscallArgs) -> SyscallResult {
     let name = "sigprocmask";
@@ -58,28 +38,37 @@ pub(crate) fn handle_sigprocmask(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
 
-    let Ok(mut guard) = GUEST_MASK.lock() else {
-        return SyscallResult::err(name, EPERM);
+    let new_bits = if set != 0 {
+        Some(guest_read_u32(set))
+    } else {
+        None
     };
-    let old = *guard;
 
-    if oset != 0 {
-        write_u32(oset, old);
-    }
-
-    if set != 0 {
-        let new_bits = read_u32(set);
-        match how {
-            SIG_BLOCK => *guard |= new_bits,
-            SIG_UNBLOCK => *guard &= !new_bits,
-            SIG_SETMASK => *guard = new_bits,
-            _ => return SyscallResult::err(name, EINVAL),
+    let result = process::with_mut(|p| {
+        let old = p.sig_mask();
+        if let Some(bits) = new_bits {
+            let updated = match how {
+                SIG_BLOCK => old | bits,
+                SIG_UNBLOCK => old & !bits,
+                SIG_SETMASK => bits,
+                _ => return Err(EINVAL),
+            };
+            p.set_sig_mask(updated);
+            // Never touch host SIGTRAP — translator relies on it.
+            let _ = SIGTRAP;
         }
-        // Never touch host SIGTRAP — translator relies on it.
-        let _ = SIGTRAP;
-    }
+        Ok(old)
+    });
 
-    SyscallResult::ok(name, 0)
+    match result {
+        Ok(old) => {
+            if oset != 0 {
+                guest_write_u32(oset, old);
+            }
+            SyscallResult::ok(name, 0)
+        }
+        Err(errno) => SyscallResult::err(name, errno),
+    }
 }
 
 /// `sigaction(sig, act, oact)`.
@@ -104,55 +93,36 @@ pub(crate) fn handle_sigaction(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
 
-    let Ok(mut table) = SIGACTIONS.lock() else {
-        return SyscallResult::err(name, EPERM);
-    };
     let idx = usize::try_from(sig).unwrap_or(0);
-    let Some(slot) = table.get_mut(idx) else {
-        return SyscallResult::err(name, EINVAL);
+    let new_act = if act != 0 {
+        Some(read_sigaction(act))
+    } else {
+        None
     };
 
+    let old = process::with_mut(|p| {
+        let prev = p.sigaction(idx).unwrap_or_else(SoftSigAct::zero);
+        if let Some(a) = new_act {
+            let _ = p.set_sigaction(idx, a);
+        }
+        prev
+    });
+
     if oact != 0 {
-        write_sigaction(oact, *slot);
-    }
-    if act != 0 {
-        *slot = read_sigaction(act);
+        write_sigaction(oact, old);
     }
     SyscallResult::ok(name, 0)
 }
 
-/// Resets soft signal state for a new guest run.
-pub(crate) fn reset_signal_state() {
-    if let Ok(mut m) = GUEST_MASK.lock() {
-        *m = 0;
-    }
-    if let Ok(mut t) = SIGACTIONS.lock() {
-        *t = [SigAct::zero(); 32];
+fn read_sigaction(addr: u64) -> SoftSigAct {
+    SoftSigAct {
+        handler: guest_read_u64(addr),
+        mask: guest_read_u32(addr.wrapping_add(8)),
+        flags: guest_read_i32(addr.wrapping_add(12)),
     }
 }
 
-fn read_u32(addr: u64) -> u32 {
-    let p = guest_ptr(addr);
-    let b = unsafe { std::slice::from_raw_parts(p, 4) };
-    le_u32(b)
-}
-
-fn write_u32(addr: u64, value: u32) {
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), 4) };
-    dst.copy_from_slice(&value.to_le_bytes());
-}
-
-fn read_sigaction(addr: u64) -> SigAct {
-    let p = guest_ptr(addr);
-    let b = unsafe { std::slice::from_raw_parts(p, SIGACTION_SIZE) };
-    SigAct {
-        handler: le_u64(b),
-        mask: le_u32(b.get(8..12).unwrap_or(&[])),
-        flags: le_i32(b.get(12..16).unwrap_or(&[])),
-    }
-}
-
-fn write_sigaction(addr: u64, act: SigAct) {
+fn write_sigaction(addr: u64, act: SoftSigAct) {
     let mut raw = [0_u8; SIGACTION_SIZE];
     if let Some(slot) = raw.get_mut(..8) {
         slot.copy_from_slice(&act.handler.to_le_bytes());
@@ -163,28 +133,5 @@ fn write_sigaction(addr: u64, act: SigAct) {
     if let Some(slot) = raw.get_mut(12..16) {
         slot.copy_from_slice(&act.flags.to_le_bytes());
     }
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), SIGACTION_SIZE) };
-    dst.copy_from_slice(&raw);
-}
-
-fn le_u32(b: &[u8]) -> u32 {
-    let mut a = [0_u8; 4];
-    let n = b.len().min(4);
-    if let (Some(dst), Some(src)) = (a.get_mut(..n), b.get(..n)) {
-        dst.copy_from_slice(src);
-    }
-    u32::from_le_bytes(a)
-}
-
-fn le_i32(b: &[u8]) -> i32 {
-    i32::from_le_bytes(le_u32(b).to_le_bytes())
-}
-
-fn le_u64(b: &[u8]) -> u64 {
-    let mut a = [0_u8; 8];
-    let n = b.len().min(8);
-    if let (Some(dst), Some(src)) = (a.get_mut(..n), b.get(..n)) {
-        dst.copy_from_slice(src);
-    }
-    u64::from_le_bytes(a)
+    guest_write(addr, &raw);
 }

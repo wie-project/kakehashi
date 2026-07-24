@@ -135,7 +135,19 @@ impl ProcessImage {
     }
 }
 
+/// Parsed + planned main image held only until [`LoadSession::map_main_only`]
+/// moves ownership into `images[0]`.
+#[derive(Debug)]
+struct StagedMain {
+    image: MachOImage,
+    plan: ImagePlan,
+}
+
 /// Configuration and state for loading one guest process image set.
+///
+/// **Ownership model:** after map, `images` is the single source of truth for
+/// parse / plan / `GuestMemory`. Before map, the main executable may live in
+/// private staging only (no duplicated top-level fields).
 #[derive(Debug)]
 pub struct LoadSession {
     /// Path to the main executable.
@@ -144,15 +156,10 @@ pub struct LoadSession {
     pub root: Option<PathBuf>,
     /// Host/guest page geometry.
     pub pages: PageLayout,
-    /// Process image set (main at index 0 when mapped). Source of truth after map.
+    /// Process image set (main at index 0 when mapped). Sole owner after map.
     pub images: Vec<ProcessImage>,
-    /// Legacy mirror of main parse (`images[0].image` after map).
-    pub image: Option<MachOImage>,
-    /// Legacy mirror of main plan (`images[0].plan` after map).
-    pub plan: ImagePlan,
-    /// Legacy main memory slot. After map, ownership lives in `images[0].memory`
-    /// (GuestMemory is not `Clone`); use [`Self::memory_mut`] / [`Self::images`].
-    pub memory: Option<GuestMemory>,
+    /// Pre-map main parse/plan; cleared when main is pushed into `images`.
+    staged_main: Option<StagedMain>,
 }
 
 /// Result of a successful map-only (`--dry-load`) session.
@@ -234,9 +241,7 @@ impl LoadSession {
             root,
             pages: PageLayout::new(host, guest),
             images: Vec::new(),
-            image: None,
-            plan: ImagePlan::empty(),
-            memory: None,
+            staged_main: None,
         })
     }
 
@@ -262,26 +267,14 @@ impl LoadSession {
         self.images.iter_mut().filter_map(|img| img.memory.as_mut())
     }
 
-    /// Parses the main executable into an owned image.
+    /// Parses the main executable into staged (or already mapped) state.
     pub fn load_main_image(&mut self) -> Result<&MachOImage, LoadError> {
-        if self.image.is_none() {
-            let image = parse::parse_path(&self.executable)?;
-            self.image = Some(image);
-        }
-        self.image
-            .as_ref()
-            .ok_or(LoadError::NotImplemented("image missing after load"))
+        self.main_image_ref()
     }
 
     /// Parses (if needed) and builds an image plan for the main executable.
     pub fn plan_main_image(&mut self) -> Result<&ImagePlan, LoadError> {
-        let _ = self.load_main_image()?;
-        let guest = self.pages.guest;
-        let Some(image) = self.image.as_ref() else {
-            return Err(LoadError::NotImplemented("image missing after load"));
-        };
-        self.plan = image.plan(guest);
-        Ok(&self.plan)
+        self.main_plan_ref()
     }
 
     /// Maps main only into `images = [main]` (no dependency walk).
@@ -292,6 +285,53 @@ impl LoadSession {
         self.map_main_only()?;
         self.main_memory()
             .ok_or(LoadError::NotImplemented("memory missing after map"))
+    }
+
+    /// Main image: mapped `images[0]` or staged pre-map parse.
+    fn main_image_ref(&mut self) -> Result<&MachOImage, LoadError> {
+        if self.images.first().and_then(|img| img.image.as_ref()).is_some() {
+            return self
+                .images
+                .first()
+                .and_then(|img| img.image.as_ref())
+                .ok_or(LoadError::NotImplemented("image missing after load"));
+        }
+        self.ensure_staged_main()?;
+        self.staged_main
+            .as_ref()
+            .map(|s| &s.image)
+            .ok_or(LoadError::NotImplemented("image missing after load"))
+    }
+
+    /// Main plan: mapped `images[0]` or staged pre-map plan.
+    fn main_plan_ref(&mut self) -> Result<&ImagePlan, LoadError> {
+        if self
+            .images
+            .first()
+            .is_some_and(|img| matches!(img.status, ImageLoadStatus::Mapped) && img.image.is_some())
+        {
+            return self
+                .images
+                .first()
+                .map(|img| &img.plan)
+                .ok_or(LoadError::NotImplemented("plan missing after map"));
+        }
+        self.ensure_staged_main()?;
+        self.staged_main
+            .as_ref()
+            .map(|s| &s.plan)
+            .ok_or(LoadError::NotImplemented("plan missing after load"))
+    }
+
+    /// Ensures `staged_main` holds a parse + plan for the executable.
+    fn ensure_staged_main(&mut self) -> Result<(), LoadError> {
+        if self.staged_main.is_some() {
+            return Ok(());
+        }
+        let image = parse::parse_path(&self.executable)?;
+        let plan = image.plan(self.pages.guest);
+        self.staged_main = Some(StagedMain { image, plan });
+        Ok(())
     }
 
     /// Map main once, BFS-load allowed dylibs, rebase pointer arrays, bind.
@@ -360,12 +400,7 @@ impl LoadSession {
 
     /// Mutable access to main mapped memory (after map).
     pub fn memory_mut(&mut self) -> Option<&mut GuestMemory> {
-        if let Some(main) = self.images.first_mut()
-            && main.memory.is_some()
-        {
-            return main.memory.as_mut();
-        }
-        self.memory.as_mut()
+        self.images.first_mut().and_then(|main| main.memory.as_mut())
     }
 
     /// Guest entry VA after main slide, if known.
@@ -375,29 +410,26 @@ impl LoadSession {
             let slide = main.slide();
             return main.plan.entry.map(|e| e.wrapping_add(slide));
         }
-        let slide = self.memory.as_ref().map_or(0, GuestMemory::slide);
-        self.plan.entry.map(|e| e.wrapping_add(slide))
+        // Pre-map: preferred entry without slide (placement not yet known).
+        self.staged_main
+            .as_ref()
+            .and_then(|s| s.plan.entry)
     }
 
     fn main_memory(&self) -> Option<&GuestMemory> {
-        self.images
-            .first()
-            .and_then(|i| i.memory.as_ref())
-            .or(self.memory.as_ref())
+        self.images.first().and_then(|i| i.memory.as_ref())
     }
 
     /// Parse + plan + map main into `images[0]`; does not walk deps.
     fn map_main_only(&mut self) -> Result<(), LoadError> {
-        // Drop previous process set (unmaps dylibs + main).
+        // Drop previous process set (unmaps dylibs + main via GuestMemory Drop).
         self.images.clear();
-        self.memory = None;
 
-        let _ = self.plan_main_image()?;
-        let image = self
-            .image
-            .clone()
+        self.ensure_staged_main()?;
+        let StagedMain { image, plan } = self
+            .staged_main
+            .take()
             .ok_or(LoadError::NotImplemented("image missing after load"))?;
-        let plan = self.plan.clone();
         let requests = map_requests_from_plan(&plan);
         let preferred = plan.preferred_base;
         let mut file = File::open(&self.executable)?;
@@ -415,7 +447,6 @@ impl LoadSession {
             exports: Vec::new(),
         };
         self.images.push(main);
-        self.mirror_main_legacy();
         Ok(())
     }
 
@@ -551,8 +582,6 @@ impl LoadSession {
             }
         }
 
-        // Main legacy mirrors unchanged by dylibs; re-assert after walk.
-        self.mirror_main_legacy();
         Ok(())
     }
 
@@ -602,16 +631,6 @@ impl LoadSession {
             requested_kind: kind,
             exports: Vec::new(),
         });
-    }
-
-    /// Mirrors main parse/plan into legacy fields. Memory stays in `images[0]`.
-    fn mirror_main_legacy(&mut self) {
-        if let Some(main) = self.images.first() {
-            self.image = main.image.clone();
-            self.plan = main.plan.clone();
-        }
-        // GuestMemory is not Clone — ownership remains in images[0].memory.
-        self.memory = None;
     }
 }
 
@@ -683,20 +702,10 @@ fn mapping_to_request(m: &PlannedMapping) -> MapRequest {
 mod tests {
     use super::*;
     use crate::fixture::minimal_arm64_execute;
-    use crate::test_util::map_test_lock;
-    use std::io::Write;
+    use crate::test_util::{map_test_lock, temp_dir, write_temp_bytes, write_under};
 
     fn write_temp_fixture() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kh-session-fixture-{}-{n}.macho",
-            std::process::id()
-        ));
-        let mut f = File::create(&path).expect("create");
-        f.write_all(&minimal_arm64_execute()).expect("write");
-        path
+        write_temp_bytes("session-fixture", &minimal_arm64_execute())
     }
 
     #[test]
@@ -801,26 +810,16 @@ mod tests {
             CALL_LIBSYSTEM_GOT_VA, KH_BOTTLE_MARK_SYMBOL, LIBSYSTEM_INSTALL_NAME,
             arm64_libsystem_stub, call_libsystem_exit,
         };
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        static N: AtomicU64 = AtomicU64::new(0);
         let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("kh-bottle-session-{}-{n}", std::process::id()));
+        let dir = temp_dir("bottle-session");
         let bottle = dir.join("bottle");
-        let lib_dir = bottle.join("usr/lib");
-        std::fs::create_dir_all(&lib_dir).expect("mkdir bottle");
-        let main_path = dir.join("call_libsystem.macho");
-        let sys_path = lib_dir.join("libSystem.B.dylib");
-        {
-            let mut f = File::create(&main_path).expect("create main");
-            f.write_all(&call_libsystem_exit()).expect("write main");
-        }
-        {
-            let mut f = File::create(&sys_path).expect("create libSystem");
-            f.write_all(&arm64_libsystem_stub()).expect("write stub");
-        }
+        let main_path = write_under(&dir, "call_libsystem.macho", &call_libsystem_exit());
+        let _sys_path = write_under(
+            &bottle,
+            "usr/lib/libSystem.B.dylib",
+            &arm64_libsystem_stub(),
+        );
 
         let mut session = LoadSession::open(&main_path, Some(bottle.clone())).expect("open");
         let report = session.dry_load().expect("dry_load with bottle");
@@ -891,19 +890,9 @@ mod tests {
     fn call_libsystem_without_bottle_fails_bind() {
         use crate::error::LoadError;
         use crate::fixture::call_libsystem_exit;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
-        static N: AtomicU64 = AtomicU64::new(0);
         let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kh-call-libsys-nobottle-{}-{n}.macho",
-            std::process::id()
-        ));
-        {
-            let mut f = File::create(&path).expect("create");
-            f.write_all(&call_libsystem_exit()).expect("write");
-        }
+        let path = write_temp_bytes("call-libsys-nobottle", &call_libsystem_exit());
         let mut session = LoadSession::open(&path, None).expect("open");
         let err = session.map_process().expect_err("bind must fail");
         assert!(

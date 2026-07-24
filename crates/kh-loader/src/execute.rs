@@ -4,9 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use kh_runtime::{
-    GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack, call_guest_args,
-    finish_with_exit_code, install_trap_handlers, map_stack, patch_svc_to_brk, register_borrowed,
-    registry_clear, set_bottle_root,
+    AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack,
+    call_guest_args, finish_with_exit_code, install_trap_handlers, map_stack, patch_svc_to_brk,
+    registry_install, registry_take, set_bottle_root,
 };
 
 use crate::error::LoadError;
@@ -77,7 +77,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     }
 
     set_bottle_root(opts.root.clone());
-    registry_clear();
+    // Drop any previous active address space (unmaps owned guest mmaps).
+    drop(registry_take());
 
     let mut session = LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)?;
     let _ = session.map_process()?;
@@ -115,15 +116,17 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let sp = bootstrap_stack(stack.host_bytes_mut(), stack_base, &argv_refs, &[])
         .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))?;
 
-    // Publish guest VA ranges for trap-path pointer checks and mmap bookkeeping.
+    // Build process address space, then install for trap-path checks / mmap bookkeeping.
+    let mut address_space = AddressSpace::new();
     for img in session.images() {
         if let Some(memory) = img.memory.as_ref() {
             for region in memory.regions() {
-                register_borrowed(region);
+                address_space.register_borrowed(region);
             }
         }
     }
-    register_borrowed(&stack);
+    address_space.register_borrowed(&stack);
+    drop(registry_install(address_space));
 
     install_trap_handlers(&TrapConfig {
         max_events: opts.max_events,

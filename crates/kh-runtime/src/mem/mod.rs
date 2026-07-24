@@ -1,8 +1,10 @@
 //! Guest and host page geometry for Darwin arm64 images on Linux.
 
 mod layout;
+// `map` needs `unsafe` for owned mapping slices / pointer arithmetic only.
 #[allow(unsafe_code)]
 mod map;
+// `registry` needs `unsafe impl Send` for host mapping pointers.
 #[allow(unsafe_code)]
 mod registry;
 
@@ -12,10 +14,10 @@ pub use map::{
     darwin_to_host_prot, map_stack, mprotect_darwin, mprotect_rw,
 };
 pub use registry::{
-    RegRegionSnapshot, RemoveOutcome, check_range as registry_check_range, clear as registry_clear,
-    find_covering as registry_find, is_active as registry_is_active, register_borrowed,
-    register_owned, remove_range as registry_remove, update_prot as registry_update_prot,
+    AddressSpace, RegRegionSnapshot, RemoveOutcome, check_range as registry_check_range,
+    clear as registry_clear, find_covering as registry_find, install_active as registry_install,
+    is_active as registry_is_active, register_borrowed, register_owned,
+    remove_range as registry_remove, take_active as registry_take,
+    update_prot as registry_update_prot, with_active as registry_with_active,
+    with_active_mut as registry_with_active_mut,
 };
-
-#[cfg(test)]
-pub(crate) use registry::test_lock as registry_test_lock;

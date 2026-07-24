@@ -3,11 +3,13 @@
 //! Dependency rule: this crate must not depend on `kh-loader` or `kh-cli`.
 //!
 //! `unsafe` is denied by workspace lints and only allowed in tightly scoped
-//! modules (`mem/*`, `trap`, `entry`, `bottle` C-string reads, `syscall` I/O).
+//! modules (`host`, `mem/*`, `trap`, `entry`, and `bottle::read_c_string`).
 
 pub mod bottle;
 pub mod entry;
+pub mod host;
 pub mod mem;
+pub mod process;
 pub mod regs;
 pub mod stack;
 pub mod syscall;
@@ -16,11 +18,14 @@ pub mod trap;
 pub use bottle::{
     PathError, bottle_root, set_bottle_root, translate_path, translate_path_with_root,
 };
+pub use process::{ProcessState, reset_run};
+
 pub use entry::{EntryError, call_guest, call_guest_args, jump_to_guest};
 pub use mem::{
-    DARWIN_ARM64_PAGE_SIZE, GuestMemory, GuestPageSize, HostPageSize, MapError, MapRequest,
-    MappedRegion, PageError, PageLayout, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, map_stack,
-    mprotect_darwin, mprotect_rw, register_borrowed, registry_clear,
+    AddressSpace, DARWIN_ARM64_PAGE_SIZE, GuestMemory, GuestPageSize, HostPageSize, MapError,
+    MapRequest, MappedRegion, PageError, PageLayout, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    map_stack, mprotect_darwin, mprotect_rw, register_borrowed, registry_clear, registry_install,
+    registry_take,
 };
 pub use regs::ThreadRegs;
 pub use stack::{StackError, bootstrap_stack};

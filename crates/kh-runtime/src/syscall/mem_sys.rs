@@ -1,15 +1,13 @@
 //! BSD `mmap` / `mprotect` / `munmap` / `msync`.
 
-use std::ptr;
-
+use crate::host;
 use crate::mem::{
     RemoveOutcome, VM_PROT_READ, VM_PROT_WRITE, darwin_to_host_prot, register_owned, registry_find,
     registry_remove, registry_update_prot,
 };
 
 use super::common::{
-    EBADF, EFAULT, EINVAL, ENOMEM, EPERM, SyscallArgs, SyscallResult, guest_ptr_mut, reg_as_i32,
-    reg_as_i64,
+    EBADF, EFAULT, EINVAL, ENOMEM, EPERM, SyscallArgs, SyscallResult, reg_as_i32, reg_as_i64,
 };
 use super::fd::guest_to_host_fd;
 
@@ -43,7 +41,6 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
     if flags & DARWIN_MAP_SHARED != 0 && flags & DARWIN_MAP_PRIVATE != 0 {
         return SyscallResult::err(name, EINVAL);
     }
-    // Default sharing when neither bit is set: private (common for MAP_ANON).
     let shared = flags & DARWIN_MAP_SHARED != 0;
     let fixed = flags & DARWIN_MAP_FIXED != 0;
 
@@ -75,7 +72,7 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         host_flags |= libc::MAP_ANONYMOUS;
     }
 
-    let addr_hint = if fixed {
+    let fixed_addr = if fixed {
         if addr == 0 {
             return SyscallResult::err(name, EINVAL);
         }
@@ -83,25 +80,20 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         if page_u64 != 0 && !addr.is_multiple_of(page_u64) {
             return SyscallResult::err(name, EINVAL);
         }
-        host_flags |= fixed_map_flag();
-        guest_ptr_mut(addr).cast()
+        host_flags |= host::fixed_map_flag();
+        Some(addr)
     } else {
-        ptr::null_mut()
+        None
     };
 
     let map_prot = libc::PROT_READ | libc::PROT_WRITE;
     let off = if is_anon { 0 } else { offset };
-    // SAFETY: length page-aligned; anon uses -1/fd; file fd from guest table; fixed uses MAP_FIXED*.
-    let raw = unsafe { libc::mmap(addr_hint, map_len, map_prot, host_flags, host_fd, off) };
-    if raw == libc::MAP_FAILED {
+    let Some(base) = host::mmap(fixed_addr, map_len, map_prot, host_flags, host_fd, off) else {
         return SyscallResult::err(name, ENOMEM);
-    }
-    let base = raw.cast::<u8>();
-    let actual = ptr_to_u64(base);
+    };
+    let actual = host::ptr_addr_u64(base);
     if fixed && actual != addr {
-        unsafe {
-            let _ = libc::munmap(raw, map_len);
-        }
+        let _ = host::munmap(base, map_len);
         return SyscallResult::err(name, ENOMEM);
     }
 
@@ -111,11 +103,8 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         prot
     };
     let host_prot = darwin_to_host_prot(final_prot);
-    let rc = unsafe { libc::mprotect(base.cast(), map_len, host_prot) };
-    if rc != 0 {
-        unsafe {
-            let _ = libc::munmap(raw, map_len);
-        }
+    if !host::mprotect(base, map_len, host_prot) {
+        let _ = host::munmap(base, map_len);
         return SyscallResult::err(name, EPERM);
     }
 
@@ -142,11 +131,8 @@ pub(crate) fn handle_mprotect(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
     let host_prot = darwin_to_host_prot(prot);
-    let rc = unsafe {
-        let base = region.ptr.wrapping_add(offset);
-        libc::mprotect(base.cast(), len, host_prot)
-    };
-    if rc != 0 {
+    let base = region.ptr.wrapping_add(offset);
+    if !host::mprotect(base, len, host_prot) {
         return SyscallResult::err(name, EPERM);
     }
     if addr == region.guest_addr && len == region.len {
@@ -191,11 +177,8 @@ pub(crate) fn handle_msync(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
     let host_flags = darwin_to_host_msync(flags);
-    let rc = unsafe {
-        let base = region.ptr.wrapping_add(offset);
-        libc::msync(base.cast(), len, host_flags)
-    };
-    if rc != 0 {
+    let base = region.ptr.wrapping_add(offset);
+    if !host::msync(base, len, host_flags) {
         return SyscallResult::err(name, EPERM);
     }
     SyscallResult::ok(name, 0)
@@ -212,7 +195,6 @@ fn darwin_to_host_msync(flags: i32) -> libc::c_int {
     if flags & DARWIN_MS_INVALIDATE != 0 {
         h |= libc::MS_INVALIDATE;
     }
-    // Default to sync if neither ASYNC nor SYNC (matches common “flush” intent).
     if h & (libc::MS_ASYNC | libc::MS_SYNC) == 0 {
         h |= libc::MS_SYNC;
     }
@@ -222,12 +204,7 @@ fn darwin_to_host_msync(flags: i32) -> libc::c_int {
 /// Host page size for tests and mmap alignment.
 #[must_use]
 pub(crate) fn host_page_size() -> usize {
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 {
-        usize::try_from(n).unwrap_or(4096)
-    } else {
-        4096
-    }
+    host::page_size().unwrap_or(4096)
 }
 
 fn align_up(len: usize, page: usize) -> usize {
@@ -241,19 +218,4 @@ fn align_up(len: usize, page: usize) -> usize {
         let pad = page.saturating_sub(rem);
         len.saturating_add(pad)
     }
-}
-
-fn fixed_map_flag() -> libc::c_int {
-    #[cfg(target_os = "linux")]
-    {
-        0x100_000 // MAP_FIXED_NOREPLACE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        libc::MAP_FIXED
-    }
-}
-
-fn ptr_to_u64(p: *mut u8) -> u64 {
-    u64::try_from(p.addr()).unwrap_or(0)
 }

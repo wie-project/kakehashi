@@ -1,8 +1,9 @@
 //! Time-related BSD syscalls: `gettimeofday`, `clock_gettime`.
 
+use crate::host;
 use crate::mem::registry_check_range;
 
-use super::common::{EFAULT, EINVAL, SyscallArgs, SyscallResult, guest_ptr_mut, reg_as_i32};
+use super::common::{EFAULT, EINVAL, SyscallArgs, SyscallResult, guest_write, reg_as_i32};
 
 /// Darwin `struct timeval` (arm64): `time_t tv_sec` + `suseconds_t tv_usec` + pad.
 const TIMEVAL_SIZE: usize = 16;
@@ -27,12 +28,9 @@ pub(crate) fn handle_gettimeofday(args: SyscallArgs) -> SyscallResult {
         if !registry_check_range(args.x0, TIMEVAL_SIZE, true) {
             return SyscallResult::err(name, EFAULT);
         }
-        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
-        // SAFETY: host gettimeofday; guest buffer written only after success.
-        let rc = unsafe { libc::gettimeofday(std::ptr::addr_of_mut!(tv), std::ptr::null_mut()) };
-        if rc != 0 {
+        let Some(tv) = host::gettimeofday() else {
             return SyscallResult::err(name, EINVAL);
-        }
+        };
         write_darwin_timeval(args.x0, widen_i64(tv.tv_sec), widen_i64(tv.tv_usec));
     }
     let _ = args.x1;
@@ -52,11 +50,9 @@ pub(crate) fn handle_clock_gettime(args: SyscallArgs) -> SyscallResult {
     let Some(host_clock) = darwin_to_host_clock(clock_id) else {
         return SyscallResult::err(name, EINVAL);
     };
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::clock_gettime(host_clock, std::ptr::addr_of_mut!(ts)) };
-    if rc != 0 {
+    let Some(ts) = host::clock_gettime(host_clock) else {
         return SyscallResult::err(name, EINVAL);
-    }
+    };
     write_darwin_timespec(args.x1, widen_i64(ts.tv_sec), widen_i64(ts.tv_nsec));
     SyscallResult::ok(name, 0)
 }
@@ -93,9 +89,7 @@ fn write_darwin_timeval(addr: u64, sec: i64, usec: i64) {
     if let Some(slot) = raw.get_mut(8..12) {
         slot.copy_from_slice(&usec_i.to_le_bytes());
     }
-    // SAFETY: range checked writable.
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), TIMEVAL_SIZE) };
-    dst.copy_from_slice(&raw);
+    guest_write(addr, &raw);
 }
 
 fn write_darwin_timespec(addr: u64, sec: i64, nsec: i64) {
@@ -106,6 +100,5 @@ fn write_darwin_timespec(addr: u64, sec: i64, nsec: i64) {
     if let Some(slot) = raw.get_mut(8..16) {
         slot.copy_from_slice(&nsec.to_le_bytes());
     }
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), TIMESPEC_SIZE) };
-    dst.copy_from_slice(&raw);
+    guest_write(addr, &raw);
 }

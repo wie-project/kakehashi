@@ -16,6 +16,8 @@ use std::ptr;
 
 use thiserror::Error;
 
+use crate::host;
+
 use super::layout::{HostPageSize, PageLayout};
 
 /// Darwin `VM_PROT_*` bits (same numeric values as XNU).
@@ -66,7 +68,7 @@ impl MappedRegion {
     /// Host virtual address of the mapping base.
     #[must_use]
     pub fn host_addr(&self) -> u64 {
-        ptr_to_u64(self.ptr)
+        host::ptr_addr_u64(self.ptr)
     }
 
     /// Host mapping length.
@@ -79,10 +81,7 @@ impl MappedRegion {
 impl Drop for MappedRegion {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.len > 0 {
-            // SAFETY: `ptr`/`len` came from a successful `mmap` and have not
-            // been munmap'd yet; Drop runs once.
-            let rc = unsafe { libc::munmap(self.ptr.cast(), self.len) };
-            if rc != 0 {
+            if !host::munmap(self.ptr, self.len) {
                 tracing::warn!(
                     name = %self.name,
                     len = self.len,
@@ -401,15 +400,6 @@ impl GuestMemory {
     }
 }
 
-fn ptr_to_u64(ptr: *mut u8) -> u64 {
-    u64::try_from(ptr.addr()).unwrap_or(0)
-}
-
-fn u64_to_void_ptr(addr: u64) -> *mut libc::c_void {
-    let u = usize::try_from(addr).unwrap_or(0);
-    std::ptr::with_exposed_provenance_mut::<u8>(u).cast()
-}
-
 fn map_one(
     host: HostPageSize,
     req: &MapRequest,
@@ -426,12 +416,6 @@ fn map_one(
         return Err(MapError::Invalid("zero map length"));
     }
 
-    let addr_hint = if fixed {
-        u64_to_void_ptr(target_guest)
-    } else {
-        ptr::null_mut()
-    };
-
     let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
     if fixed {
         flags |= fixed_map_flag();
@@ -439,20 +423,16 @@ fn map_one(
 
     // Map RW first so we can fill file content; tighten with mprotect after.
     let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
+    let fixed_addr = if fixed { Some(target_guest) } else { None };
 
-    // SAFETY: anonymous private map; addr is either null or a page-aligned
-    // preferred VA. Length is host-page multiple. On failure mmap returns
-    // MAP_FAILED and we convert errno.
-    let raw = unsafe { libc::mmap(addr_hint, map_len, prot_rw, flags, -1, 0) };
-    if raw == libc::MAP_FAILED {
+    let Some(base) = host::mmap(fixed_addr, map_len, prot_rw, flags, -1, 0) else {
         return Err(MapError::Sys {
             name: req.name.clone(),
             source: std::io::Error::last_os_error(),
         });
-    }
+    };
 
-    let base = raw.cast::<u8>();
-    let actual_host = ptr_to_u64(base);
+    let actual_host = host::ptr_addr_u64(base);
     // For non-fixed maps, guest VA becomes the host address (identity slide).
     let guest_addr = if fixed { target_guest } else { actual_host };
 
@@ -491,9 +471,7 @@ fn map_one(
 
     // Apply final protection. Empty initprot → PROT_NONE.
     let host_prot = darwin_to_host_prot(req.initprot);
-    // SAFETY: entire mapping owned; prot is a valid combination of PROT_*.
-    let rc = unsafe { libc::mprotect(base.cast(), map_len, host_prot) };
-    if rc != 0 {
+    if !host::mprotect(base, map_len, host_prot) {
         return Err(MapError::Sys {
             name: req.name.clone(),
             source: std::io::Error::last_os_error(),
@@ -514,18 +492,8 @@ fn map_one(
     Ok(region)
 }
 
-/// Linux: prefer `MAP_FIXED_NOREPLACE` so we do not clobber existing maps.
-/// Other Unix: `MAP_FIXED`.
 fn fixed_map_flag() -> libc::c_int {
-    #[cfg(target_os = "linux")]
-    {
-        // MAP_FIXED_NOREPLACE = 0x100000 on Linux.
-        0x100_000
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        libc::MAP_FIXED
-    }
+    host::fixed_map_flag()
 }
 
 /// Converts Darwin `VM_PROT_*` to host `PROT_*`.
@@ -560,18 +528,15 @@ pub fn map_stack(host: HostPageSize, size: u64) -> Result<MappedRegion, MapError
 
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
     let prot = libc::PROT_READ | libc::PROT_WRITE;
-    // SAFETY: anonymous private mapping of `map_len` host pages; no file.
-    let raw = unsafe { libc::mmap(ptr::null_mut(), map_len, prot, flags, -1, 0) };
-    if raw == libc::MAP_FAILED {
+    let Some(base) = host::mmap(None, map_len, prot, flags, -1, 0) else {
         return Err(MapError::Sys {
             name: "__STACK".into(),
             source: std::io::Error::last_os_error(),
         });
-    }
-    let base = raw.cast::<u8>();
+    };
     Ok(MappedRegion {
         name: "__STACK".into(),
-        guest_addr: ptr_to_u64(base),
+        guest_addr: host::ptr_addr_u64(base),
         ptr: base,
         len: map_len,
         prot: VM_PROT_READ | VM_PROT_WRITE,
@@ -582,34 +547,31 @@ pub fn map_stack(host: HostPageSize, size: u64) -> Result<MappedRegion, MapError
 
 /// Temporarily makes a region read/write (for SVC patching).
 pub fn mprotect_rw(region: &MappedRegion) -> Result<(), MapError> {
-    // SAFETY: owned mapping; RW is always a valid prot for private anonymous maps.
-    let rc = unsafe {
-        libc::mprotect(
-            region.ptr.cast(),
-            region.len,
-            libc::PROT_READ | libc::PROT_WRITE,
-        )
-    };
-    if rc != 0 {
-        return Err(MapError::Sys {
+    if host::mprotect(
+        region.ptr,
+        region.len,
+        libc::PROT_READ | libc::PROT_WRITE,
+    ) {
+        Ok(())
+    } else {
+        Err(MapError::Sys {
             name: region.name.clone(),
             source: std::io::Error::last_os_error(),
-        });
+        })
     }
-    Ok(())
 }
 
 /// Restores Darwin-derived host protection on a region.
 pub fn mprotect_darwin(region: &MappedRegion, darwin_prot: u32) -> Result<(), MapError> {
     let host_prot = darwin_to_host_prot(darwin_prot);
-    let rc = unsafe { libc::mprotect(region.ptr.cast(), region.len, host_prot) };
-    if rc != 0 {
-        return Err(MapError::Sys {
+    if host::mprotect(region.ptr, region.len, host_prot) {
+        Ok(())
+    } else {
+        Err(MapError::Sys {
             name: region.name.clone(),
             source: std::io::Error::last_os_error(),
-        });
+        })
     }
-    Ok(())
 }
 
 #[cfg(test)]

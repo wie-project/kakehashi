@@ -6,7 +6,9 @@ use std::os::unix::fs::MetadataExt;
 use crate::bottle::{self, translate_path};
 use crate::mem::registry_check_range;
 
-use super::common::{EBADF, EFAULT, ENOENT, SyscallArgs, SyscallResult, guest_ptr_mut};
+use crate::host;
+
+use super::common::{EBADF, EFAULT, ENOENT, SyscallArgs, SyscallResult, guest_write};
 use super::fd::guest_to_host_fd;
 
 /// Darwin `struct stat64` size (XNU).
@@ -61,12 +63,9 @@ pub(crate) fn handle_fstat(args: SyscallArgs) -> SyscallResult {
     if !registry_check_range(args.x1, DARWIN_STAT64_SIZE, true) {
         return SyscallResult::err(name, EFAULT);
     }
-    // SAFETY: host fd live; fstat into local libc stat then convert.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(host, std::ptr::addr_of_mut!(st)) };
-    if rc != 0 {
+    let Some(st) = host::fstat_fd(host) else {
         return SyscallResult::err(name, EBADF);
-    }
+    };
     write_darwin_stat64_from_libc(args.x1, &st, name)
 }
 
@@ -74,24 +73,23 @@ fn write_darwin_stat64(buf_addr: u64, meta: &Metadata, name: &'static str) -> Sy
     let mut raw = [0_u8; DARWIN_STAT64_SIZE];
     fill_stat64_bytes(
         &mut raw,
-        trunc_i32(meta.dev()),
-        trunc_u16_u32(meta.mode()),
-        trunc_u16_u64(meta.nlink()),
-        meta.ino(),
-        meta.uid(),
-        meta.gid(),
-        trunc_i32(meta.rdev()),
-        meta.atime(),
-        meta.mtime(),
-        meta.ctime(),
-        trunc_i64_from_u64(meta.size()),
-        trunc_i64_from_u64(meta.blocks()),
-        trunc_i32_from_u64(meta.blksize()),
+        &Stat64Fields {
+            dev: trunc_i32(meta.dev()),
+            mode: trunc_u16_u32(meta.mode()),
+            nlink: trunc_u16_u64(meta.nlink()),
+            ino: meta.ino(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            rdev: trunc_i32(meta.rdev()),
+            atime: meta.atime(),
+            mtime: meta.mtime(),
+            ctime: meta.ctime(),
+            size: trunc_i64_from_u64(meta.size()),
+            blocks: trunc_i64_from_u64(meta.blocks()),
+            blksize: trunc_i32_from_u64(meta.blksize()),
+        },
     );
-    // SAFETY: range checked writable.
-    let dst =
-        unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(buf_addr), DARWIN_STAT64_SIZE) };
-    dst.copy_from_slice(&raw);
+    guest_write(buf_addr, &raw);
     SyscallResult::ok(name, 0)
 }
 
@@ -101,26 +99,25 @@ fn write_darwin_stat64_from_libc(
     name: &'static str,
 ) -> SyscallResult {
     let mut raw = [0_u8; DARWIN_STAT64_SIZE];
-    // libc field widths differ by host OS — convert via integer intermediates.
     fill_stat64_bytes(
         &mut raw,
-        narrow_i32(st.st_dev),
-        narrow_u16(st.st_mode),
-        narrow_u16(st.st_nlink),
-        st.st_ino,
-        st.st_uid,
-        st.st_gid,
-        narrow_i32(st.st_rdev),
-        st.st_atime,
-        st.st_mtime,
-        st.st_ctime,
-        st.st_size,
-        st.st_blocks,
-        narrow_i32(st.st_blksize),
+        &Stat64Fields {
+            dev: narrow_i32(st.st_dev),
+            mode: narrow_u16(st.st_mode),
+            nlink: narrow_u16(st.st_nlink),
+            ino: st.st_ino,
+            uid: st.st_uid,
+            gid: st.st_gid,
+            rdev: narrow_i32(st.st_rdev),
+            atime: st.st_atime,
+            mtime: st.st_mtime,
+            ctime: st.st_ctime,
+            size: st.st_size,
+            blocks: st.st_blocks,
+            blksize: narrow_i32(st.st_blksize),
+        },
     );
-    let dst =
-        unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(buf_addr), DARWIN_STAT64_SIZE) };
-    dst.copy_from_slice(&raw);
+    guest_write(buf_addr, &raw);
     SyscallResult::ok(name, 0)
 }
 
@@ -160,10 +157,9 @@ fn narrow_u16<T: Copy + TryInto<u64>>(v: T) -> u16 {
     u16::try_from(wide & 0xFFFF).unwrap_or(0)
 }
 
-/// Packs a Darwin `struct stat64` (144 bytes) little-endian.
-#[allow(clippy::too_many_arguments)]
-fn fill_stat64_bytes(
-    raw: &mut [u8; DARWIN_STAT64_SIZE],
+/// Fields packed into Darwin `struct stat64` (144 bytes, little-endian).
+#[derive(Clone, Copy)]
+struct Stat64Fields {
     dev: i32,
     mode: u16,
     nlink: u16,
@@ -177,25 +173,28 @@ fn fill_stat64_bytes(
     size: i64,
     blocks: i64,
     blksize: i32,
-) {
-    put_i32(raw, 0, dev);
-    put_u16(raw, 4, mode);
-    put_u16(raw, 6, nlink);
-    put_u64(raw, 8, ino);
-    put_u32(raw, 16, uid);
-    put_u32(raw, 20, gid);
-    put_i32(raw, 24, rdev);
-    put_i64(raw, 32, atime);
+}
+
+/// Packs a Darwin `struct stat64` (144 bytes) little-endian.
+fn fill_stat64_bytes(raw: &mut [u8; DARWIN_STAT64_SIZE], f: &Stat64Fields) {
+    put_i32(raw, 0, f.dev);
+    put_u16(raw, 4, f.mode);
+    put_u16(raw, 6, f.nlink);
+    put_u64(raw, 8, f.ino);
+    put_u32(raw, 16, f.uid);
+    put_u32(raw, 20, f.gid);
+    put_i32(raw, 24, f.rdev);
+    put_i64(raw, 32, f.atime);
     put_i64(raw, 40, 0);
-    put_i64(raw, 48, mtime);
+    put_i64(raw, 48, f.mtime);
     put_i64(raw, 56, 0);
-    put_i64(raw, 64, ctime);
+    put_i64(raw, 64, f.ctime);
     put_i64(raw, 72, 0);
     put_i64(raw, 80, 0);
     put_i64(raw, 88, 0);
-    put_i64(raw, 96, size);
-    put_i64(raw, 104, blocks);
-    put_i32(raw, 112, blksize);
+    put_i64(raw, 96, f.size);
+    put_i64(raw, 104, f.blocks);
+    put_i32(raw, 112, f.blksize);
     put_u32(raw, 116, 0);
     put_u32(raw, 120, 0);
 }

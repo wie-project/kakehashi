@@ -1,12 +1,11 @@
 //! `sysctl` / `sysctlbyname` stubs that return plausible Darwin-shaped data.
 
-use std::sync::Mutex;
-
+use crate::host;
 use crate::mem::registry_check_range;
 
 use super::common::{
-    EFAULT, EINVAL, ENOENT, ENOMEM, EPERM, SyscallArgs, SyscallResult, guest_ptr, guest_ptr_mut,
-    reg_as_i32,
+    EFAULT, EINVAL, ENOENT, ENOMEM, EPERM, SyscallArgs, SyscallResult, guest_read_u64, guest_slice,
+    guest_write, reg_as_i32,
 };
 
 /// CTL level-0 names (XNU).
@@ -30,8 +29,8 @@ const HW_PAGESIZE: i32 = 7;
 const HW_MEMSIZE: i32 = 24;
 const HW_AVAILCPU: i32 = 25;
 
-/// Soft hostname (read-only stub).
-static HOSTNAME: Mutex<&'static [u8]> = Mutex::new(b"kakehashi");
+/// Soft hostname (read-only stub; never mutated).
+const HOSTNAME: &[u8] = b"kakehashi";
 
 /// `sysctl(name, namelen, oldp, oldlenp, newp, newlen)`.
 pub(crate) fn handle_sysctl(args: SyscallArgs) -> SyscallResult {
@@ -48,13 +47,11 @@ pub(crate) fn handle_sysctl(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
     let mut mib = vec![0_i32; n];
-    // SAFETY: range checked readable.
-    unsafe {
-        let src = guest_ptr(args.x0);
-        for (i, slot) in mib.iter_mut().enumerate() {
-            let p = src.wrapping_add(i.saturating_mul(4));
-            let b = std::slice::from_raw_parts(p, 4);
-            *slot = le_i32(b);
+    let raw = guest_slice(args.x0, mib_bytes);
+    for (i, slot) in mib.iter_mut().enumerate() {
+        let off = i.saturating_mul(4);
+        if let Some(chunk) = raw.get(off..off.saturating_add(4)) {
+            *slot = le_i32(chunk);
         }
     }
 
@@ -102,10 +99,7 @@ fn resolve_mib(mib: &[i32]) -> Option<SysctlValue> {
             "Darwin Kernel Version 24.0.0: kakehashi stub",
         )),
         [CTL_KERN, KERN_ARGMAX] => Some(SysctlValue::Int32(262_144)),
-        [CTL_KERN, KERN_HOSTNAME] => {
-            let guard = HOSTNAME.lock().ok()?;
-            Some(SysctlValue::Bytes(guard.to_vec()))
-        }
+        [CTL_KERN, KERN_HOSTNAME] => Some(SysctlValue::Bytes(HOSTNAME.to_vec())),
         [CTL_HW, HW_MACHINE] => Some(SysctlValue::String("arm64")),
         [CTL_HW, HW_MODEL] => Some(SysctlValue::String("Kakehashi")),
         [CTL_HW, HW_NCPU | HW_AVAILCPU] => Some(SysctlValue::Int32(host_ncpu())),
@@ -196,25 +190,18 @@ fn write_sysctl_value(
     if !registry_check_range(oldp, need, true) {
         return SyscallResult::err(name, EFAULT);
     }
-    // SAFETY: range checked.
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(oldp), need) };
-    dst.copy_from_slice(&bytes);
+    guest_write(oldp, &bytes);
     write_usize(oldlenp, need);
     SyscallResult::ok(name, 0)
 }
 
 fn read_usize(addr: u64) -> usize {
-    // SAFETY: range checked as 8 writable/readable bytes for size_t.
-    let p = guest_ptr(addr);
-    let b = unsafe { std::slice::from_raw_parts(p, 8) };
-    let v = le_u64(b);
-    usize::try_from(v).unwrap_or(0)
+    usize::try_from(guest_read_u64(addr)).unwrap_or(0)
 }
 
 fn write_usize(addr: u64, value: usize) {
     let v = u64::try_from(value).unwrap_or(0);
-    let dst = unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), 8) };
-    dst.copy_from_slice(&v.to_le_bytes());
+    guest_write(addr, &v.to_le_bytes());
 }
 
 fn le_i32(b: &[u8]) -> i32 {
@@ -226,37 +213,16 @@ fn le_i32(b: &[u8]) -> i32 {
     i32::from_le_bytes(a)
 }
 
-fn le_u64(b: &[u8]) -> u64 {
-    let mut a = [0_u8; 8];
-    let n = b.len().min(8);
-    if let (Some(dst), Some(src)) = (a.get_mut(..n), b.get(..n)) {
-        dst.copy_from_slice(src);
-    }
-    u64::from_le_bytes(a)
-}
-
 fn host_ncpu() -> i32 {
     let n = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     i32::try_from(n).unwrap_or(1)
 }
 
 fn host_pagesize_i32() -> i32 {
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 {
-        i32::try_from(n).unwrap_or(4096)
-    } else {
-        4096
-    }
+    let n = host::page_size().unwrap_or(4096);
+    i32::try_from(n).unwrap_or(4096)
 }
 
 fn host_memsize() -> u64 {
-    // Prefer _SC_PHYS_PAGES * page size when available.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if pages > 0 && page > 0 {
-        let p = u64::try_from(pages).unwrap_or(0);
-        let s = u64::try_from(page).unwrap_or(0);
-        return p.saturating_mul(s).max(64 * 1024 * 1024);
-    }
-    8 * 1024 * 1024 * 1024 // 8 GiB fallback
+    host::phys_mem_bytes()
 }

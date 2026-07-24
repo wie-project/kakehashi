@@ -1,4 +1,7 @@
-//! Shared syscall types, errno, and pointer helpers.
+//! Shared syscall types, errno, and guest-memory helpers.
+//!
+//! Guest VA ↔ host pointer helpers assume the identity map model. Callers must
+//! validate ranges with the active address space before reading or writing.
 
 use crate::trap::TrapOutcome;
 
@@ -106,4 +109,67 @@ pub(crate) fn guest_ptr(addr: u64) -> *const u8 {
 pub(crate) fn guest_ptr_mut(addr: u64) -> *mut u8 {
     let u = usize::try_from(addr).unwrap_or(0);
     std::ptr::with_exposed_provenance_mut(u)
+}
+
+/// Immutable view of `len` guest bytes (identity map).
+///
+/// # Safety contract
+/// Caller must have validated `[addr, addr+len)` as readable guest memory.
+#[must_use]
+#[allow(unsafe_code)]
+pub(crate) fn guest_slice<'a>(addr: u64, len: usize) -> &'a [u8] {
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: caller validated the range; identity map ⇒ guest VA is host VA.
+    unsafe { std::slice::from_raw_parts(guest_ptr(addr), len) }
+}
+
+/// Mutable view of `len` guest bytes (identity map).
+///
+/// # Safety contract
+/// Caller must have validated `[addr, addr+len)` as writable guest memory.
+#[must_use]
+#[allow(unsafe_code)]
+pub(crate) fn guest_slice_mut<'a>(addr: u64, len: usize) -> &'a mut [u8] {
+    if len == 0 {
+        return &mut [];
+    }
+    // SAFETY: caller validated the range; identity map ⇒ guest VA is host VA.
+    unsafe { std::slice::from_raw_parts_mut(guest_ptr_mut(addr), len) }
+}
+
+/// Write bytes into guest memory (identity map).
+///
+/// # Safety contract
+/// Caller must have validated `[addr, addr+data.len())` as writable guest memory.
+pub(crate) fn guest_write(addr: u64, data: &[u8]) {
+    guest_slice_mut(addr, data.len()).copy_from_slice(data);
+}
+
+/// Read a little-endian `u32` from guest memory.
+#[must_use]
+pub(crate) fn guest_read_u32(addr: u64) -> u32 {
+    let mut le = [0_u8; 4];
+    le.copy_from_slice(guest_slice(addr, 4));
+    u32::from_le_bytes(le)
+}
+
+/// Write a little-endian `u32` into guest memory.
+pub(crate) fn guest_write_u32(addr: u64, value: u32) {
+    guest_write(addr, &value.to_le_bytes());
+}
+
+/// Read a little-endian `u64` from guest memory.
+#[must_use]
+pub(crate) fn guest_read_u64(addr: u64) -> u64 {
+    let mut le = [0_u8; 8];
+    le.copy_from_slice(guest_slice(addr, 8));
+    u64::from_le_bytes(le)
+}
+
+/// Read a little-endian `i32` from guest memory.
+#[must_use]
+pub(crate) fn guest_read_i32(addr: u64) -> i32 {
+    i32::from_ne_bytes(guest_read_u32(addr).to_ne_bytes())
 }

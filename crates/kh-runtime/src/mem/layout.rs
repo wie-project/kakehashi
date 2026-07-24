@@ -178,17 +178,15 @@ pub enum PageError {
     },
 }
 
-/// Queries the OS page size. Isolated so `unsafe` does not spread.
-#[allow(unsafe_code)]
+/// Queries the OS page size via [`crate::host`].
 fn detect_host_page_size() -> Result<HostPageSize, PageError> {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` takes no pointers and only returns a
-    // scalar page size or -1 on error. No memory is dereferenced.
-    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if raw <= 0 {
+    let Some(raw) = crate::host::page_size() else {
         return Err(PageError::DetectFailed);
-    }
+    };
     let Ok(bytes) = u32::try_from(raw) else {
-        return Err(PageError::UnsupportedHostPageSize { bytes: raw });
+        return Err(PageError::UnsupportedHostPageSize {
+            bytes: i64::try_from(raw).unwrap_or(i64::MAX),
+        });
     };
     HostPageSize::from_bytes(bytes).ok_or(PageError::UnsupportedHostPageSize {
         bytes: i64::from(bytes),

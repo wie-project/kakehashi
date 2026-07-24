@@ -1,12 +1,13 @@
-//! Guest file-descriptor table and FD-related BSD syscalls.
+//! Guest file-descriptor table accessors and FD-related BSD syscalls.
 
-use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
-use std::sync::Mutex;
+use std::io::{Read, Write};
+use std::os::fd::{IntoRawFd, RawFd};
 
 use crate::bottle::{self, translate_path};
+use crate::host;
 use crate::mem::registry_check_range;
+use crate::process;
 
 use super::common::{
     EBADF, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, reg_as_i32, reg_as_i64,
@@ -38,31 +39,6 @@ const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
 const SEEK_END: i32 = 2;
 
-// Guest FD → host FD. 0/1/2 are identity (stdin/out/err).
-static FD_TABLE: Mutex<Option<HashMap<i32, RawFd>>> = Mutex::new(None);
-static NEXT_FD: Mutex<i32> = Mutex::new(32);
-
-/// Resets the guest FD table (called from [`super::reset_syscall_state`]).
-pub(crate) fn reset_fd_table() {
-    if let Ok(mut t) = FD_TABLE.lock() {
-        // Close owned host fds so we do not leak across runs in tests.
-        if let Some(map) = t.take() {
-            for (gfd, hfd) in map {
-                if gfd > 2 {
-                    // SAFETY: host fd was owned by the table.
-                    unsafe {
-                        let _ = libc::close(hfd);
-                    }
-                }
-            }
-        }
-        *t = Some(HashMap::new());
-    }
-    if let Ok(mut n) = NEXT_FD.lock() {
-        *n = 32;
-    }
-}
-
 /// Resolves a guest FD register value to a host `RawFd`.
 #[must_use]
 pub(crate) fn guest_to_host_fd(x0: u64) -> Option<RawFd> {
@@ -70,39 +46,16 @@ pub(crate) fn guest_to_host_fd(x0: u64) -> Option<RawFd> {
 }
 
 fn guest_to_host_fd_i32(gfd: i32) -> Option<RawFd> {
-    if gfd == 0 || gfd == 1 || gfd == 2 {
-        return Some(gfd);
-    }
-    FD_TABLE
-        .lock()
-        .ok()
-        .and_then(|t| t.as_ref().and_then(|m| m.get(&gfd).copied()))
+    process::with_ref(|p| p.fds().get(gfd))
 }
 
-/// Allocates a new guest FD bound to `host`.
-pub(crate) fn alloc_guest_fd(host: RawFd) -> Option<i32> {
-    let mut table = FD_TABLE.lock().ok()?;
-    let map = table.get_or_insert_with(HashMap::new);
-    let mut next = NEXT_FD.lock().ok()?;
-    // Skip collisions (unlikely with monotonic counter).
-    for _ in 0..1024 {
-        let gfd = *next;
-        *next = next.saturating_add(1);
-        if gfd > 2 && !map.contains_key(&gfd) {
-            map.insert(gfd, host);
-            return Some(gfd);
-        }
-    }
-    None
+/// Allocates a new guest FD bound to `host_fd`.
+pub(crate) fn alloc_guest_fd(host_fd: RawFd) -> Option<i32> {
+    process::with_mut(|p| p.fds_mut().alloc(host_fd))
 }
 
 fn take_guest_fd(gfd: i32) -> Option<RawFd> {
-    let mut table = FD_TABLE.lock().ok()?;
-    table.as_mut()?.remove(&gfd)
-}
-
-fn peek_guest_fd(gfd: i32) -> Option<RawFd> {
-    guest_to_host_fd_i32(gfd)
+    process::with_mut(|p| p.fds_mut().take(gfd))
 }
 
 /// `open` — path in `x0`, flags in `x1`, mode in `x2` (ignored unless create).
@@ -125,29 +78,19 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
         return open_translated(&path, args.x2, name);
     }
 
-    let Some(host_dir) = peek_guest_fd(dirfd) else {
+    let Some(host_dir) = guest_to_host_fd_i32(dirfd) else {
         return SyscallResult::err(name, EBADF);
     };
 
-    // Relative openat against a directory FD (no bottle rewrite of relative).
     let flags = darwin_to_host_open_flags(args.x2);
     let mode = u32::try_from(args.x3 & 0xFFFF).unwrap_or(0o666);
-    // SAFETY: host_dir is a live table fd; path is a temporary CString.
     let Ok(c_path) = std::ffi::CString::new(path) else {
         return SyscallResult::err(name, EFAULT);
     };
-    let rc = unsafe { libc::openat(host_dir, c_path.as_ptr(), flags, mode) };
-    if rc < 0 {
+    let Some(rc) = host::openat(host_dir, &c_path, flags, mode) else {
         return SyscallResult::err(name, ENOENT);
-    }
-    if let Some(gfd) = alloc_guest_fd(rc) {
-        SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
-    } else {
-        unsafe {
-            let _ = libc::close(rc);
-        }
-        SyscallResult::err(name, EPERM)
-    }
+    };
+    finish_open(name, rc)
 }
 
 fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
@@ -170,13 +113,14 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     let Ok(file) = opts.open(&host_path) else {
         return SyscallResult::err(name, ENOENT);
     };
-    let host_fd = file.into_raw_fd();
+    finish_open(name, file.into_raw_fd())
+}
+
+fn finish_open(name: &'static str, host_fd: RawFd) -> SyscallResult {
     if let Some(gfd) = alloc_guest_fd(host_fd) {
         SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
     } else {
-        unsafe {
-            let _ = libc::close(host_fd);
-        }
+        host::close_fd(host_fd);
         SyscallResult::err(name, EPERM)
     }
 }
@@ -190,12 +134,8 @@ pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
     }
     match take_guest_fd(gfd) {
         Some(hfd) => {
-            let rc = unsafe { libc::close(hfd) };
-            if rc == 0 {
-                SyscallResult::ok(name, 0)
-            } else {
-                SyscallResult::err(name, EBADF)
-            }
+            host::close_fd(hfd);
+            SyscallResult::ok(name, 0)
         }
         None => SyscallResult::err(name, EBADF),
     }
@@ -204,28 +144,19 @@ pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
 /// `dup`.
 pub(crate) fn handle_dup(args: SyscallArgs) -> SyscallResult {
     let name = "dup";
-    let Some(host) = guest_to_host_fd(args.x0) else {
+    let Some(h) = guest_to_host_fd(args.x0) else {
         return SyscallResult::err(name, EBADF);
     };
-    // SAFETY: host is a valid open fd.
-    let new_host = unsafe { libc::dup(host) };
-    if new_host < 0 {
+    let Some(new_host) = host::dup_fd(h) else {
         return SyscallResult::err(name, EBADF);
-    }
-    if let Some(gfd) = alloc_guest_fd(new_host) {
-        SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
-    } else {
-        unsafe {
-            let _ = libc::close(new_host);
-        }
-        SyscallResult::err(name, EPERM)
-    }
+    };
+    finish_open(name, new_host)
 }
 
 /// `lseek` — fd `x0`, offset `x1`, whence `x2`.
 pub(crate) fn handle_lseek(args: SyscallArgs) -> SyscallResult {
     let name = "lseek";
-    let Some(host) = guest_to_host_fd(args.x0) else {
+    let Some(h) = guest_to_host_fd(args.x0) else {
         return SyscallResult::err(name, EBADF);
     };
     let offset = reg_as_i64(args.x1);
@@ -236,104 +167,88 @@ pub(crate) fn handle_lseek(args: SyscallArgs) -> SyscallResult {
         SEEK_END => libc::SEEK_END,
         _ => return SyscallResult::err(name, EINVAL),
     };
-    // SAFETY: host fd live.
-    let rc = unsafe { libc::lseek(host, offset, host_whence) };
-    if rc < 0 {
+    let Some(rc) = host::lseek_fd(h, offset, host_whence) else {
         return SyscallResult::err(name, EBADF);
-    }
+    };
     SyscallResult::ok(name, u64::from_ne_bytes(rc.to_ne_bytes()))
 }
 
 /// `fcntl` — fd `x0`, cmd `x1`, arg `x2`.
 pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
     let name = "fcntl";
-    let Some(host) = guest_to_host_fd(args.x0) else {
+    let Some(h) = guest_to_host_fd(args.x0) else {
         return SyscallResult::err(name, EBADF);
     };
     let cmd = reg_as_i32(args.x1);
     let arg = reg_as_i32(args.x2);
     match cmd {
-        F_GETFD => {
-            let rc = unsafe { libc::fcntl(host, libc::F_GETFD) };
-            if rc < 0 {
-                SyscallResult::err(name, EBADF)
-            } else {
-                SyscallResult::ok(name, u64::try_from(rc).unwrap_or(0))
-            }
-        }
-        F_SETFD => {
-            let rc = unsafe { libc::fcntl(host, libc::F_SETFD, arg) };
-            if rc < 0 {
-                SyscallResult::err(name, EBADF)
-            } else {
-                SyscallResult::ok(name, 0)
-            }
-        }
+        F_GETFD => match host::fcntl_get(h, libc::F_GETFD) {
+            Some(rc) => SyscallResult::ok(name, u64::try_from(rc).unwrap_or(0)),
+            None => SyscallResult::err(name, EBADF),
+        },
+        F_SETFD => match host::fcntl_set(h, libc::F_SETFD, arg) {
+            Some(_) => SyscallResult::ok(name, 0),
+            None => SyscallResult::err(name, EBADF),
+        },
         F_GETFL => {
-            let rc = unsafe { libc::fcntl(host, libc::F_GETFL) };
-            if rc < 0 {
+            let Some(rc) = host::fcntl_get(h, libc::F_GETFL) else {
                 return SyscallResult::err(name, EBADF);
-            }
-            // Best-effort map common host bits → Darwin O_* for libc probes.
-            let fl = u32::try_from(rc).unwrap_or(0);
-            let accmode = u32::try_from(libc::O_ACCMODE).unwrap_or(3);
-            let o_wronly = u32::try_from(libc::O_WRONLY).unwrap_or(1);
-            let o_rdwr = u32::try_from(libc::O_RDWR).unwrap_or(2);
-            let o_append = u32::try_from(libc::O_APPEND).unwrap_or(0);
-            let o_nonblock = u32::try_from(libc::O_NONBLOCK).unwrap_or(0);
-            let mut d = DARWIN_O_RDONLY;
-            let acc = fl & accmode;
-            if acc == o_wronly {
-                d = DARWIN_O_WRONLY;
-            } else if acc == o_rdwr {
-                d = DARWIN_O_RDWR;
-            }
-            if o_append != 0 && fl & o_append != 0 {
-                d |= DARWIN_O_APPEND;
-            }
-            if o_nonblock != 0 && fl & o_nonblock != 0 {
-                d |= DARWIN_O_NONBLOCK;
-            }
-            SyscallResult::ok(name, d)
+            };
+            SyscallResult::ok(name, host_fl_to_darwin(rc))
         }
         F_SETFL => {
-            // Map a few Darwin bits to host; ignore unknown.
-            let mut host_fl = 0_i32;
-            let f = u64::try_from(arg).unwrap_or(0);
-            if f & DARWIN_O_APPEND != 0 {
-                host_fl |= libc::O_APPEND;
-            }
-            if f & DARWIN_O_NONBLOCK != 0 {
-                host_fl |= libc::O_NONBLOCK;
-            }
-            let rc = unsafe { libc::fcntl(host, libc::F_SETFL, host_fl) };
-            if rc < 0 {
-                SyscallResult::err(name, EBADF)
-            } else {
-                SyscallResult::ok(name, 0)
+            let host_fl = darwin_fl_to_host(u64::try_from(arg).unwrap_or(0));
+            match host::fcntl_set(h, libc::F_SETFL, host_fl) {
+                Some(_) => SyscallResult::ok(name, 0),
+                None => SyscallResult::err(name, EBADF),
             }
         }
         F_DUPFD => {
-            let rc = unsafe { libc::fcntl(host, libc::F_DUPFD, arg.max(0)) };
-            if rc < 0 {
+            let Some(rc) = host::fcntl_set(h, libc::F_DUPFD, arg.max(0)) else {
                 return SyscallResult::err(name, EBADF);
-            }
-            if let Some(gfd) = alloc_guest_fd(rc) {
-                SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
-            } else {
-                unsafe {
-                    let _ = libc::close(rc);
-                }
-                SyscallResult::err(name, EPERM)
-            }
+            };
+            finish_open(name, rc)
         }
         _ => SyscallResult::err(name, EINVAL),
     }
 }
 
+fn host_fl_to_darwin(rc: i32) -> u64 {
+    let fl = u32::try_from(rc).unwrap_or(0);
+    let accmode = u32::try_from(libc::O_ACCMODE).unwrap_or(3);
+    let o_wronly = u32::try_from(libc::O_WRONLY).unwrap_or(1);
+    let o_rdwr = u32::try_from(libc::O_RDWR).unwrap_or(2);
+    let o_append = u32::try_from(libc::O_APPEND).unwrap_or(0);
+    let o_nonblock = u32::try_from(libc::O_NONBLOCK).unwrap_or(0);
+    let mut d = DARWIN_O_RDONLY;
+    let acc = fl & accmode;
+    if acc == o_wronly {
+        d = DARWIN_O_WRONLY;
+    } else if acc == o_rdwr {
+        d = DARWIN_O_RDWR;
+    }
+    if o_append != 0 && fl & o_append != 0 {
+        d |= DARWIN_O_APPEND;
+    }
+    if o_nonblock != 0 && fl & o_nonblock != 0 {
+        d |= DARWIN_O_NONBLOCK;
+    }
+    d
+}
+
+fn darwin_fl_to_host(f: u64) -> i32 {
+    let mut host_fl = 0_i32;
+    if f & DARWIN_O_APPEND != 0 {
+        host_fl |= libc::O_APPEND;
+    }
+    if f & DARWIN_O_NONBLOCK != 0 {
+        host_fl |= libc::O_NONBLOCK;
+    }
+    host_fl
+}
+
 /// Writes data to a host fd (stdio special-cased for tests).
 pub(crate) fn write_host_fd(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
-    use std::io::Write;
     if fd == 1 {
         let mut out = std::io::stdout().lock();
         out.write_all(data)?;
@@ -346,70 +261,80 @@ pub(crate) fn write_host_fd(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
         out.flush()?;
         return Ok(data.len());
     }
-    // SAFETY: fd from table / stdio.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let n = file.write(data)?;
-    let _ = file.into_raw_fd();
-    Ok(n)
+    host::write_fd(fd, data)
 }
 
 /// Reads from a host fd.
 pub(crate) fn read_host_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    use std::io::Read;
     if fd == 0 {
         return std::io::stdin().lock().read(buf);
     }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let n = file.read(buf)?;
-    let _ = file.into_raw_fd();
-    Ok(n)
+    host::read_fd(fd, buf)
 }
 
 // --- open flags --------------------------------------------------------------
 
+/// Bit-packed open flags (avoids a bool-heavy struct for clippy).
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_excessive_bools)]
-struct OpenFlags {
-    read: bool,
-    write: bool,
-    create: bool,
-    truncate: bool,
-    append: bool,
-    exclusive: bool,
+struct OpenFlags(u8);
+
+impl OpenFlags {
+    const READ: u8 = 1 << 0;
+    const WRITE: u8 = 1 << 1;
+    const CREATE: u8 = 1 << 2;
+    const TRUNCATE: u8 = 1 << 3;
+    const APPEND: u8 = 1 << 4;
+    const EXCLUSIVE: u8 = 1 << 5;
+
+    const fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
 }
 
 fn darwin_open_flags(raw: u64) -> OpenFlags {
     let acc = raw & 0x3;
-    OpenFlags {
-        read: acc == DARWIN_O_RDONLY || acc == DARWIN_O_RDWR,
-        write: acc == DARWIN_O_WRONLY || acc == DARWIN_O_RDWR,
-        create: raw & DARWIN_O_CREAT != 0,
-        truncate: raw & DARWIN_O_TRUNC != 0,
-        append: raw & DARWIN_O_APPEND != 0,
-        exclusive: raw & DARWIN_O_EXCL != 0,
+    let mut bits = 0_u8;
+    if acc == DARWIN_O_RDONLY || acc == DARWIN_O_RDWR {
+        bits |= OpenFlags::READ;
     }
+    if acc == DARWIN_O_WRONLY || acc == DARWIN_O_RDWR {
+        bits |= OpenFlags::WRITE;
+    }
+    if raw & DARWIN_O_CREAT != 0 {
+        bits |= OpenFlags::CREATE;
+    }
+    if raw & DARWIN_O_TRUNC != 0 {
+        bits |= OpenFlags::TRUNCATE;
+    }
+    if raw & DARWIN_O_APPEND != 0 {
+        bits |= OpenFlags::APPEND;
+    }
+    if raw & DARWIN_O_EXCL != 0 {
+        bits |= OpenFlags::EXCLUSIVE;
+    }
+    OpenFlags(bits)
 }
 
 fn apply_open_flags(opts: &mut OpenOptions, flags: OpenFlags) {
-    if flags.read {
+    if flags.has(OpenFlags::READ) {
         opts.read(true);
     }
-    if flags.write {
+    if flags.has(OpenFlags::WRITE) {
         opts.write(true);
     }
-    if !flags.read && !flags.write {
+    if !flags.has(OpenFlags::READ) && !flags.has(OpenFlags::WRITE) {
         opts.read(true);
     }
-    if flags.create {
+    if flags.has(OpenFlags::CREATE) {
         opts.create(true);
     }
-    if flags.truncate {
+    if flags.has(OpenFlags::TRUNCATE) {
         opts.truncate(true);
     }
-    if flags.append {
+    if flags.has(OpenFlags::APPEND) {
         opts.append(true);
     }
-    if flags.create && flags.exclusive {
+    if flags.has(OpenFlags::CREATE) && flags.has(OpenFlags::EXCLUSIVE) {
         opts.create_new(true);
     }
 }
@@ -417,23 +342,23 @@ fn apply_open_flags(opts: &mut OpenOptions, flags: OpenFlags) {
 fn darwin_to_host_open_flags(raw: u64) -> libc::c_int {
     let of = darwin_open_flags(raw);
     let mut f = 0;
-    if of.read && of.write {
+    if of.has(OpenFlags::READ) && of.has(OpenFlags::WRITE) {
         f |= libc::O_RDWR;
-    } else if of.write {
+    } else if of.has(OpenFlags::WRITE) {
         f |= libc::O_WRONLY;
     } else {
         f |= libc::O_RDONLY;
     }
-    if of.create {
+    if of.has(OpenFlags::CREATE) {
         f |= libc::O_CREAT;
     }
-    if of.truncate {
+    if of.has(OpenFlags::TRUNCATE) {
         f |= libc::O_TRUNC;
     }
-    if of.append {
+    if of.has(OpenFlags::APPEND) {
         f |= libc::O_APPEND;
     }
-    if of.exclusive {
+    if of.has(OpenFlags::EXCLUSIVE) {
         f |= libc::O_EXCL;
     }
     f

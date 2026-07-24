@@ -47,7 +47,12 @@ pub use session::{
 };
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod test_util {
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     /// Serialize identity-map unit tests so preferred-VA races under
@@ -57,5 +62,38 @@ pub(crate) mod test_util {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Unique path under the system temp directory.
+    pub(crate) fn temp_path(prefix: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("kh-{prefix}-{}-{n}", std::process::id()))
+    }
+
+    /// Write `bytes` to a new unique temp file; returns the path.
+    pub(crate) fn write_temp_bytes(prefix: &str, bytes: &[u8]) -> PathBuf {
+        let path = temp_path(prefix);
+        let mut f = File::create(&path).expect("create temp");
+        f.write_all(bytes).expect("write temp");
+        path
+    }
+
+    /// Create a unique temp directory.
+    pub(crate) fn temp_dir(prefix: &str) -> PathBuf {
+        let dir = temp_path(prefix);
+        std::fs::create_dir_all(&dir).expect("mkdir temp");
+        dir
+    }
+
+    /// Write a file under `dir` (creating parents as needed).
+    pub(crate) fn write_under(dir: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        let mut f = File::create(&path).expect("create under");
+        f.write_all(bytes).expect("write under");
+        path
     }
 }

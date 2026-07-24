@@ -2,15 +2,12 @@
 //!
 //! Guest absolute paths such as `/usr/lib/libSystem.B.dylib` resolve to
 //! `{root}/usr/lib/libSystem.B.dylib`. Path escape via `..` is rejected.
-#![allow(unsafe_code)]
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 
 use thiserror::Error;
 
-/// Process-wide bottle root for the trap backend (set before guest jump).
-static BOTTLE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+use crate::process;
 
 /// Path translation errors.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -32,15 +29,13 @@ pub enum PathError {
 ///
 /// Pass `None` to clear (pass-through absolute guest paths to the host).
 pub fn set_bottle_root(root: Option<PathBuf>) {
-    if let Ok(mut guard) = BOTTLE_ROOT.lock() {
-        *guard = root;
-    }
+    process::set_bottle_root(root);
 }
 
 /// Returns a clone of the configured bottle root, if any.
 #[must_use]
 pub fn bottle_root() -> Option<PathBuf> {
-    BOTTLE_ROOT.lock().ok().and_then(|g| g.clone())
+    process::bottle_root()
 }
 
 /// Translates a guest path string into a host path.
@@ -91,6 +86,7 @@ fn strip_root_components(path: &Path) -> Result<PathBuf, PathError> {
 ///
 /// Used by `open` / `access` handlers. Caps length to avoid runaway scans.
 #[must_use]
+#[allow(unsafe_code)]
 pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
     if ptr == 0 || max_len == 0 {
         return None;
@@ -111,34 +107,37 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn absolute_under_bottle() {
         let root = Path::new("/opt/bottle");
-        let host = translate_path_with_root(Some(root), "/usr/lib/libSystem.B.dylib").unwrap();
+        let host = translate_path_with_root(Some(root), "/usr/lib/libSystem.B.dylib")
+            .expect("translate absolute");
         assert_eq!(host, PathBuf::from("/opt/bottle/usr/lib/libSystem.B.dylib"));
     }
 
     #[test]
     fn relative_under_bottle() {
         let root = Path::new("/opt/bottle");
-        let host = translate_path_with_root(Some(root), "tmp/x").unwrap();
+        let host =
+            translate_path_with_root(Some(root), "tmp/x").expect("translate relative");
         assert_eq!(host, PathBuf::from("/opt/bottle/tmp/x"));
     }
 
     #[test]
     fn no_bottle_passthrough() {
-        let host = translate_path_with_root(None, "/tmp/foo").unwrap();
+        let host = translate_path_with_root(None, "/tmp/foo").expect("passthrough");
         assert_eq!(host, PathBuf::from("/tmp/foo"));
     }
 
     #[test]
     fn rejects_parent_dir() {
         let root = Path::new("/opt/bottle");
-        let err = translate_path_with_root(Some(root), "/usr/../etc/passwd").unwrap_err();
+        let err = translate_path_with_root(Some(root), "/usr/../etc/passwd")
+            .expect_err("must reject ..");
         assert!(matches!(err, PathError::Escape(_)));
     }
 

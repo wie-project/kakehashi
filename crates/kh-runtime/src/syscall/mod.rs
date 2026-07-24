@@ -14,7 +14,6 @@
 //! - [`time_sys`] — gettimeofday/clock_gettime
 //! - [`sysctl`] — sysctl/sysctlbyname
 //! - [`signal`] — sigprocmask/sigaction (soft)
-#![allow(unsafe_code)]
 
 mod common;
 mod fd;
@@ -28,8 +27,7 @@ mod sysctl;
 mod table;
 mod time_sys;
 
-use std::sync::Mutex;
-
+use crate::process as proc_state;
 use crate::trap::TrapOutcome;
 
 pub use common::{
@@ -37,34 +35,20 @@ pub use common::{
 };
 pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
 
-static SYSCALL_COUNT: Mutex<u64> = Mutex::new(0);
-static MAX_SYSCALLS: Mutex<u64> = Mutex::new(256);
-
 /// Resets FD table, soft signal state, and syscall counter for a new run.
 pub fn reset_syscall_state(max_syscalls: usize) {
-    fd::reset_fd_table();
-    signal::reset_signal_state();
-    if let Ok(mut c) = SYSCALL_COUNT.lock() {
-        *c = 0;
-    }
-    if let Ok(mut m) = MAX_SYSCALLS.lock() {
-        *m = u64::try_from(max_syscalls).unwrap_or(256);
-    }
+    proc_state::reset_run(max_syscalls);
 }
 
 /// Dispatches a Darwin BSD syscall by number.
 pub fn dispatch(args: SyscallArgs) -> SyscallResult {
-    if let Ok(mut c) = SYSCALL_COUNT.lock() {
-        *c = c.saturating_add(1);
-        let max = MAX_SYSCALLS.lock().map_or(256, |m| *m);
-        if *c > max {
-            return SyscallResult {
-                name: "max_syscalls",
-                outcome: TrapOutcome::Exit { code: 1 },
-                retval: Some(1),
-                error: false,
-            };
-        }
+    if proc_state::with_mut(proc_state::ProcessState::tick_syscall) {
+        return SyscallResult {
+            name: "max_syscalls",
+            outcome: TrapOutcome::Exit { code: 1 },
+            retval: Some(1),
+            error: false,
+        };
     }
 
     // Synthetic bottle helpers (puts / minimal printf) use high x16 values.
@@ -102,25 +86,21 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::cast_possible_truncation,
-    clippy::indexing_slicing
-)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::mem::{
         HostPageSize, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, map_stack, register_borrowed,
         registry_clear,
     };
-    use crate::syscall::mem_sys::{
+    use super::common::{guest_read_i32, guest_read_u64, guest_slice, guest_write};
+    use super::mem_sys::{
         DARWIN_MAP_ANON, DARWIN_MAP_PRIVATE, DARWIN_MAP_SHARED, host_page_size,
     };
     use std::io::Write;
 
     fn lock_syscalls() -> std::sync::MutexGuard<'static, ()> {
-        crate::mem::registry_test_lock()
+        proc_state::test_lock()
     }
 
     fn args(number: u32, x0: u64, x1: u64, x2: u64) -> SyscallArgs {
@@ -134,6 +114,17 @@ mod tests {
             x4: 0,
             x5: 0,
         }
+    }
+
+    fn guest_va(base: u64, off: usize) -> u64 {
+        base.wrapping_add(u64::try_from(off).unwrap())
+    }
+
+    fn write_cstr(base: u64, off: usize, s: &str) -> u64 {
+        let va = guest_va(base, off);
+        guest_write(va, s.as_bytes());
+        guest_write(va.wrapping_add(u64::try_from(s.len()).unwrap()), &[0]);
+        va
     }
 
     #[test]
@@ -222,11 +213,12 @@ mod tests {
         reset_syscall_state(256);
         registry_clear();
         let page = host_page_size();
+        let page_u = u64::try_from(page).unwrap_or(4096);
         let r = dispatch(SyscallArgs {
             pc: 0,
             number: 197,
             x0: 0,
-            x1: u64::try_from(page).unwrap_or(4096),
+            x1: page_u,
             x2: u64::from(VM_PROT_READ | VM_PROT_WRITE),
             x3: DARWIN_MAP_ANON | DARWIN_MAP_PRIVATE,
             x4: u64::MAX,
@@ -242,7 +234,7 @@ mod tests {
             pc: 0,
             number: 74,
             x0: addr,
-            x1: u64::try_from(page).unwrap_or(4096),
+            x1: page_u,
             x2: u64::from(VM_PROT_READ | VM_PROT_EXECUTE),
             x3: 0,
             x4: 0,
@@ -254,7 +246,7 @@ mod tests {
             pc: 0,
             number: 73,
             x0: addr,
-            x1: u64::try_from(page).unwrap_or(4096),
+            x1: page_u,
             x2: 0,
             x3: 0,
             x4: 0,
@@ -280,27 +272,18 @@ mod tests {
 
         let base = stack.guest_addr;
         let path_str = path.to_str().unwrap();
-        let path_off = 0x1000_usize;
-        let path_ptr = usize::try_from(base).unwrap() + path_off;
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(path_ptr),
-                path_str.len() + 1,
-            );
-            dst[..path_str.len()].copy_from_slice(path_str.as_bytes());
-            dst[path_str.len()] = 0;
-        }
-        let path_va = base + u64::try_from(path_off).unwrap();
+        let path_va = write_cstr(base, 0x1000, path_str);
         let open = dispatch(args(5, path_va, 2, 0)); // O_RDWR
         assert!(!open.error, "open: {:?}", open.retval);
         let gfd = open.retval.expect("fd");
 
         let page = host_page_size();
+        let page_u = u64::try_from(page).unwrap();
         let map = dispatch(SyscallArgs {
             pc: 0,
             number: 197,
             x0: 0,
-            x1: u64::try_from(page).unwrap(),
+            x1: page_u,
             x2: u64::from(VM_PROT_READ | VM_PROT_WRITE),
             x3: DARWIN_MAP_SHARED,
             x4: gfd,
@@ -308,21 +291,14 @@ mod tests {
         });
         assert!(!map.error, "mmap file: {:?}", map.retval);
         let addr = map.retval.expect("map");
-        let host_addr = usize::try_from(addr).unwrap();
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(host_addr),
-                10,
-            )
-        };
-        assert_eq!(&bytes[..9], b"KAKEMAP01");
-        bytes[0] = b'X';
+        assert_eq!(guest_slice(addr, 9), b"KAKEMAP01");
+        guest_write(addr, b"X");
 
         let sync = dispatch(SyscallArgs {
             pc: 0,
             number: 65,
             x0: addr,
-            x1: u64::try_from(page).unwrap(),
+            x1: page_u,
             x2: 0x10, // MS_SYNC
             x3: 0,
             x4: 0,
@@ -334,7 +310,7 @@ mod tests {
             pc: 0,
             number: 73,
             x0: addr,
-            x1: u64::try_from(page).unwrap(),
+            x1: page_u,
             x2: 0,
             x3: 0,
             x4: 0,
@@ -344,8 +320,8 @@ mod tests {
         assert!(!dispatch(args(6, gfd, 0, 0)).error);
 
         let on_disk = std::fs::read(&path).expect("reread");
-        assert_eq!(on_disk[0], b'X');
-        assert_eq!(&on_disk[1..9], b"AKEMAP01");
+        assert_eq!(on_disk.first().copied(), Some(b'X'));
+        assert_eq!(on_disk.get(1..9), Some(b"AKEMAP01".as_slice()));
 
         registry_clear();
         drop(stack);
@@ -362,29 +338,19 @@ mod tests {
         let stack = map_stack(host, 64 * 1024).expect("stack");
         register_borrowed(&stack);
         let base = stack.guest_addr;
-        let tv_off = 0x400_usize;
-        let ts_off = 0x500_usize;
-        let tv_va = base + u64::try_from(tv_off).unwrap();
-        let ts_va = base + u64::try_from(ts_off).unwrap();
+        let tv_va = guest_va(base, 0x400);
+        let ts_va = guest_va(base, 0x500);
 
         let r = dispatch(args(116, tv_va, 0, 0));
         assert!(!r.error, "gettimeofday: {:?}", r.retval);
-        let sec = unsafe {
-            let p =
-                std::ptr::with_exposed_provenance::<u8>(usize::try_from(base).unwrap() + tv_off);
-            let b = std::slice::from_raw_parts(p, 8);
-            i64::from_le_bytes(b.try_into().unwrap())
-        };
+        let sec = guest_read_u64(tv_va);
+        let sec = i64::from_ne_bytes(sec.to_ne_bytes());
         assert!(sec > 1_600_000_000, "tv_sec={sec}");
 
         let r2 = dispatch(args(266, 0, ts_va, 0)); // CLOCK_REALTIME
         assert!(!r2.error, "clock_gettime: {:?}", r2.retval);
-        let sec2 = unsafe {
-            let p =
-                std::ptr::with_exposed_provenance::<u8>(usize::try_from(base).unwrap() + ts_off);
-            let b = std::slice::from_raw_parts(p, 8);
-            i64::from_le_bytes(b.try_into().unwrap())
-        };
+        let sec2 = guest_read_u64(ts_va);
+        let sec2 = i64::from_ne_bytes(sec2.to_ne_bytes());
         assert!((sec2 - sec).abs() < 5);
 
         registry_clear();
@@ -400,37 +366,23 @@ mod tests {
         let stack = map_stack(host, 64 * 1024).expect("stack");
         register_borrowed(&stack);
         let base = stack.guest_addr;
-        let key = b"hw.ncpu\0";
-        let key_off = 0x200_usize;
-        let val_off = 0x300_usize;
-        let len_off = 0x310_usize;
-        let host_base = usize::try_from(base).unwrap();
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(host_base + key_off),
-                key.len(),
-            );
-            dst.copy_from_slice(key);
-            let len_p = std::ptr::with_exposed_provenance_mut::<u8>(host_base + len_off);
-            let len_sl = std::slice::from_raw_parts_mut(len_p, 8);
-            len_sl.copy_from_slice(&8_u64.to_le_bytes());
-        }
+        let key_va = write_cstr(base, 0x200, "hw.ncpu");
+        let val_va = guest_va(base, 0x300);
+        let len_va = guest_va(base, 0x310);
+        guest_write(len_va, &8_u64.to_le_bytes());
+
         let r = dispatch(SyscallArgs {
             pc: 0,
             number: 274,
-            x0: base + u64::try_from(key_off).unwrap(),
-            x1: base + u64::try_from(val_off).unwrap(),
-            x2: base + u64::try_from(len_off).unwrap(),
+            x0: key_va,
+            x1: val_va,
+            x2: len_va,
             x3: 0,
             x4: 0,
             x5: 0,
         });
         assert!(!r.error, "sysctlbyname: {:?}", r.retval);
-        let ncpu = unsafe {
-            let p = std::ptr::with_exposed_provenance::<u8>(host_base + val_off);
-            let b = std::slice::from_raw_parts(p, 4);
-            i32::from_le_bytes(b.try_into().unwrap())
-        };
+        let ncpu = guest_read_i32(val_va);
         assert!(ncpu >= 1);
 
         registry_clear();
@@ -446,23 +398,16 @@ mod tests {
         let stack = map_stack(host, 64 * 1024).expect("stack");
         register_borrowed(&stack);
         let base = stack.guest_addr;
-        let set_off = 0x100_usize;
-        let oset_off = 0x110_usize;
-        let host_base = usize::try_from(base).unwrap();
-        unsafe {
-            let p = std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(host_base + set_off),
-                4,
-            );
-            p.copy_from_slice(&0x00FF_u32.to_le_bytes());
-        }
+        let set_va = guest_va(base, 0x100);
+        let oset_va = guest_va(base, 0x110);
+        guest_write(set_va, &0x00FF_u32.to_le_bytes());
         // SIG_SETMASK = 3
         let r = dispatch(SyscallArgs {
             pc: 0,
             number: 48,
             x0: 3,
-            x1: base + u64::try_from(set_off).unwrap(),
-            x2: base + u64::try_from(oset_off).unwrap(),
+            x1: set_va,
+            x2: oset_va,
             x3: 0,
             x4: 0,
             x5: 0,
@@ -509,53 +454,27 @@ mod tests {
 
         let base = stack.guest_addr;
         let path_str = path.to_str().expect("utf8 path");
-        let path_bytes = path_str.as_bytes();
-        let path_off = 0x1000_usize;
-        let buf_off = 0x2000_usize;
-        let stat_off = 0x3000_usize;
-        let host_base = usize::try_from(base).expect("base");
-        let path_ptr = host_base + path_off;
-        let read_ptr = host_base + buf_off;
-        let stat_ptr = host_base + stat_off;
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(path_ptr),
-                path_bytes.len() + 1,
-            );
-            if let Some(slot) = dst.get_mut(..path_bytes.len()) {
-                slot.copy_from_slice(path_bytes);
-            }
-            if let Some(nul) = dst.get_mut(path_bytes.len()) {
-                *nul = 0;
-            }
-        }
-
-        let path_va = base + u64::try_from(path_off).unwrap();
+        let path_va = write_cstr(base, 0x1000, path_str);
         let open = dispatch(args(5, path_va, 0, 0)); // O_RDONLY
         assert!(!open.error, "open: {:?}", open.retval);
         let gfd = open.retval.expect("fd");
 
-        let read_va = base + u64::try_from(buf_off).unwrap();
+        let read_va = guest_va(base, 0x2000);
         let rd = dispatch(args(3, gfd, read_va, 5)); // read 5
         assert!(!rd.error, "read: {:?}", rd.retval);
         assert_eq!(rd.retval, Some(5));
-        let got = unsafe {
-            std::slice::from_raw_parts(std::ptr::with_exposed_provenance::<u8>(read_ptr), 5)
-        };
-        assert_eq!(got, b"hello");
+        assert_eq!(guest_slice(read_va, 5), b"hello");
 
         let seek = dispatch(args(199, gfd, 0, 0)); // lseek SET 0
         assert!(!seek.error);
         assert_eq!(seek.retval, Some(0));
 
-        let stat_va = base + u64::try_from(stat_off).unwrap();
+        let stat_va = guest_va(base, 0x3000);
         let st = dispatch(args(339, gfd, stat_va, 0));
         assert!(!st.error, "fstat: {:?}", st.retval);
-        let size = unsafe {
-            let p = std::ptr::with_exposed_provenance::<u8>(stat_ptr + 96);
-            let bytes = std::slice::from_raw_parts(p, 8);
-            i64::from_le_bytes(bytes.try_into().unwrap())
-        };
+        // Darwin stat64: st_size at offset 96.
+        let size = guest_read_u64(stat_va + 96);
+        let size = i64::from_ne_bytes(size.to_ne_bytes());
         assert_eq!(size, 9);
 
         let dup = dispatch(args(41, gfd, 0, 0));
@@ -566,10 +485,8 @@ mod tests {
         let fl = dispatch(args(92, gfd, 3, 0));
         assert!(!fl.error);
 
-        let cl = dispatch(args(6, gfd, 0, 0));
-        assert!(!cl.error);
-        let cl2 = dispatch(args(6, gfd2, 0, 0));
-        assert!(!cl2.error);
+        assert!(!dispatch(args(6, gfd, 0, 0)).error);
+        assert!(!dispatch(args(6, gfd2, 0, 0)).error);
 
         registry_clear();
         drop(stack);
@@ -593,21 +510,7 @@ mod tests {
 
         let base = stack.guest_addr;
         let path_str = path.to_str().unwrap();
-        let path_off = 0x800_usize;
-        let path_ptr = usize::try_from(base).unwrap() + path_off;
-        unsafe {
-            let dst = std::slice::from_raw_parts_mut(
-                std::ptr::with_exposed_provenance_mut::<u8>(path_ptr),
-                path_str.len() + 1,
-            );
-            if let Some(slot) = dst.get_mut(..path_str.len()) {
-                slot.copy_from_slice(path_str.as_bytes());
-            }
-            if let Some(nul) = dst.get_mut(path_str.len()) {
-                *nul = 0;
-            }
-        }
-        let path_va = base + u64::try_from(path_off).unwrap();
+        let path_va = write_cstr(base, 0x800, path_str);
         let r = dispatch(SyscallArgs {
             pc: 0,
             number: 463,
