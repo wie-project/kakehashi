@@ -1,0 +1,15 @@
+[package]
+name = "kh-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kakehashi native ARM64 execution context, memory layout, and trap hooks"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

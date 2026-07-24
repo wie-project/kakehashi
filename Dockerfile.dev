@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+# Dev image: toolchain only. Mount the repo at /src for fast iteration.
+#
+#   docker build -t kakehashi:dev -f Dockerfile.dev .
+#   docker run --rm -v "$PWD":/src -w /src kakehashi:dev cargo test --workspace
+FROM rust:1.97-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN rustc --version && echo "host PAGE_SIZE=$(getconf PAGE_SIZE)"
+
+ENTRYPOINT []
+CMD ["cargo", "test", "--workspace"]

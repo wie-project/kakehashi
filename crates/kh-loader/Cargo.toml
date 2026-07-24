@@ -1,0 +1,21 @@
+[package]
+name = "kh-loader"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kakehashi Mach-O binary loader and process environment setup"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+goblin.workspace = true
+scroll = "0.13"
+kh-runtime = { path = "../kh-runtime" }
+
+[dev-dependencies]
+# Fixture round-trip uses goblin directly in fixture tests (already a dep).
+
+[lints]
+workspace = true

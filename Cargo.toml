@@ -1,0 +1,88 @@
+[workspace]
+members = [
+    "crates/kh-loader",
+    "crates/kh-runtime",
+    "crates/kh-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "LGPL-3.0-only"
+authors = ["Vladislav Kalinkin"]
+repository = "https://github.com/wie-project/kakehashi"
+description = "Kakehashi — userspace macOS translation layer for Linux ARM64"
+exclude = [
+    "scripts/",
+]
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+thiserror = "2.0.19"
+
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+goblin = "0.10.7"
+
+clap = { version = "4.6.4", features = ["derive"] }
+
+libc = "0.2.189"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+unused_extern_crates = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+let_underscore_drop = "deny"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_prelude_collisions = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+indexing_slicing = "deny"
+integer_division = "warn"
+arithmetic_side_effects = "warn"
+
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+
+dbg_macro = "deny"
+print_stdout = "allow"
+print_stderr = "allow"
+
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+large_enum_variant = "warn"
+large_stack_arrays = "warn"
+needless_pass_by_value = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

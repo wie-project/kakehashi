@@ -1,0 +1,11 @@
+target
+.git
+.github
+**/*.md
+!Cargo.toml
+.DS_Store
+**/.DS_Store
+*.swp
+.idea
+.vscode
+sessions

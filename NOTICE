@@ -1,0 +1,11 @@
+Kakehashi
+Copyright (C) 2026 Vladislav Kalinkin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This project is an independent userspace macOS translation layer for Linux
+ARM64. It is not derived from Darling. Proprietary Apple binaries and SDKs
+are not redistributed with this source tree.

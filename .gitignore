@@ -1,0 +1,25 @@
+# Build
+/target/
+**/*.rs.bk
+
+# OS / editor
+.DS_Store
+**/.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Local env / secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Tooling / session noise
+sessions/
+.grok/
+*.log
+
+# Occasional local scratch (keep probes under tests/clang-probe/)
+/tmp/
