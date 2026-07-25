@@ -60,7 +60,9 @@ impl FdTable {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
-            next: 32,
+            // Start at 3 (after stdio). Starting at 32 looked "safe" but 7zz
+            // reports OPEN_MAX:20 and rejects high descriptors → hang on archive.
+            next: 3,
         }
     }
 
@@ -70,7 +72,7 @@ impl FdTable {
                 host::close_fd(hfd);
             }
         }
-        self.next = 32;
+        self.next = 3;
     }
 
     #[must_use]
@@ -86,11 +88,12 @@ impl FdTable {
     }
 
     pub(crate) fn alloc(&mut self, host_fd: RawFd) -> Option<i32> {
-        for _ in 0..1024 {
-            let gfd = self.next;
-            self.next = self.next.saturating_add(1);
-            if gfd > 2 && !self.map.contains_key(&gfd) {
-                self.map.insert(gfd, host_fd);
+        // Prefer the lowest free slot ≥ 3 so guest FDs stay under typical
+        // OPEN_MAX / RLIMIT_NOFILE soft values reported by stubs.
+        for gfd in 3..1024 {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(gfd) {
+                e.insert(host_fd);
+                self.next = gfd.saturating_add(1);
                 return Some(gfd);
             }
         }

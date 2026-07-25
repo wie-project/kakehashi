@@ -180,6 +180,10 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
             return Ok(());
         }
 
+        // Guest faults used to leave multi‑MB `core` files in the workspace cwd.
+        // Faults go through our handler → `_exit`; disable dumps as belt-and-braces.
+        disable_core_dumps();
+
         // SAFETY: process-wide SIGTRAP / fault handlers with SA_SIGINFO.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
@@ -211,6 +215,20 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
         }
         reset_trap_state();
         Ok(())
+    }
+}
+
+/// Sets `RLIMIT_CORE` soft+hard to 0 so guest crashes never litter the repo with
+/// `core` dumps (we already print a guest fault summary and `_exit`).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn disable_core_dumps() {
+    // SAFETY: process-wide rlimit; best-effort, ignore failure.
+    unsafe {
+        let lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let _ = libc::setrlimit(libc::RLIMIT_CORE, std::ptr::addr_of!(lim));
     }
 }
 

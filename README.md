@@ -114,10 +114,14 @@ cargo build -p kh-libsystem --release    # on macOS / apple-darwin target
 # Single managed bottle (skeleton + Volumes/linux → host / + optional libSystem):
 ./target/debug/kh bottle create                    # default: $XDG_DATA_HOME/kakehashi/bottle
 ./target/debug/kh bottle create --path /opt/my-b   # custom path (name is free to rename)
+# Idempotent (Docker/dev): create if missing, else refresh libSystem — no .tmp-bottle.
+./scripts/stage-libsystem.sh                       # dist/guest/libSystem.B.dylib (auto-discovered)
+./target/debug/kh bottle ensure                    # picks up dist/guest or target/…
 ./target/debug/kh bottle status
 ./target/debug/kh bottle destroy                   # interactive y/N
 ./target/debug/kh bottle destroy --yes             # scripts / CI
 # Root resolution for run/trace: --root > KAKEHASHI_ROOT > registered bottle
+# Prefer `kh bottle ensure` over hand-made bottle trees; live runs leave no core dumps.
 
 # Real-world guest: 7-Zip `7zz` (default host path /tmp/7zz, override KAKEHASHI_7ZZ).
 # Bottle materialize creates usr/lib/libc++.1.dylib → libSystem.B.dylib so both

@@ -157,8 +157,24 @@ fn discover_adjacent() -> Option<PathBuf> {
 
 fn discover_dev_target() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
+    // Walk cwd → parents so Docker `-w /src` and nested shells still find a
+    // workspace-staged dylib without hand-building `.tmp-bottle`.
+    let mut dir = Some(cwd.as_path());
+    while let Some(base) = dir {
+        if let Some(p) = discover_under_workspace(base) {
+            return Some(p);
+        }
+        dir = base.parent();
+    }
+    None
+}
+
+/// Candidate relative paths under a Cargo / release workspace root.
+fn discover_under_workspace(base: &Path) -> Option<PathBuf> {
     let names = ["libSystem.B.dylib", "libkh_libsystem.dylib"];
     let dirs = [
+        // Staged guest install name (`scripts/stage-libsystem.sh`).
+        "dist/guest",
         "target/release",
         "target/debug",
         "target/aarch64-apple-darwin/release",
@@ -167,7 +183,7 @@ fn discover_dev_target() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     for d in dirs {
         for n in names {
-            candidates.push(cwd.join(d).join(n));
+            candidates.push(base.join(d).join(n));
         }
     }
     first_file(&candidates)

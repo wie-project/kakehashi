@@ -37,8 +37,24 @@ pub enum BsdSyscall {
     Stat,
     /// `fstat` / `fstat64`.
     Fstat,
+    /// `lstat` / `lstat64`.
+    Lstat,
+    /// `unlink`.
+    Unlink,
+    /// `mkdir`.
+    Mkdir,
+    /// `rmdir`.
+    Rmdir,
+    /// `rename`.
+    Rename,
+    /// `ftruncate`.
+    Ftruncate,
+    /// `fsync`.
+    Fsync,
     /// `openat`.
     Openat,
+    /// `fstatat` / `fstatat64`.
+    Fstatat,
     /// `gettimeofday`.
     Gettimeofday,
     /// `clock_gettime`.
@@ -83,7 +99,15 @@ impl BsdSyscall {
             Self::Lseek => "lseek",
             Self::Stat => "stat",
             Self::Fstat => "fstat",
+            Self::Lstat => "lstat",
+            Self::Unlink => "unlink",
+            Self::Mkdir => "mkdir",
+            Self::Rmdir => "rmdir",
+            Self::Rename => "rename",
+            Self::Ftruncate => "ftruncate",
+            Self::Fsync => "fsync",
             Self::Openat => "openat",
+            Self::Fstatat => "fstatat",
             Self::Gettimeofday => "gettimeofday",
             Self::ClockGettime => "clock_gettime",
             Self::Sysctl => "sysctl",
@@ -106,6 +130,7 @@ impl BsdSyscall {
             Self::Write => 4,
             Self::Open => 5,
             Self::Close => 6,
+            Self::Unlink => 10,
             Self::Getpid => 20,
             Self::Access => 33,
             Self::Dup => 41,
@@ -115,9 +140,14 @@ impl BsdSyscall {
             Self::Munmap => 73,
             Self::Mprotect => 74,
             Self::Fcntl => 92,
+            Self::Fsync => 95,
             Self::Gettimeofday => 116,
+            Self::Rename => 128,
+            Self::Mkdir => 136,
+            Self::Rmdir => 137,
             Self::Mmap => 197,
             Self::Lseek => 199,
+            Self::Ftruncate => 201,
             Self::Sysctl => 202,
             Self::ClockGettime => 266,
             Self::Sysctlbyname => 274,
@@ -125,11 +155,13 @@ impl BsdSyscall {
             // Prefer 64-bit variants as primary; aliases in lookup.
             Self::Stat => 338,
             Self::Fstat => 339,
+            Self::Lstat => 340,
             Self::BsdthreadCreate => 360,
             Self::BsdthreadTerminate => 361,
             Self::BsdthreadRegister => 366,
             Self::ThreadSelfid => 372,
             Self::Openat => 463,
+            Self::Fstatat => 470,
         }
     }
 }
@@ -143,6 +175,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         4 | 397 => Some(BsdSyscall::Write),
         5 | 398 => Some(BsdSyscall::Open),
         6 | 399 => Some(BsdSyscall::Close),
+        10 | 401 => Some(BsdSyscall::Unlink),
         20 => Some(BsdSyscall::Getpid),
         33 => Some(BsdSyscall::Access),
         41 => Some(BsdSyscall::Dup),
@@ -152,11 +185,17 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         73 => Some(BsdSyscall::Munmap),
         74 => Some(BsdSyscall::Mprotect),
         92 => Some(BsdSyscall::Fcntl),
+        95 | 406 => Some(BsdSyscall::Fsync),
         116 => Some(BsdSyscall::Gettimeofday),
+        128 => Some(BsdSyscall::Rename),
+        136 => Some(BsdSyscall::Mkdir),
+        137 => Some(BsdSyscall::Rmdir),
         188 | 338 => Some(BsdSyscall::Stat),  // stat / stat64
         189 | 339 => Some(BsdSyscall::Fstat), // fstat / fstat64
+        190 | 340 => Some(BsdSyscall::Lstat), // lstat / lstat64
         197 => Some(BsdSyscall::Mmap),
         199 => Some(BsdSyscall::Lseek),
+        201 => Some(BsdSyscall::Ftruncate),
         202 => Some(BsdSyscall::Sysctl),
         266 => Some(BsdSyscall::ClockGettime),
         274 => Some(BsdSyscall::Sysctlbyname),
@@ -166,6 +205,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         366 => Some(BsdSyscall::BsdthreadRegister),
         372 => Some(BsdSyscall::ThreadSelfid),
         463 => Some(BsdSyscall::Openat),
+        470 | 471 => Some(BsdSyscall::Fstatat), // fstatat / nocancel
         _ => None,
     }
 }
@@ -204,8 +244,17 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (266, "clock_gettime"),
         (274, "sysctlbyname"),
         (327, "issetugid"),
+        (10, "unlink"),
+        (95, "fsync"),
+        (128, "rename"),
+        (136, "mkdir"),
+        (137, "rmdir"),
+        (201, "ftruncate"),
         (338, "stat"),
         (339, "fstat"),
+        (340, "lstat"),
+        (463, "openat"),
+        (470, "fstatat"),
         (360, "bsdthread_create"),
         (361, "bsdthread_terminate"),
         (366, "bsdthread_register"),

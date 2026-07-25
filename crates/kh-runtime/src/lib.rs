@@ -20,8 +20,8 @@ pub use bottle::{
     BottleError, BottleStatus, CreateOptions, CreateResult, DEFAULT_7ZZ_PATH, ENV_7ZZ,
     GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, PathError, active_root, bottle_root,
     create as create_bottle, create_with as create_bottle_with, destroy as destroy_bottle,
-    discover_7zz, ensure_libcxx_symlink, has_libcxx_symlink, set_bottle_root,
-    status as bottle_status, translate_path, translate_path_with_root,
+    discover_7zz, ensure as ensure_bottle, ensure_libcxx_symlink, has_libcxx_symlink,
+    set_bottle_root, status as bottle_status, translate_path, translate_path_with_root,
 };
 pub use process::{ProcessState, reset_run};
 

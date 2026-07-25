@@ -18,7 +18,7 @@ KH=(docker run --rm --entrypoint kh -w /app "${IMAGE}")
 echo "==> kh --help"
 "${KH[@]}" --help
 
-echo "==> kh bottle create / Volumes/linux R-W / libSystem install / destroy (inside Linux)"
+echo "==> kh bottle create / ensure / Volumes/linux R-W / libSystem install / destroy (inside Linux)"
 docker run --rm --entrypoint bash -w /app "${IMAGE}" -c '
 set -euo pipefail
 export KAKEHASHI_CONFIG_DIR=/tmp/kh-cfg
@@ -55,9 +55,19 @@ if kh bottle create --path /tmp/kh-data/other --skip-libsystem 2>/dev/null; then
   exit 1
 fi
 
+# ensure is idempotent and refreshes libSystem without destroy.
+kh bottle ensure --libsystem "$LIBSYS"
+test -f "$BOTTLE/usr/lib/libSystem.B.dylib"
+kh bottle status | grep -q "libSystem: true"
+
 kh bottle destroy --yes
 test ! -e "$BOTTLE"
 kh bottle status | grep -q "no bottle"
+
+# ensure with no prior bottle behaves like create.
+kh bottle ensure --path "$BOTTLE" --libsystem "$LIBSYS"
+test -f "$BOTTLE/.kakehashi-bottle"
+kh bottle destroy --yes
 echo "bottle lifecycle ok"
 '
 

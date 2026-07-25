@@ -14,7 +14,8 @@ use crate::init;
 use crate::session::LoadSession;
 
 /// Default guest stack size for the micro spike (1 MiB).
-pub const DEFAULT_STACK_SIZE: u64 = 1024 * 1024;
+/// Guest stack for micro execution (8 MiB — C++ guests like `7zz` use deep frames).
+pub const DEFAULT_STACK_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Options for a micro run / trace.
 #[derive(Debug, Clone)]

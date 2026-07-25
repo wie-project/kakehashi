@@ -5,8 +5,9 @@ use core::ffi::{c_char, c_int, c_void};
 use crate::errno;
 use crate::heap::malloc;
 use crate::sys::{
-    self, SYS_CLOSE, SYS_FSTAT64, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LSEEK,
-    SYS_LSTAT64, SYS_OPEN, SYS_READ, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME,
+    self, SYS_CLOSE, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID, SYS_GETPPID,
+    SYS_GETTIMEOFDAY, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_RENAME,
+    SYS_RMDIR, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
 
@@ -72,6 +73,32 @@ pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_
             ptr_u64(path.cast()),
             u64::from(oflag.cast_unsigned()),
             u64::from(mode.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
+}
+
+/// C `openat` → nlist `_openat`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn openat(
+    fd: c_int,
+    path: *const c_char,
+    oflag: c_int,
+    mode: c_int,
+) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall6(
+            SYS_OPENAT,
+            u64::from(fd.cast_unsigned()),
+            ptr_u64(path.cast()),
+            u64::from(oflag.cast_unsigned()),
+            u64::from(mode.cast_unsigned()),
+            0,
+            0,
         )
     };
     ret_c_int(ret)
@@ -150,55 +177,109 @@ pub(crate) unsafe extern "C" fn lstat(path: *const c_char, buf: *mut c_void) -> 
     ret_c_int(ret)
 }
 
-/// C `fstatat` → nlist `_fstatat` (soft ENOSYS).
+/// C `fstatat` → nlist `_fstatat`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fstatat(
-    _fd: c_int,
-    _path: *const c_char,
-    _buf: *mut c_void,
-    _flag: c_int,
+    fd: c_int,
+    path: *const c_char,
+    buf: *mut c_void,
+    flag: c_int,
 ) -> c_int {
-    not_impl(b"[kh-libsystem] fstatat ENOSYS\n")
+    if path.is_null() || buf.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall6(
+            SYS_FSTATAT,
+            u64::from(fd.cast_unsigned()),
+            ptr_u64(path.cast()),
+            ptr_u64(buf),
+            u64::from(flag.cast_unsigned()),
+            0,
+            0,
+        )
+    };
+    ret_c_int(ret)
 }
 
 /// C `ftruncate` → nlist `_ftruncate`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn ftruncate(_fd: c_int, _length: i64) -> c_int {
-    not_impl(b"[kh-libsystem] ftruncate ENOSYS\n")
+pub(crate) unsafe extern "C" fn ftruncate(fd: c_int, length: i64) -> c_int {
+    let ret = unsafe {
+        sys::syscall2(
+            SYS_FTRUNCATE,
+            u64::from(fd.cast_unsigned()),
+            length.cast_unsigned(),
+        )
+    };
+    ret_c_int(ret)
 }
 
-// ── path ops (soft) ─────────────────────────────────────────────────────────
+/// C `fsync` → nlist `_fsync`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fsync(fd: c_int) -> c_int {
+    let ret = unsafe { sys::syscall1(SYS_FSYNC, u64::from(fd.cast_unsigned())) };
+    ret_c_int(ret)
+}
+
+// ── path ops ────────────────────────────────────────────────────────────────
 
 /// C `unlink` → nlist `_unlink`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn unlink(_path: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] unlink ENOSYS\n")
+pub(crate) unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall1(SYS_UNLINK, ptr_u64(path.cast())) };
+    ret_c_int(ret)
 }
 
-/// C `remove` → nlist `_remove`.
+/// C `remove` → nlist `_remove` (file unlink; directories may need rmdir).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn remove(path: *const c_char) -> c_int {
-    // Prefer unlink semantics.
-    let _ = path;
-    not_impl(b"[kh-libsystem] remove ENOSYS\n")
+    // SAFETY: same contract as unlink.
+    unsafe { unlink(path) }
 }
 
 /// C `rename` → nlist `_rename`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn rename(_from: *const c_char, _to: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] rename ENOSYS\n")
+pub(crate) unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
+    if from.is_null() || to.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall2(SYS_RENAME, ptr_u64(from.cast()), ptr_u64(to.cast())) };
+    ret_c_int(ret)
 }
 
 /// C `mkdir` → nlist `_mkdir`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn mkdir(_path: *const c_char, _mode: c_int) -> c_int {
-    not_impl(b"[kh-libsystem] mkdir ENOSYS\n")
+pub(crate) unsafe extern "C" fn mkdir(path: *const c_char, mode: c_int) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall2(
+            SYS_MKDIR,
+            ptr_u64(path.cast()),
+            u64::from(mode.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
 }
 
 /// C `rmdir` → nlist `_rmdir`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn rmdir(_path: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] rmdir ENOSYS\n")
+pub(crate) unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall1(SYS_RMDIR, ptr_u64(path.cast())) };
+    ret_c_int(ret)
 }
 
 /// C `chdir` → nlist `_chdir`.
@@ -380,13 +461,21 @@ pub(crate) unsafe extern "C" fn ioctl(_fd: c_int, _request: u64, _arg: *mut c_vo
 }
 
 /// C `sysconf` → nlist `_sysconf`.
+///
+/// Darwin name numbers (from `<unistd.h>` / XNU): `_SC_ARG_MAX=1`,
+/// `_SC_OPEN_MAX=5`, `_SC_PAGE_SIZE=29`, `_SC_NPROCESSORS_ONLN=58`, …
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn sysconf(name: c_int) -> i64 {
-    // Common Darwin names (subset).
     match name {
-        1 | 29 => 4096,  // _SC_PAGE_SIZE-ish
-        6 => 1,          // _SC_NPROCESSORS_ONLN soft
-        8 => 256 * 1024, // ARG_MAX soft
+        1 => 256 * 1024, // _SC_ARG_MAX
+        2 => 256,        // _SC_CHILD_MAX
+        3 => 100,        // _SC_CLK_TCK
+        5 => 1024,       // _SC_OPEN_MAX (must exceed guest FD numbers)
+        6 => 1,          // _SC_JOB_CONTROL
+        7 => 1,          // _SC_SAVED_IDS
+        8 => 200_809,    // _SC_VERSION
+        29 => 16_384,    // _SC_PAGE_SIZE (Darwin arm64 default guest page)
+        58 | 84 => 1,    // _SC_NPROCESSORS_ONLN / CONF (soft single-core)
         _ => {
             errno::set_errno(EINVAL);
             -1

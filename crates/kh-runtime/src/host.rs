@@ -143,6 +143,20 @@ pub fn fstat_fd(fd: RawFd) -> Option<libc::stat> {
     if rc == 0 { Some(st) } else { None }
 }
 
+/// `ftruncate(fd, length)`.
+pub fn ftruncate_fd(fd: RawFd, length: i64) -> Option<()> {
+    // SAFETY: live fd.
+    let rc = unsafe { libc::ftruncate(fd, length) };
+    if rc == 0 { Some(()) } else { None }
+}
+
+/// `fsync(fd)`.
+pub fn fsync_fd(fd: RawFd) -> Option<()> {
+    // SAFETY: live fd.
+    let rc = unsafe { libc::fsync(fd) };
+    if rc == 0 { Some(()) } else { None }
+}
+
 /// Host `gettimeofday` (timezone ignored).
 pub fn gettimeofday() -> Option<libc::timeval> {
     // SAFETY: stack timeval; null tz pointer is allowed.

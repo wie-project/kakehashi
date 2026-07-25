@@ -10,6 +10,7 @@ pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EBADF: i64 = 9;
 pub const EFAULT: i64 = 14;
+pub const EEXIST: i64 = 17;
 pub const EINVAL: i64 = 22;
 pub const ENOSYS: i64 = 78;
 pub const ENOMEM: i64 = 12;

@@ -33,7 +33,7 @@ use crate::process as proc_state;
 use crate::trap::TrapOutcome;
 
 pub use common::{
-    EBADF, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, EPERM, SyscallArgs, SyscallResult,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, EPERM, SyscallArgs, SyscallResult,
 };
 pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
 
@@ -76,7 +76,15 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Lseek) => fd::handle_lseek(args),
         Some(BsdSyscall::Stat) => fs::handle_stat(args),
         Some(BsdSyscall::Fstat) => fs::handle_fstat(args),
+        Some(BsdSyscall::Lstat) => fs::handle_lstat(args),
+        Some(BsdSyscall::Unlink) => fs::handle_unlink(args),
+        Some(BsdSyscall::Mkdir) => fs::handle_mkdir(args),
+        Some(BsdSyscall::Rmdir) => fs::handle_rmdir(args),
+        Some(BsdSyscall::Rename) => fs::handle_rename(args),
+        Some(BsdSyscall::Ftruncate) => fs::handle_ftruncate(args),
+        Some(BsdSyscall::Fsync) => fs::handle_fsync(args),
         Some(BsdSyscall::Openat) => fd::handle_openat(args),
+        Some(BsdSyscall::Fstatat) => fs::handle_fstatat(args),
         Some(BsdSyscall::Gettimeofday) => time_sys::handle_gettimeofday(args),
         Some(BsdSyscall::ClockGettime) => time_sys::handle_clock_gettime(args),
         Some(BsdSyscall::Sysctl) => sysctl::handle_sysctl(args),
@@ -87,8 +95,24 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::BsdthreadTerminate) => thread_sys::handle_bsdthread_terminate(args),
         Some(BsdSyscall::BsdthreadRegister) => thread_sys::handle_bsdthread_register(args),
         Some(BsdSyscall::ThreadSelfid) => thread_sys::handle_thread_selfid(),
-        None => SyscallResult::err("unknown", ENOSYS),
+        None => {
+            // Rate-limited diagnostic so hangs (e.g. 7zz archive) show the
+            // missing Darwin number without flooding when guests spin.
+            log_unknown_syscall(args.number, args.x0, args.x1, args.x2);
+            SyscallResult::err("unknown", ENOSYS)
+        }
     }
+}
+
+fn log_unknown_syscall(number: u32, x0: u64, x1: u64, x2: u64) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+    let msg = format!("kh: unknown BSD syscall #{number} x0={x0:#x} x1={x1:#x} x2={x2:#x}\n");
+    drop(std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes()));
 }
 
 #[cfg(test)]

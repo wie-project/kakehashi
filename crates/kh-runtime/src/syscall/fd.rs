@@ -209,8 +209,26 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
             };
             finish_open(name, rc)
         }
-        _ => SyscallResult::err(name, EINVAL),
+        _ => {
+            // Soft-success for unknown fcntl cmds (F_FULLFSYNC, F_NOCACHE, …).
+            // Hard EINVAL made guests spin; macOS ignores many optional cmds.
+            log_fcntl_cmd(cmd);
+            SyscallResult::ok(name, 0)
+        }
     }
+}
+
+fn log_fcntl_cmd(cmd: i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    let msg = format!("kh: soft-ok fcntl cmd={cmd}\n");
+    drop(std::io::Write::write_all(
+        &mut std::io::stderr(),
+        msg.as_bytes(),
+    ));
 }
 
 fn host_fl_to_darwin(rc: i32) -> u64 {

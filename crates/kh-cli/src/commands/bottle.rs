@@ -15,6 +15,12 @@ pub(crate) enum BottleCmd<'a> {
         libsystem: Option<&'a Path>,
         skip_libsystem: bool,
     },
+    /// Create if missing, otherwise refresh libSystem in the active bottle.
+    Ensure {
+        path: Option<&'a Path>,
+        libsystem: Option<&'a Path>,
+        skip_libsystem: bool,
+    },
     /// Remove the registered bottle after confirmation.
     Destroy { yes: bool },
     /// Print the registered path (empty / exit 1 when none).
@@ -31,6 +37,11 @@ pub(crate) fn run(cmd: &BottleCmd<'_>, json: bool) -> Result<()> {
             libsystem,
             skip_libsystem,
         } => create(*path, *libsystem, *skip_libsystem, json),
+        BottleCmd::Ensure {
+            path,
+            libsystem,
+            skip_libsystem,
+        } => ensure(*path, *libsystem, *skip_libsystem, json),
         BottleCmd::Destroy { yes } => destroy(*yes, json),
         BottleCmd::Path => print_path(json),
         BottleCmd::Status => print_status(json),
@@ -49,53 +60,7 @@ fn create(
         skip_libsystem,
     }) {
         Ok(created) => {
-            if json {
-                let libsystem = created.libsystem.as_ref().map(|ls| {
-                    json!({
-                        "source": ls.source.display().to_string(),
-                        "dest": ls.dest.display().to_string(),
-                        "origin": origin_str(ls.origin),
-                        "id_rewritten": ls.id_rewritten,
-                    })
-                });
-                println!(
-                    "{}",
-                    json!({
-                        "action": "create",
-                        "path": created.path.display().to_string(),
-                        "libsystem": libsystem,
-                    })
-                );
-            } else {
-                println!("bottle created at {}", created.path.display());
-                println!(
-                    "  host Linux bridge: {}/{}",
-                    created.path.display(),
-                    bottle::VOLUMES_LINUX
-                );
-                if let Some(ls) = &created.libsystem {
-                    println!(
-                        "  libSystem: {} → {}",
-                        ls.source.display(),
-                        ls.dest.display()
-                    );
-                    println!(
-                        "    origin: {}, LC_ID_DYLIB rewritten: {}",
-                        origin_str(ls.origin),
-                        ls.id_rewritten
-                    );
-                } else if skip_libsystem {
-                    println!("  libSystem: skipped (--skip-libsystem)");
-                } else {
-                    println!("  libSystem: not found (bottle skeleton only)");
-                    println!("    build:  cargo build -p kh-libsystem --release");
-                    println!("    or:     kh bottle create --libsystem /path/to/libSystem.B.dylib");
-                    println!(
-                        "    or:     place libSystem.B.dylib next to `kh` / set {env}",
-                        env = bottle::ENV_LIBSYSTEM
-                    );
-                }
-            }
+            print_create_result("create", &created, skip_libsystem, json);
             Ok(())
         }
         Err(BottleError::AlreadyExists { path }) => {
@@ -105,18 +70,94 @@ fn create(
                     json!({
                         "error": "already_exists",
                         "path": path.display().to_string(),
-                        "hint": "kh bottle destroy",
+                        "hint": "kh bottle destroy  |  kh bottle ensure",
                     })
                 );
             }
             bail!(
                 "a bottle already exists at {}\n\
-                 if you want a new one, delete the current bottle first:\n\
-                   kh bottle destroy",
+                 to refresh libSystem in place:  kh bottle ensure\n\
+                 to replace the bottle entirely: kh bottle destroy",
                 path.display()
             );
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+fn ensure(
+    path: Option<&Path>,
+    libsystem: Option<&Path>,
+    skip_libsystem: bool,
+    json: bool,
+) -> Result<()> {
+    let created = bottle::ensure(&CreateOptions {
+        path,
+        libsystem,
+        skip_libsystem,
+    })?;
+    print_create_result("ensure", &created, skip_libsystem, json);
+    Ok(())
+}
+
+fn print_create_result(
+    action: &str,
+    created: &bottle::CreateResult,
+    skip_libsystem: bool,
+    json: bool,
+) {
+    if json {
+        let libsystem = created.libsystem.as_ref().map(|ls| {
+            json!({
+                "source": ls.source.display().to_string(),
+                "dest": ls.dest.display().to_string(),
+                "origin": origin_str(ls.origin),
+                "id_rewritten": ls.id_rewritten,
+            })
+        });
+        println!(
+            "{}",
+            json!({
+                "action": action,
+                "path": created.path.display().to_string(),
+                "libsystem": libsystem,
+            })
+        );
+        return;
+    }
+    let verb = if action == "ensure" {
+        "bottle ready at"
+    } else {
+        "bottle created at"
+    };
+    println!("{verb} {}", created.path.display());
+    println!(
+        "  host Linux bridge: {}/{}",
+        created.path.display(),
+        bottle::VOLUMES_LINUX
+    );
+    if let Some(ls) = &created.libsystem {
+        println!(
+            "  libSystem: {} → {}",
+            ls.source.display(),
+            ls.dest.display()
+        );
+        println!(
+            "    origin: {}, LC_ID_DYLIB rewritten: {}",
+            origin_str(ls.origin),
+            ls.id_rewritten
+        );
+    } else if skip_libsystem {
+        println!("  libSystem: skipped (--skip-libsystem)");
+    } else {
+        println!("  libSystem: not found (bottle skeleton only)");
+        println!("    build:  cargo build -p kh-libsystem --release");
+        println!("    stage:  ./scripts/stage-libsystem.sh");
+        println!("    or:     kh bottle ensure --libsystem /path/to/libSystem.B.dylib");
+        println!(
+            "    or:     place libSystem.B.dylib next to `kh` / set {env}",
+            env = bottle::ENV_LIBSYSTEM
+        );
     }
 }
 

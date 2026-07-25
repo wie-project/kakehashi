@@ -224,6 +224,50 @@ pub fn active_root() -> Result<Option<PathBuf>, BottleError> {
     }
 }
 
+/// Idempotent bottle setup: create when missing, refresh libSystem when present.
+///
+/// Intended for Docker/dev loops so you never hand-assemble `.tmp-bottle` trees:
+///
+/// ```text
+/// kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+/// kh run tests/clang-probe/7zz.bin -- --help   # uses registered bottle
+/// ```
+///
+/// * Valid registered bottle → reinstalls libSystem (unless `skip_libsystem`).
+/// * Unregistered path that already has a bottle marker → adopt + refresh.
+/// * Otherwise → same as [`create_with`].
+/// * Explicit `--libsystem` that is missing is always an error.
+pub fn ensure(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
+    if let Some(path) = active_root()? {
+        return refresh_bottle(&path, opts);
+    }
+
+    // Adopt a marker'd bottle that is not in the registry (e.g. after wiping
+    // KAKEHASHI_CONFIG_DIR but keeping the tree, or a previous manual path).
+    if let Some(p) = opts.path {
+        let abs = absolute(p)?;
+        if layout::is_bottle_root(&abs) {
+            return refresh_bottle(&abs, opts);
+        }
+    } else if let Ok(def) = registry::default_bottle_path()
+        && layout::is_bottle_root(&def)
+    {
+        return refresh_bottle(&def, opts);
+    }
+
+    create_with(opts)
+}
+
+fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
+    layout::ensure_libcxx_symlink(path)?;
+    let libsystem = install_libsystem_for_create(path, opts)?;
+    registry::write_active(path)?;
+    Ok(CreateResult {
+        path: path.to_path_buf(),
+        libsystem,
+    })
+}
+
 fn absolute(path: &Path) -> Result<PathBuf, BottleError> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -409,6 +453,39 @@ mod tests {
         assert!(st.libsystem);
         assert!(st.libcxx_alias);
         assert!(layout::has_libcxx_symlink(&created.path));
+
+        destroy(true).expect("destroy");
+    }
+
+    #[test]
+    fn ensure_creates_then_refreshes_libsystem() {
+        let _lock = test_env_lock();
+        let _g = EnvGuard::new();
+
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = repo.join("tests/fixtures/bottle/usr/lib/libSystem.B.dylib");
+        assert!(fixture.is_file());
+
+        let first = ensure(&CreateOptions {
+            libsystem: Some(&fixture),
+            ..CreateOptions::default()
+        })
+        .expect("ensure create");
+        assert!(first.libsystem.is_some());
+        let dest = first.path.join(libsystem::GUEST_LIBSYSTEM_REL);
+        let before = std::fs::metadata(&dest).expect("meta").len();
+
+        // Second ensure reuses the same bottle and reinstalls the dylib.
+        let second = ensure(&CreateOptions {
+            libsystem: Some(&fixture),
+            ..CreateOptions::default()
+        })
+        .expect("ensure refresh");
+        assert_eq!(second.path, first.path);
+        assert!(second.libsystem.is_some());
+        assert!(dest.is_file());
+        let after = std::fs::metadata(&dest).expect("meta2").len();
+        assert_eq!(before, after);
 
         destroy(true).expect("destroy");
     }

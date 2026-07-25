@@ -10,14 +10,26 @@ pub(crate) const SYS_WRITE: u32 = 4;
 pub(crate) const SYS_OPEN: u32 = 5;
 /// BSD `close`.
 pub(crate) const SYS_CLOSE: u32 = 6;
+/// BSD `unlink`.
+pub(crate) const SYS_UNLINK: u32 = 10;
 /// BSD `getpid`.
 pub(crate) const SYS_GETPID: u32 = 20;
 /// BSD `getppid`.
 pub(crate) const SYS_GETPPID: u32 = 39;
+/// BSD `fsync`.
+pub(crate) const SYS_FSYNC: u32 = 95;
 /// BSD `gettimeofday`.
 pub(crate) const SYS_GETTIMEOFDAY: u32 = 116;
+/// BSD `rename`.
+pub(crate) const SYS_RENAME: u32 = 128;
+/// BSD `mkdir`.
+pub(crate) const SYS_MKDIR: u32 = 136;
+/// BSD `rmdir`.
+pub(crate) const SYS_RMDIR: u32 = 137;
 /// BSD `lseek`.
 pub(crate) const SYS_LSEEK: u32 = 199;
+/// BSD `ftruncate`.
+pub(crate) const SYS_FTRUNCATE: u32 = 201;
 /// BSD `sysctl`.
 pub(crate) const SYS_SYSCTL: u32 = 202;
 /// BSD `sysctlbyname`.
@@ -28,6 +40,10 @@ pub(crate) const SYS_STAT64: u32 = 338;
 pub(crate) const SYS_FSTAT64: u32 = 339;
 /// BSD `lstat64`.
 pub(crate) const SYS_LSTAT64: u32 = 340;
+/// BSD `fstatat` / `fstatat64`.
+pub(crate) const SYS_FSTATAT: u32 = 470;
+/// BSD `openat`.
+pub(crate) const SYS_OPENAT: u32 = 463;
 
 /// Invokes a Darwin BSD syscall with zero arguments.
 ///

@@ -25,7 +25,7 @@ pub use libsystem::{
 };
 pub use manage::{
     BottleError, BottleStatus, CreateOptions, CreateResult, active_root, create, create_with,
-    destroy, status,
+    destroy, ensure, status,
 };
 pub use path::{
     PathError, bottle_root, read_c_string, set_bottle_root, translate_path,

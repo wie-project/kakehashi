@@ -116,7 +116,7 @@ enum Command {
         guest_args: Vec<String>,
     },
 
-    /// Manage the single macOS-like bottle (create / destroy / status).
+    /// Manage the single macOS-like bottle (create / ensure / destroy / status).
     Bottle {
         #[command(subcommand)]
         action: BottleAction,
@@ -135,10 +135,25 @@ enum BottleAction {
         path: Option<PathBuf>,
         /// Guest `libSystem.B.dylib` (or `libkh_libsystem.dylib`) to install under
         /// `usr/lib/`. When omitted, searches `KAKEHASHI_LIBSYSTEM`, paths next to
-        /// `kh`, then Cargo `target/` outputs.
+        /// `kh`, `dist/guest/`, then Cargo `target/` outputs.
         #[arg(long)]
         libsystem: Option<PathBuf>,
         /// Create the skeleton only (no libSystem install).
+        #[arg(long)]
+        skip_libsystem: bool,
+    },
+    /// Create the bottle if missing; otherwise refresh libSystem in place.
+    ///
+    /// Preferred for Docker/dev loops (no hand-made `.tmp-bottle`, no destroy
+    /// between libSystem rebuilds). Discovery order matches `create`.
+    Ensure {
+        /// Bottle directory when none is registered yet (same default as create).
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+        /// Guest dylib to install / refresh (see `create --libsystem`).
+        #[arg(long)]
+        libsystem: Option<PathBuf>,
+        /// Do not install or refresh libSystem.
         #[arg(long)]
         skip_libsystem: bool,
     },
@@ -242,6 +257,15 @@ fn run() -> Result<()> {
                     libsystem,
                     skip_libsystem,
                 } => commands::bottle::BottleCmd::Create {
+                    path: path.as_deref(),
+                    libsystem: libsystem.as_deref(),
+                    skip_libsystem: *skip_libsystem,
+                },
+                BottleAction::Ensure {
+                    path,
+                    libsystem,
+                    skip_libsystem,
+                } => commands::bottle::BottleCmd::Ensure {
                     path: path.as_deref(),
                     libsystem: libsystem.as_deref(),
                     skip_libsystem: *skip_libsystem,

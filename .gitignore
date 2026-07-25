@@ -23,6 +23,17 @@ sessions/
 
 # Occasional local scratch (keep probes under tests/clang-probe/)
 /tmp/
+.tmp-bottle/
+.kh/
+
+# Linux guest/host crash dumps (kh disables RLIMIT_CORE; still never commit)
+/core
+core
+core.[0-9]*
+*.core
 
 # Staged guest dylib / release layout (scripts/stage-libsystem.sh)
 /dist/
+
+# Local guest/docker scratch dirs
+.tmp-*/

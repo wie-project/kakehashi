@@ -6,7 +6,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::errno;
 use crate::trace;
 
-const HEAP_SIZE: usize = 256 * 1024;
+// 7zz (and other C++ guests) allocate multi‑MiB working sets before they fall
+// back to `mmap`; 256 KiB was enough for help/hash but not archive create.
+const HEAP_SIZE: usize = 16 * 1024 * 1024;
 const ALIGN: usize = 16;
 
 struct Heap {
