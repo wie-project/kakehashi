@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 # Build and run the reproducible Linux smoke image (Colima / Docker aarch64).
+#
+# What this proves (all exit codes / stdout checked in-script):
+#   - bottle create / ensure / Volumes/linux R-W / destroy
+#   - synthetic fixtures (write+exit, errno, mmap, threads, dylib, ctor, …)
+#   - clang probes when present (write_exit, puts_hello, printf_hello, …)
+#   - kh trace smoke
+#
+# This script is pass/fail in the terminal only — it does not leave large
+# artifacts. For inspectable .7z archives see:
+#   ./scripts/docker-7zz.sh        →  .tmp/kh-out/
+#   ./scripts/bench-fair-local.sh  →  .tmp/kh-bench-fair/artifacts/
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -146,4 +158,13 @@ fi
 echo "==> kh trace (write+exit)"
 "${KH[@]}" trace --max-events 16 tests/fixtures/minimal_arm64_execute.macho
 
-echo "smoke ok"
+echo
+echo "================================================================"
+echo " smoke ok  (image: ${IMAGE})"
+echo "  checked: bottle lifecycle, fixtures, clang probes (if present), trace"
+echo "  no host artifacts  — for .7z you can open yourself:"
+echo "    ./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z \\"
+echo "        /Volumes/linux/src/README.md"
+echo "    ls -lh .tmp/kh-out/"
+echo "    ./scripts/bench-fair-local.sh   # → .tmp/kh-bench-fair/artifacts/"
+echo "================================================================"

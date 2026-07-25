@@ -32,7 +32,9 @@ core
 core.[0-9]*
 *.core
 
-# Local guest/docker scratch dirs
+# Local guest/docker scratch dirs (bench + 7zz outputs live here — never commit)
+#   .tmp/kh-bench-fair/   ← scripts/bench-fair-local.sh  (summary + artifacts/*.7z)
+#   .tmp/kh-out/          ← scripts/docker-7zz.sh durable output
 .tmp/
 .tmp-*/
 /tmp/kh-bench/
