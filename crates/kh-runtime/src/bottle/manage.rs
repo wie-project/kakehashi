@@ -8,6 +8,8 @@ use super::layout;
 use super::libsystem::{self, LibsystemInstall, LibsystemOrigin};
 use super::registry;
 
+static EMBEDDED_LIBSYSTEM: &[u8] = include_bytes!("../../resources/libSystem.B.dylib");
+
 /// Bottle management errors.
 #[derive(Debug, Error)]
 pub enum BottleError {
@@ -166,6 +168,23 @@ fn install_libsystem_for_create(
     if let Some((src, origin)) = libsystem::discover(None) {
         return Ok(Some(libsystem::install(target, &src, origin)?));
     }
+
+    // ========================================================
+    // НАШ ФИНАЛЬНЫЙ РЕЛИЗНЫЙ FALLBACK ДЛЯ CRATES.IO
+    // Если на машине пользователя вообще ничего не нашлось, но байты вшиты
+    if !EMBEDDED_LIBSYSTEM.is_empty() {
+        let tmp_src = std::env::temp_dir().join("kakehashi_embedded_libsystem.dylib");
+
+        std::fs::write(&tmp_src, EMBEDDED_LIBSYSTEM)?;
+
+        let install_result = libsystem::install(target, &tmp_src, LibsystemOrigin::Embedded);
+
+        drop(std::fs::remove_file(tmp_src));
+
+        return Ok(Some(install_result?));
+    }
+    // ========================================================
+
     Ok(None)
 }
 

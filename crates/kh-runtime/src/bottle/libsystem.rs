@@ -41,6 +41,7 @@ pub enum LibsystemOrigin {
     Adjacent,
     /// Workspace `target/` outputs under the current working directory.
     DevTarget,
+    Embedded,
 }
 
 /// Result of installing libSystem into a bottle.

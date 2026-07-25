@@ -167,6 +167,7 @@ fn origin_str(o: LibsystemOrigin) -> &'static str {
         LibsystemOrigin::Env => "env",
         LibsystemOrigin::Adjacent => "adjacent",
         LibsystemOrigin::DevTarget => "dev_target",
+        LibsystemOrigin::Embedded => "embedded (crates.io auto-deploy)",
     }
 }
 
