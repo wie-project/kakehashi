@@ -16,6 +16,8 @@ pub(crate) const SYS_UNLINK: u32 = 10;
 pub(crate) const SYS_GETPID: u32 = 20;
 /// BSD `getppid`.
 pub(crate) const SYS_GETPPID: u32 = 39;
+/// BSD `munmap`.
+pub(crate) const SYS_MUNMAP: u32 = 73;
 /// BSD `fsync`.
 pub(crate) const SYS_FSYNC: u32 = 95;
 /// BSD `gettimeofday`.
@@ -26,6 +28,8 @@ pub(crate) const SYS_RENAME: u32 = 128;
 pub(crate) const SYS_MKDIR: u32 = 136;
 /// BSD `rmdir`.
 pub(crate) const SYS_RMDIR: u32 = 137;
+/// BSD `mmap`.
+pub(crate) const SYS_MMAP: u32 = 197;
 /// BSD `lseek`.
 pub(crate) const SYS_LSEEK: u32 = 199;
 /// BSD `ftruncate`.
@@ -40,6 +44,12 @@ pub(crate) const SYS_STAT64: u32 = 338;
 pub(crate) const SYS_FSTAT64: u32 = 339;
 /// BSD `lstat64`.
 pub(crate) const SYS_LSTAT64: u32 = 340;
+/// BSD `bsdthread_create`.
+pub(crate) const SYS_BSDTHREAD_CREATE: u32 = 360;
+/// BSD `bsdthread_terminate`.
+pub(crate) const SYS_BSDTHREAD_TERMINATE: u32 = 361;
+/// BSD `bsdthread_register`.
+pub(crate) const SYS_BSDTHREAD_REGISTER: u32 = 366;
 /// BSD `fstatat` / `fstatat64`.
 pub(crate) const SYS_FSTATAT: u32 = 470;
 /// BSD `openat`.
@@ -103,6 +113,26 @@ pub(crate) unsafe fn syscall6(
     a4: u64,
     a5: u64,
 ) -> isize {
+    // SAFETY: forwarded with x6=0.
+    unsafe { syscall7(number, a0, a1, a2, a3, a4, a5, 0) }
+}
+
+/// Invokes a Darwin BSD syscall with up to seven arguments (`x0`–`x6`).
+///
+/// # Safety
+///
+/// Valid Darwin call for the guest (or translated by `kh-runtime`).
+#[inline]
+pub(crate) unsafe fn syscall7(
+    number: u32,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> isize {
     #[cfg(target_arch = "aarch64")]
     {
         let mut ret: u64;
@@ -119,6 +149,7 @@ pub(crate) unsafe fn syscall6(
                 in("x3") a3,
                 in("x4") a4,
                 in("x5") a5,
+                in("x6") a6,
                 flags = out(reg) flags,
                 options(nostack),
             );
@@ -139,7 +170,7 @@ pub(crate) unsafe fn syscall6(
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (number, a0, a1, a2, a3, a4, a5);
+        let _ = (number, a0, a1, a2, a3, a4, a5, a6);
         -1
     }
 }

@@ -3,7 +3,7 @@
 use core::ffi::{c_char, c_int, c_void};
 
 use crate::errno;
-use crate::heap::malloc;
+use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_CLOSE, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID, SYS_GETPPID,
     SYS_GETTIMEOFDAY, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_RENAME,
@@ -306,10 +306,10 @@ pub(crate) unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_
     buf
 }
 
-/// C `chmod` → nlist `_chmod`.
+/// C `chmod` → nlist `_chmod` (soft success; bottle ignores mode bits).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn chmod(_path: *const c_char, _mode: c_int) -> c_int {
-    not_impl(b"[kh-libsystem] chmod ENOSYS\n")
+    0
 }
 
 /// C `chown` → nlist `_chown`.
@@ -352,7 +352,7 @@ pub(crate) unsafe extern "C" fn umask(cmask: c_int) -> c_int {
     }
 }
 
-/// C `utimensat` → nlist `_utimensat`.
+/// C `utimensat` → nlist `_utimensat` (soft success; mtime not applied).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn utimensat(
     _fd: c_int,
@@ -360,33 +360,92 @@ pub(crate) unsafe extern "C" fn utimensat(
     _times: *const c_void,
     _flag: c_int,
 ) -> c_int {
-    not_impl(b"[kh-libsystem] utimensat ENOSYS\n")
+    0
 }
 
-// ── dirent (soft opaque) ────────────────────────────────────────────────────
+// ── dirent ──────────────────────────────────────────────────────────────────
+//
+// Minimal directory stream: open the path as a directory FD. `readdir` is still
+// empty (no getdirentries yet) so recursive tree walks see zero children, but
+// single-file archive paths never need readdir — and we no longer hard-fail
+// `opendir` with ENOSYS (which some guests treat as fatal).
+
+const DIR_MAGIC: u32 = 0x4B48_4449; // "KHDI"
 
 #[repr(C)]
 struct DirStub {
+    magic: u32,
     fd: c_int,
-    _pad: [u8; 60],
+    exhausted: c_int,
+    /// Darwin `struct dirent` is large; we only need a stable address for soft readdir.
+    ent: [u8; 1048],
 }
 
 /// C `opendir` → nlist `_opendir`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn opendir(_name: *const c_char) -> *mut c_void {
-    not_impl(b"[kh-libsystem] opendir ENOSYS\n");
-    core::ptr::null_mut()
+pub(crate) unsafe extern "C" fn opendir(name: *const c_char) -> *mut c_void {
+    if name.is_null() {
+        errno::set_errno(14);
+        return core::ptr::null_mut();
+    }
+    // O_RDONLY = 0. Directory open succeeds on Linux when path is a dir.
+    let fd = unsafe { open(name, 0, 0) };
+    if fd < 0 {
+        return core::ptr::null_mut();
+    }
+    let raw = unsafe { malloc(core::mem::size_of::<DirStub>()) };
+    if raw.is_null() {
+        let _ = unsafe { close(fd) };
+        errno::set_errno(ENOMEM);
+        return core::ptr::null_mut();
+    }
+    let d = raw.cast::<DirStub>();
+    unsafe {
+        (*d).magic = DIR_MAGIC;
+        (*d).fd = fd;
+        (*d).exhausted = 0;
+        crate::stdio::bzero((*d).ent.as_mut_ptr().cast(), (*d).ent.len());
+    }
+    raw
 }
 
 /// C `closedir` → nlist `_closedir`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn closedir(_dirp: *mut c_void) -> c_int {
+pub(crate) unsafe extern "C" fn closedir(dirp: *mut c_void) -> c_int {
+    if dirp.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    let d = dirp.cast::<DirStub>();
+    if unsafe { (*d).magic } != DIR_MAGIC {
+        errno::set_errno(9);
+        return -1;
+    }
+    let fd = unsafe { (*d).fd };
+    unsafe {
+        (*d).magic = 0;
+        let _ = close(fd);
+        free(dirp);
+    }
     0
 }
 
 /// C `readdir` → nlist `_readdir`.
+///
+/// Soft empty directory: always returns NULL (end of stream). Enough for
+/// guests that only open dirs defensively; real listing needs getdirentries.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn readdir(_dirp: *mut c_void) -> *mut c_void {
+pub(crate) unsafe extern "C" fn readdir(dirp: *mut c_void) -> *mut c_void {
+    if dirp.is_null() {
+        errno::set_errno(9);
+        return core::ptr::null_mut();
+    }
+    let d = dirp.cast::<DirStub>();
+    if unsafe { (*d).magic } != DIR_MAGIC {
+        errno::set_errno(9);
+        return core::ptr::null_mut();
+    }
+    // End of directory (empty listing).
     core::ptr::null_mut()
 }
 
@@ -397,8 +456,12 @@ pub(crate) unsafe extern "C" fn dirfd(dirp: *mut c_void) -> c_int {
         errno::set_errno(9);
         return -1;
     }
-    // SAFETY: only valid if from our opendir (currently never).
-    unsafe { (*dirp.cast::<DirStub>()).fd }
+    let d = dirp.cast::<DirStub>();
+    if unsafe { (*d).magic } != DIR_MAGIC {
+        errno::set_errno(9);
+        return -1;
+    }
+    unsafe { (*d).fd }
 }
 
 // ── process / misc ──────────────────────────────────────────────────────────

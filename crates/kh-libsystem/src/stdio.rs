@@ -127,13 +127,24 @@ pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_
 }
 
 /// `bzero` → nlist `_bzero`.
+///
+/// Must not be implemented as `memset(dst, 0, n)` or a plain zeroing loop:
+/// freestanding LLVM rewrites those to a call to `bzero` itself, which became
+/// `b _bzero` (infinite loop) and hung `7zz a` inside `VariantCopy`.
+/// Volatile stores prevent that recognition.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bzero(dst: *mut c_void, n: usize) {
-    if n > 0 && !dst.is_null() {
-        // SAFETY: valid for n bytes.
+    if dst.is_null() || n == 0 {
+        return;
+    }
+    let p = dst.cast::<u8>();
+    let mut i = 0_usize;
+    while i < n {
+        // SAFETY: `i < n` bytes at `dst`.
         unsafe {
-            byte_set(dst.cast(), 0, n);
+            core::ptr::write_volatile(p.add(i), 0);
         }
+        i = i.saturating_add(1);
     }
 }
 
