@@ -21,9 +21,19 @@ pub const MARKER_MAGIC: &str = "kakehashi-bottle 1";
 /// Relative path (from bottle root) of the host Linux bridge directory.
 pub const VOLUMES_LINUX: &str = "Volumes/linux";
 
+/// Guest path for the `libc++.1.dylib` alias under the bottle root.
+///
+/// Materialized as a **relative** symlink → [`GUEST_LIBCXX_TARGET`] so C++ guests
+/// (`7zz`, …) load our freestanding libSystem without a second crate.
+pub const GUEST_LIBCXX_REL: &str = "usr/lib/libc++.1.dylib";
+
+/// Relative symlink target of [`GUEST_LIBCXX_REL`] (sibling under `usr/lib/`).
+pub const GUEST_LIBCXX_TARGET: &str = "libSystem.B.dylib";
+
 /// Empty directories that form the post-install macOS root skeleton.
 ///
-/// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`) are created separately.
+/// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`)
+/// are created separately.
 const DIRS: &[&str] = &[
     "Applications",
     "Library/Application Support",
@@ -89,6 +99,11 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     symlink_rel(root, "private/tmp", "tmp")?;
     symlink_rel(root, "private/var", "var")?;
 
+    // C++ runtime alias: guest `/usr/lib/libc++.1.dylib` → same freestanding
+    // dylib as libSystem (no second crate). Target file may be installed later
+    // by `kh bottle create` / libsystem install.
+    ensure_libcxx_symlink(root)?;
+
     // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
     let volumes_linux = root.join(VOLUMES_LINUX);
     if volumes_linux.exists() || volumes_linux.symlink_metadata().is_ok() {
@@ -101,6 +116,52 @@ pub fn materialize(root: &Path) -> io::Result<()> {
 
     fs::write(root.join(MARKER_NAME), format!("{MARKER_MAGIC}\n"))?;
     Ok(())
+}
+
+/// Ensures `usr/lib/libc++.1.dylib` → `libSystem.B.dylib` (relative) under `root`.
+///
+/// Idempotent: existing correct symlink is left alone. A pre-existing non-symlink
+/// file at that path is an error so we never clobber a real dylib.
+pub fn ensure_libcxx_symlink(root: &Path) -> io::Result<()> {
+    let link_path = root.join(GUEST_LIBCXX_REL);
+    if let Ok(meta) = link_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&link_path)?;
+            if target == Path::new(GUEST_LIBCXX_TARGET) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists as symlink to {} (expected {})",
+                    link_path.display(),
+                    target.display(),
+                    GUEST_LIBCXX_TARGET
+                ),
+            ));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists and is not a symlink",
+                link_path.display()
+            ),
+        ));
+    }
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(GUEST_LIBCXX_TARGET, &link_path)
+}
+
+/// Returns `true` if the bottle has the libc++ → libSystem alias symlink.
+#[must_use]
+pub fn has_libcxx_symlink(root: &Path) -> bool {
+    let link_path = root.join(GUEST_LIBCXX_REL);
+    match fs::read_link(&link_path) {
+        Ok(target) => target == Path::new(GUEST_LIBCXX_TARGET),
+        Err(_) => false,
+    }
 }
 
 /// Creates `link` as a relative symlink to `target` under `root`, if absent.
@@ -147,9 +208,15 @@ mod tests {
         assert!(root.join("tmp").is_symlink());
         assert!(root.join("var").is_symlink());
         assert!(root.join(VOLUMES_LINUX).is_symlink());
+        assert!(has_libcxx_symlink(&root));
+        let cxx = fs::read_link(root.join(GUEST_LIBCXX_REL)).expect("libcxx readlink");
+        assert_eq!(cxx, Path::new(GUEST_LIBCXX_TARGET));
 
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));
+
+        // Idempotent ensure after materialize.
+        ensure_libcxx_symlink(&root).expect("ensure again");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

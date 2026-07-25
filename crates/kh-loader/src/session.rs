@@ -289,7 +289,12 @@ impl LoadSession {
 
     /// Main image: mapped `images[0]` or staged pre-map parse.
     fn main_image_ref(&mut self) -> Result<&MachOImage, LoadError> {
-        if self.images.first().and_then(|img| img.image.as_ref()).is_some() {
+        if self
+            .images
+            .first()
+            .and_then(|img| img.image.as_ref())
+            .is_some()
+        {
             return self
                 .images
                 .first()
@@ -400,7 +405,9 @@ impl LoadSession {
 
     /// Mutable access to main mapped memory (after map).
     pub fn memory_mut(&mut self) -> Option<&mut GuestMemory> {
-        self.images.first_mut().and_then(|main| main.memory.as_mut())
+        self.images
+            .first_mut()
+            .and_then(|main| main.memory.as_mut())
     }
 
     /// Guest entry VA after main slide, if known.
@@ -411,9 +418,7 @@ impl LoadSession {
             return main.plan.entry.map(|e| e.wrapping_add(slide));
         }
         // Pre-map: preferred entry without slide (placement not yet known).
-        self.staged_main
-            .as_ref()
-            .and_then(|s| s.plan.entry)
+        self.staged_main.as_ref().and_then(|s| s.plan.entry)
     }
 
     fn main_memory(&self) -> Option<&GuestMemory> {

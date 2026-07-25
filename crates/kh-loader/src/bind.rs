@@ -456,7 +456,7 @@ fn find_mapped_by_install_name<'a>(
     images: &'a [ProcessImage],
     install_name: &str,
 ) -> Option<&'a ProcessImage> {
-    images.iter().find(|img| {
+    if let Some(img) = images.iter().find(|img| {
         matches!(img.status, ImageLoadStatus::Mapped)
             && (img.install_name == install_name
                 || img
@@ -464,6 +464,33 @@ fn find_mapped_by_install_name<'a>(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| install_name.ends_with(n)))
+    }) {
+        return Some(img);
+    }
+
+    // Bottle alias: `libc++.1.dylib` → same real path as already-mapped
+    // `libSystem.B.dylib` is recorded as `skipped:duplicate`. Reuse the mapped
+    // image so two-level binds against the alias ordinal still resolve.
+    let alias = images.iter().find(|img| {
+        matches!(
+            img.status,
+            ImageLoadStatus::Skipped(crate::session::SkipReason::Duplicate)
+        ) && img.install_name == install_name
+    })?;
+    let alias_key = real_path_key(&alias.path)?;
+    images.iter().find(|img| {
+        matches!(img.status, ImageLoadStatus::Mapped)
+            && real_path_key(&img.path).as_ref() == Some(&alias_key)
+    })
+}
+
+fn real_path_key(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.canonicalize().ok().or_else(|| {
+        if path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(path.to_path_buf())
+        }
     })
 }
 

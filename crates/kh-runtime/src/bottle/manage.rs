@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::layout;
+use super::libsystem::{self, LibsystemInstall, LibsystemOrigin};
 use super::registry;
 
 /// Bottle management errors.
@@ -33,6 +34,10 @@ pub enum BottleError {
     #[error("destroy cancelled (confirmation required)")]
     NotConfirmed,
 
+    /// `--libsystem` / env pointed at a path that is not a readable file.
+    #[error("libSystem source not found: {0}")]
+    LibsystemNotFound(PathBuf),
+
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -40,6 +45,7 @@ pub enum BottleError {
 
 /// Snapshot of the registered bottle.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent presence flags for CLI/status
 pub struct BottleStatus {
     /// Absolute path from the registry (directory name is user-chosen).
     pub path: PathBuf,
@@ -47,13 +53,51 @@ pub struct BottleStatus {
     pub exists: bool,
     /// Whether the path has a valid `.kakehashi-bottle` marker.
     pub valid_marker: bool,
+    /// Whether `{path}/usr/lib/libSystem.B.dylib` is present.
+    pub libsystem: bool,
+    /// Whether `{path}/usr/lib/libc++.1.dylib` → `libSystem.B.dylib` alias exists.
+    pub libcxx_alias: bool,
+}
+
+/// Options for [`create`].
+#[derive(Debug, Clone, Default)]
+pub struct CreateOptions<'a> {
+    /// Bottle directory (default data path when `None`).
+    pub path: Option<&'a Path>,
+    /// Explicit guest dylib to install (`--libsystem`).
+    pub libsystem: Option<&'a Path>,
+    /// Skip searching/installing libSystem (skeleton only).
+    pub skip_libsystem: bool,
+}
+
+/// Result of a successful [`create`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateResult {
+    /// Absolute bottle root.
+    pub path: PathBuf,
+    /// libSystem install details when a source was found and copied.
+    pub libsystem: Option<LibsystemInstall>,
 }
 
 /// Creates the single bottle at `path` (or the default data path when `None`).
 ///
 /// Fails if a bottle is already registered and still present on disk. A stale
 /// registry entry (path missing) is cleared automatically so create can proceed.
-pub fn create(path: Option<&Path>) -> Result<PathBuf, BottleError> {
+///
+/// After the skeleton is written, installs guest `libSystem.B.dylib` when a
+/// source is discovered (see [`libsystem::discover`]) unless
+/// [`CreateOptions::skip_libsystem`] is set. An explicit `--libsystem` path that
+/// does not exist is an error; a missing auto-discovered source is not (the
+/// bottle is still usable for path tests without dylibs).
+pub fn create(path: Option<&Path>) -> Result<CreateResult, BottleError> {
+    create_with(&CreateOptions {
+        path,
+        ..CreateOptions::default()
+    })
+}
+
+/// Creates a bottle with full options (libSystem path / skip).
+pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
     if let Some(active) = registry::read_active()? {
         if active.exists() {
             return Err(BottleError::AlreadyExists { path: active });
@@ -62,7 +106,7 @@ pub fn create(path: Option<&Path>) -> Result<PathBuf, BottleError> {
         registry::clear_active()?;
     }
 
-    let target = match path {
+    let target = match opts.path {
         Some(p) => absolute(p)?,
         None => registry::default_bottle_path()?,
     };
@@ -86,8 +130,43 @@ pub fn create(path: Option<&Path>) -> Result<PathBuf, BottleError> {
     }
 
     layout::materialize(&target)?;
+
+    let libsystem = match install_libsystem_for_create(&target, opts) {
+        Ok(v) => v,
+        Err(err) => {
+            drop(layout::remove_tree(&target));
+            return Err(err);
+        }
+    };
+
     registry::write_active(&target)?;
-    Ok(target)
+    Ok(CreateResult {
+        path: target,
+        libsystem,
+    })
+}
+
+fn install_libsystem_for_create(
+    target: &Path,
+    opts: &CreateOptions<'_>,
+) -> Result<Option<LibsystemInstall>, BottleError> {
+    if opts.skip_libsystem {
+        return Ok(None);
+    }
+    if let Some(explicit) = opts.libsystem {
+        if !explicit.is_file() {
+            return Err(BottleError::LibsystemNotFound(explicit.to_path_buf()));
+        }
+        return Ok(Some(libsystem::install(
+            target,
+            explicit,
+            LibsystemOrigin::Explicit,
+        )?));
+    }
+    if let Some((src, origin)) = libsystem::discover(None) {
+        return Ok(Some(libsystem::install(target, &src, origin)?));
+    }
+    Ok(None)
 }
 
 /// Destroys the registered bottle after `confirmed` is true.
@@ -124,10 +203,14 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
     };
     let exists = path.exists();
     let valid_marker = exists && layout::is_bottle_root(&path);
+    let libsystem = exists && path.join(libsystem::GUEST_LIBSYSTEM_REL).is_file();
+    let libcxx_alias = exists && layout::has_libcxx_symlink(&path);
     Ok(Some(BottleStatus {
         path,
         exists,
         valid_marker,
+        libsystem,
+        libcxx_alias,
     }))
 }
 
@@ -201,10 +284,16 @@ mod tests {
         let _lock = test_env_lock();
         let g = EnvGuard::new();
 
-        let path = create(None).expect("create");
+        let created = create_with(&CreateOptions {
+            skip_libsystem: true,
+            ..CreateOptions::default()
+        })
+        .expect("create");
+        let path = created.path;
         assert!(layout::is_bottle_root(&path));
         assert_eq!(path, g.data.join("bottle"));
         assert!(path.join("Volumes/linux").is_symlink());
+        assert!(created.libsystem.is_none());
 
         let err = create(None).expect_err("second create");
         assert!(matches!(err, BottleError::AlreadyExists { .. }));
@@ -221,7 +310,13 @@ mod tests {
         let _g = EnvGuard::new();
 
         let custom = unique("custom-bottle-name");
-        let path = create(Some(&custom)).expect("create custom");
+        let created = create_with(&CreateOptions {
+            path: Some(&custom),
+            skip_libsystem: true,
+            ..CreateOptions::default()
+        })
+        .expect("create custom");
+        let path = created.path;
         assert_eq!(path, custom);
         assert!(layout::is_bottle_root(&path));
 
@@ -234,8 +329,13 @@ mod tests {
 
         // Create should clear stale and succeed at a new path.
         let again = unique("after-rename");
-        let path2 = create(Some(&again)).expect("create after stale");
-        assert!(layout::is_bottle_root(&path2));
+        let path2 = create_with(&CreateOptions {
+            path: Some(&again),
+            skip_libsystem: true,
+            ..CreateOptions::default()
+        })
+        .expect("create after stale");
+        assert!(layout::is_bottle_root(&path2.path));
 
         destroy(true).expect("destroy");
         drop(std::fs::remove_dir_all(&renamed));
@@ -246,7 +346,12 @@ mod tests {
         let _lock = test_env_lock();
         let _g = EnvGuard::new();
 
-        let path = create(None).expect("create");
+        let path = create_with(&CreateOptions {
+            skip_libsystem: true,
+            ..CreateOptions::default()
+        })
+        .expect("create")
+        .path;
         let err = destroy(false).expect_err("need confirm");
         assert!(matches!(err, BottleError::NotConfirmed));
         assert!(path.exists());
@@ -258,7 +363,12 @@ mod tests {
         let _lock = test_env_lock();
         let _g = EnvGuard::new();
 
-        let root = create(None).expect("create");
+        let root = create_with(&CreateOptions {
+            skip_libsystem: true,
+            ..CreateOptions::default()
+        })
+        .expect("create")
+        .path;
         let token = format!("kh-manage-vol-{}", std::process::id());
         let host_file = std::env::temp_dir().join(&token);
         let payload = b"rw-outside\n";
@@ -274,6 +384,32 @@ mod tests {
         assert_eq!(std::fs::read(&host_file).expect("host read"), payload2);
 
         drop(std::fs::remove_file(&host_file));
+        destroy(true).expect("destroy");
+    }
+
+    #[test]
+    fn create_installs_explicit_libsystem() {
+        let _lock = test_env_lock();
+        let _g = EnvGuard::new();
+
+        // Synthetic bottle fixture (checked in) is a valid thin arm64 dylib.
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = repo.join("tests/fixtures/bottle/usr/lib/libSystem.B.dylib");
+        assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+
+        let created = create_with(&CreateOptions {
+            libsystem: Some(&fixture),
+            ..CreateOptions::default()
+        })
+        .expect("create with libsystem");
+        assert!(created.libsystem.is_some());
+        let dest = created.path.join(libsystem::GUEST_LIBSYSTEM_REL);
+        assert!(dest.is_file());
+        let st = status().expect("status").expect("registered");
+        assert!(st.libsystem);
+        assert!(st.libcxx_alias);
+        assert!(layout::has_libcxx_symlink(&created.path));
+
         destroy(true).expect("destroy");
     }
 }

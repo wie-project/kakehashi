@@ -34,6 +34,39 @@ cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
 
 # Guest libSystem stubs (macOS arm64 dylib → bottle usr/lib/libSystem.B.dylib):
 cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+# Optional: stage as libSystem.B.dylib for release trees / explicit --libsystem:
+./scripts/stage-libsystem.sh
+```
+
+### Bottle + libSystem (two install paths)
+
+`kh bottle create` builds the macOS-like skeleton and, when a source dylib is
+found, copies it to `{bottle}/usr/lib/libSystem.B.dylib` (rewriting `LC_ID_DYLIB`
+to `/usr/lib/libSystem.B.dylib` if needed — no `install_name_tool` on Linux).
+
+| Path | What you have | What create does |
+| ---- | ------------- | ---------------- |
+| **From source** | Built `target/.../libkh_libsystem.dylib` + `kh` | Auto-finds Cargo `target/` (cwd) or pass `--libsystem` |
+| **From release** | Unpacked `bin/kh` + `lib/kakehashi/libSystem.B.dylib` | Auto-finds dylib next to / relative to `kh` |
+
+Discovery order: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next to the
+binary → `target/{release,debug,...}/libkh_libsystem.dylib`. Use
+`--skip-libsystem` for a skeleton-only bottle.
+
+```bash
+# From source (after both cargo builds):
+cargo build -p kh-cli --release          # on Linux aarch64
+cargo build -p kh-libsystem --release    # on macOS / apple-darwin target
+./target/release/kh bottle create        # picks up target/release/libkh_libsystem.dylib
+
+# From a release tarball layout:
+#   bin/kh
+#   lib/kakehashi/libSystem.B.dylib
+./bin/kh bottle create
+
+# Explicit path (either workflow):
+./target/debug/kh bottle create --libsystem dist/guest/libSystem.B.dylib
+./target/debug/kh bottle create --libsystem tests/fixtures/bottle/usr/lib/libSystem.B.dylib
 ```
 
 ```bash
@@ -78,13 +111,20 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 # Bottle root for path-taking syscalls (open/access) and absolute dylib resolve:
 ./target/debug/kh run --root /path/to/bottle tests/fixtures/minimal_arm64_execute.macho
 
-# Single managed bottle (macOS-like skeleton + Volumes/linux → host /):
+# Single managed bottle (skeleton + Volumes/linux → host / + optional libSystem):
 ./target/debug/kh bottle create                    # default: $XDG_DATA_HOME/kakehashi/bottle
 ./target/debug/kh bottle create --path /opt/my-b   # custom path (name is free to rename)
 ./target/debug/kh bottle status
 ./target/debug/kh bottle destroy                   # interactive y/N
 ./target/debug/kh bottle destroy --yes             # scripts / CI
 # Root resolution for run/trace: --root > KAKEHASHI_ROOT > registered bottle
+
+# Real-world guest: 7-Zip `7zz` (default host path /tmp/7zz, override KAKEHASHI_7ZZ).
+# Bottle materialize creates usr/lib/libc++.1.dylib → libSystem.B.dylib so both
+# LC_LOAD_DYLIB edges map to the freestanding guest dylib (no separate libc++ crate).
+# ./target/debug/kh bottle create
+# ./target/debug/kh run --dry-load /tmp/7zz          # map/bind probe (any host)
+# ./target/debug/kh trace --max-events 64 /tmp/7zz   # live: Linux aarch64
 ```
 
 Text `dry-load` output is multi-image (per-image mapped/skipped lines). Prefer

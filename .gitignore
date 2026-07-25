@@ -23,3 +23,6 @@ sessions/
 
 # Occasional local scratch (keep probes under tests/clang-probe/)
 /tmp/
+
+# Staged guest dylib / release layout (scripts/stage-libsystem.sh)
+/dist/

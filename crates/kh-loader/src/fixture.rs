@@ -2011,8 +2011,8 @@ pub fn bsdthread_create_join() -> Vec<u8> {
         (i32::try_from(worker_idx).unwrap_or(0) - i32::try_from(adr_worker_idx).unwrap_or(0)) * 4;
     patch_u32(&mut text, adr_worker_idx, adr(0, worker_byte));
 
-    let msg_byte = i32::try_from(msg_off).unwrap_or(0)
-        - (i32::try_from(adr_msg_idx).unwrap_or(0) * 4);
+    let msg_byte =
+        i32::try_from(msg_off).unwrap_or(0) - (i32::try_from(adr_msg_idx).unwrap_or(0) * 4);
     patch_u32(&mut text, adr_msg_idx, adr(1, msg_byte));
 
     arm64_execute_with_text(&text)

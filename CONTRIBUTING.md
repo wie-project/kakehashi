@@ -4,7 +4,7 @@ If you want to help this project, please follow these guidelines.
 
 ## Rules
 
-1. **Pre-PR checklist** — `cargo fmt --check`, `cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings`, and `cargo test --workspace --exclude kh-libsystem` should pass. (`kh-libsystem` is a freestanding aarch64-apple-darwin dylib; build it separately with `--target aarch64-apple-darwin --release`.)
+1. **Pre-PR checklist** — `cargo fmt --check`, `cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings`, and `cargo test --workspace --exclude kh-libsystem` should pass. (`kh-libsystem` is a freestanding aarch64-apple-darwin dylib; build it separately with `--target aarch64-apple-darwin --release`, then `./scripts/stage-libsystem.sh` or let `kh bottle create` install it.)
 
 2. **Clippy discipline** — Prefer fixing warnings over adding `allow`. Keep `allow` attributes rare and justified.
 

@@ -18,20 +18,27 @@ KH=(docker run --rm --entrypoint kh -w /app "${IMAGE}")
 echo "==> kh --help"
 "${KH[@]}" --help
 
-echo "==> kh bottle create / Volumes/linux R-W / destroy (inside Linux)"
+echo "==> kh bottle create / Volumes/linux R-W / libSystem install / destroy (inside Linux)"
 docker run --rm --entrypoint bash -w /app "${IMAGE}" -c '
 set -euo pipefail
 export KAKEHASHI_CONFIG_DIR=/tmp/kh-cfg
 export KAKEHASHI_DATA_DIR=/tmp/kh-data
 mkdir -p "$KAKEHASHI_CONFIG_DIR" "$KAKEHASHI_DATA_DIR"
 BOTTLE=/tmp/kh-data/custom-bottle-name
+# Release-like path: explicit dylib (synthetic fixture stands in for staged guest).
+LIBSYS=/app/tests/fixtures/bottle/usr/lib/libSystem.B.dylib
 
-kh bottle create --path "$BOTTLE"
+kh bottle create --path "$BOTTLE" --libsystem "$LIBSYS"
 test -L "$BOTTLE/Volumes/linux"
 test -d "$BOTTLE/usr/lib"
 test -d "$BOTTLE/Applications"
 test -L "$BOTTLE/etc"
 test -f "$BOTTLE/.kakehashi-bottle"
+test -f "$BOTTLE/usr/lib/libSystem.B.dylib"
+test -L "$BOTTLE/usr/lib/libc++.1.dylib"
+test "$(readlink "$BOTTLE/usr/lib/libc++.1.dylib")" = "libSystem.B.dylib"
+kh bottle status | grep -q "libSystem: true"
+kh bottle status | grep -q "libc++:    true"
 
 # Host (Linux) file readable through the bottle bridge.
 TOKEN="kh-vol-$$"
@@ -43,7 +50,7 @@ echo "from-bottle" >"$BOTTLE/Volumes/linux/tmp/${TOKEN}-2"
 test "$(cat "/tmp/${TOKEN}-2")" = "from-bottle"
 
 # Exactly one bottle: second create must fail.
-if kh bottle create --path /tmp/kh-data/other 2>/dev/null; then
+if kh bottle create --path /tmp/kh-data/other --skip-libsystem 2>/dev/null; then
   echo "expected second create to fail" >&2
   exit 1
 fi

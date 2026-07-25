@@ -133,6 +133,14 @@ enum BottleAction {
         /// the absolute path.
         #[arg(long, short = 'p')]
         path: Option<PathBuf>,
+        /// Guest `libSystem.B.dylib` (or `libkh_libsystem.dylib`) to install under
+        /// `usr/lib/`. When omitted, searches `KAKEHASHI_LIBSYSTEM`, paths next to
+        /// `kh`, then Cargo `target/` outputs.
+        #[arg(long)]
+        libsystem: Option<PathBuf>,
+        /// Create the skeleton only (no libSystem install).
+        #[arg(long)]
+        skip_libsystem: bool,
     },
     /// Delete the registered bottle (prompts for y/N unless `--yes`).
     Destroy {
@@ -229,8 +237,14 @@ fn run() -> Result<()> {
         }),
         Command::Bottle { action } => {
             let cmd = match &action {
-                BottleAction::Create { path } => commands::bottle::BottleCmd::Create {
+                BottleAction::Create {
+                    path,
+                    libsystem,
+                    skip_libsystem,
+                } => commands::bottle::BottleCmd::Create {
                     path: path.as_deref(),
+                    libsystem: libsystem.as_deref(),
+                    skip_libsystem: *skip_libsystem,
                 },
                 BottleAction::Destroy { yes } => commands::bottle::BottleCmd::Destroy { yes: *yes },
                 BottleAction::Path => commands::bottle::BottleCmd::Path,

@@ -18,9 +18,8 @@
 //! rustup target add aarch64-apple-darwin   # when cross-building
 //! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 //! # → target/aarch64-apple-darwin/release/libkh_libsystem.dylib
-//! install_name_tool -id /usr/lib/libSystem.B.dylib \
-//!   target/aarch64-apple-darwin/release/libkh_libsystem.dylib
-//! # ship as usr/lib/libSystem.B.dylib
+//! ./scripts/stage-libsystem.sh   # optional: dist/guest/libSystem.B.dylib
+//! kh bottle create               # copies + sets LC_ID_DYLIB to /usr/lib/...
 //! ```
 //!
 //! Default `cargo test` / `cargo clippy` use workspace `default-members` and
