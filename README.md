@@ -10,12 +10,12 @@ Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).
 
 ## Crates
 
-| Crate          | Role                                                            |
-| -------------- | --------------------------------------------------------------- |
-| `kh-cli`       | Binary `kh` — inspect / run / trace / bottle                    |
-| `kh-loader`    | Mach-O parse, image plan, map session, micro execute            |
-| `kh-runtime`   | Page geometry, guest `mmap`, stack, traps, BSD table, bottle    |
-| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` (build on Apple Darwin)  |
+| Crate          | Role                                                           |
+| -------------- | -------------------------------------------------------------- |
+| `kh-cli`       | Binary `kh` — inspect / run / trace / bottle                   |
+| `kh-loader`    | Mach-O parse, image plan, map session, micro execute           |
+| `kh-runtime`   | Page geometry, guest `mmap`, stack, traps, BSD table, bottle   |
+| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` (build on Apple Darwin) |
 
 ## Requirements
 
@@ -102,59 +102,6 @@ KAKEHASHI_HYPERCALL=0 ./scripts/bench-fair-local.sh
 
 Guest Darwin `7zz` and a Linux `7zz` are **different binaries** — compare
 hyper vs brk for path overhead, not absolute “native × N” across versions.
-
-## Test on a free Linux arm64 machine
-
-You need a real **aarch64 Linux** shell (not x86_64) with Rust, git, and a
-staged `libSystem` (build the dylib on a Mac first, commit is not required —
-copy `dist/guest/libSystem.B.dylib` or build with a Darwin cross toolchain).
-
-### Option A — Oracle Cloud Always Free (recommended)
-
-1. Sign up: [Oracle Cloud Free Tier](https://www.oracle.com/cloud/free/)  
-   (credit card for verification; Always Free Ampere A1 is free ongoing).
-2. Create a VM: **Ampere A1** (aarch64), Ubuntu 22.04/24.04, ≥2 OCPU / 12 GB
-   (free allowance is shared across A1 shapes).
-3. SSH in, then:
-
-```bash
-sudo apt update && sudo apt install -y build-essential git curl
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-git clone <your-fork-or-repo-url> kakehashi && cd kakehashi
-# Copy dist/guest/libSystem.B.dylib from your Mac if you did not build it here:
-#   scp dist/guest/libSystem.B.dylib user@vm:~/kakehashi/dist/guest/
-
-cargo build -p kh-cli --release
-./target/release/kh bottle ensure
-./target/release/kh run --expect-code 0 tests/fixtures/minimal_arm64_execute.macho
-./target/release/kh run --expect-code 0 --root tests/fixtures/bottle \
-  tests/clang-probe/puts_hello
-./target/release/kh run tests/clang-probe/7zz.bin -- --help
-```
-
-### Option B — GitHub Codespaces / other free aarch64
-
-- Prefer a host that reports `uname -m` → `aarch64` / `arm64`.
-- x86_64 free VMs (most Fly.io / Railway free tiers) **cannot** run live
-  `kh run` (wrong ISA). Use them only for `dry-load` / inspect.
-
-### Option C — Scaleway / Hetzner / AWS (paid or trial)
-
-Any **arm64** instance works the same as Option A once Rust and the bottle
-libSystem are in place.
-
-### Minimal checklist on the VM
-
-```bash
-uname -m                    # must be aarch64
-cargo test --workspace --exclude kh-libsystem
-./target/release/kh bottle ensure
-./target/release/kh run --expect-code 0 tests/fixtures/bsdthread_create_join.macho
-./target/release/kh run tests/clang-probe/7zz.bin -- \
-  a -t7z -mx=1 -mmt=2 /tmp/t.7z README.md
-```
 
 ## License
 
