@@ -45,13 +45,30 @@ pub fn bottle_root() -> Option<PathBuf> {
 /// * Relative guest path + bottle → `{root}/{relative}`
 /// * Relative guest path, no bottle → host-relative path as-is
 pub fn translate_path(guest: &str) -> Result<PathBuf, PathError> {
-    translate_path_with_root(bottle_root().as_deref(), guest)
+    // Avoid cloning the bottle root PathBuf on every open/stat.
+    process::with_bottle_root(|root| translate_path_with_root(root, guest))
 }
 
 /// Pure translation helper (testable without process globals).
 pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<PathBuf, PathError> {
     if guest.is_empty() {
         return Err(PathError::Empty);
+    }
+
+    // Fast path: no `..` and no empty components → strip leading slashes / `.`
+    // without allocating intermediate PathBufs for each component.
+    if let Some(rel) = try_fast_relative(guest) {
+        return match root {
+            Some(r) => {
+                let mut out = PathBuf::with_capacity(r.as_os_str().len().saturating_add(rel.len()).saturating_add(1));
+                out.push(r);
+                if !rel.is_empty() {
+                    out.push(rel);
+                }
+                Ok(out)
+            }
+            None => Ok(PathBuf::from(guest)),
+        };
     }
 
     let guest_path = Path::new(guest);
@@ -65,6 +82,35 @@ pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<Path
         }
         None => Ok(guest_path.to_path_buf()),
     }
+}
+
+/// Returns stripped relative guest path when it has no `..` (and no empty segs).
+///
+/// `None` means fall back to the full component walker.
+fn try_fast_relative(guest: &str) -> Option<&str> {
+    if guest.contains("..") {
+        // May be `foo..bar` (ok) or `../x` / `a/../b` — let the slow path decide.
+        if guest == ".."
+            || guest.starts_with("../")
+            || guest.ends_with("/..")
+            || guest.contains("/../")
+        {
+            return None;
+        }
+    }
+    let mut s = guest;
+    while let Some(rest) = s.strip_prefix('/') {
+        s = rest;
+    }
+    // Drop a single leading "./"
+    if let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    // Reject remaining "./" or empty segments that need normalization.
+    if s.contains("/./") || s.contains("//") || s.ends_with("/.") {
+        return None;
+    }
+    Some(s)
 }
 
 /// Strips leading `/` (and Windows-style prefixes if any) and rejects `..`.
@@ -82,6 +128,9 @@ fn strip_root_components(path: &Path) -> Result<PathBuf, PathError> {
     Ok(out)
 }
 
+/// Stack buffer size for typical guest paths (avoids heap on open/stat).
+const PATH_STACK: usize = 512;
+
 /// Reads a NUL-terminated C string from an identity-mapped guest pointer.
 ///
 /// Used by `open` / `access` handlers. Caps length to avoid runaway scans.
@@ -93,10 +142,29 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
     }
     let base = usize::try_from(ptr).ok()?;
     let base_ptr: *const u8 = std::ptr::with_exposed_provenance(base);
-    let mut buf = Vec::new();
-    for i in 0..max_len {
-        // SAFETY: identity map — guest VA == host VA for mapped pages. A bad
-        // pointer may fault; callers only use this from the trap path.
+
+    let mut stack = [0_u8; PATH_STACK];
+    let stack_cap = PATH_STACK.min(max_len);
+    for i in 0..stack_cap {
+        // SAFETY: identity map — guest VA == host VA for mapped pages.
+        let byte = unsafe { *base_ptr.wrapping_add(i) };
+        if byte == 0 {
+            return stack.get(..i).and_then(|s| std::str::from_utf8(s).ok()).map(str::to_owned);
+        }
+        if let Some(slot) = stack.get_mut(i) {
+            *slot = byte;
+        }
+    }
+    if stack_cap == max_len {
+        return None; // no NUL within cap
+    }
+
+    // Longer path: fall back to heap.
+    let mut buf = Vec::with_capacity(stack_cap.saturating_add(64));
+    if let Some(prefix) = stack.get(..stack_cap) {
+        buf.extend_from_slice(prefix);
+    }
+    for i in stack_cap..max_len {
         let byte = unsafe { *base_ptr.wrapping_add(i) };
         if byte == 0 {
             return String::from_utf8(buf).ok();
@@ -154,5 +222,13 @@ mod tests {
             host,
             PathBuf::from("/var/lib/my-renamed-bottle/Volumes/linux/tmp/x")
         );
+    }
+
+    #[test]
+    fn fast_path_dots_in_name_ok() {
+        let root = Path::new("/b");
+        let host = translate_path_with_root(Some(root), "/foo..bar")
+            .expect("dots in name");
+        assert_eq!(host, PathBuf::from("/b/foo..bar"));
     }
 }

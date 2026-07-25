@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use kh_runtime::{
     AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack,
-    call_guest_args, finish_with_exit_code, install_trap_handlers, map_stack, patch_svc_to_brk,
-    registry_install, registry_take, set_bottle_root,
+    call_guest_args, clear_trampoline_cache, finish_with_exit_code, install_trap_handlers,
+    map_stack, patch_svc_to_brk, registry_install, registry_take, set_bottle_root,
 };
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+use kh_runtime::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, mprotect_darwin, mprotect_rw};
 
 use crate::error::LoadError;
 use crate::init;
@@ -80,6 +82,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     set_bottle_root(opts.root.clone());
     // Drop any previous active address space (unmaps owned guest mmaps).
     drop(registry_take());
+    // Owned trampoline pages went with the space — never reuse stale VAs.
+    clear_trampoline_cache();
 
     let mut session = LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)?;
     let _ = session.map_process()?;
@@ -91,12 +95,6 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let entry = session
         .entry_va()
         .ok_or(LoadError::NotImplemented("image has no entry point"))?;
-
-    let mut patched_svc = 0usize;
-    for memory in session.mapped_memories_mut() {
-        patched_svc = patched_svc
-            .saturating_add(patch_svc_to_brk(memory.regions_mut()).map_err(trap_to_load)?);
-    }
 
     let host = session
         .images()
@@ -118,6 +116,9 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))?;
 
     // Build process address space, then install for trap-path checks / mmap bookkeeping.
+    // Must install *before* `patch_svc_to_brk`: the Linux trampoline path maps an RX
+    // page and `register_owned`s it. Installing a fresh AddressSpace drops the previous
+    // one and would munmap that trampoline → SIGSEGV on the first `bl`.
     let mut address_space = AddressSpace::new();
     for img in session.images() {
         if let Some(memory) = img.memory.as_ref() {
@@ -128,6 +129,21 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     }
     address_space.register_borrowed(&stack);
     drop(registry_install(address_space));
+
+    // Wire freestanding libSystem → host BSD dispatch (no SIGTRAP).
+    // Default ON; opt out with `KAKEHASHI_HYPERCALL=0|false|off|no`.
+    let hypercall_wired = if hypercall_enabled() {
+        install_libsystem_hypercall(&mut session)
+    } else {
+        false
+    };
+    // Rewrite residual Darwin `svc` (binaries not using freestanding hypercall).
+    // After the active registry is live so optional trampoline pages stick.
+    let mut patched_svc = 0usize;
+    for memory in session.mapped_memories_mut() {
+        patched_svc = patched_svc
+            .saturating_add(patch_svc_to_brk(memory.regions_mut()).map_err(trap_to_load)?);
+    }
 
     install_trap_handlers(&TrapConfig {
         max_events: opts.max_events,
@@ -143,6 +159,7 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         sp = format_args!("{sp:#x}"),
         slide,
         patched_svc,
+        hypercall_wired,
         initializers_run,
         images = session.images().len(),
         root = ?opts.root,
@@ -192,4 +209,117 @@ fn trap_to_load(err: TrapError) -> LoadError {
             LoadError::PageLayout(format!("trap signal setup: {io_err}"))
         }
     }
+}
+
+/// Freestanding libSystem hypercall is on by default (avoids SIGTRAP).
+///
+/// Disable with `KAKEHASHI_HYPERCALL=0|false|off|no`.
+fn hypercall_enabled() -> bool {
+    match std::env::var_os("KAKEHASHI_HYPERCALL") {
+        None => true,
+        Some(v) => {
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+    }
+}
+
+/// Point freestanding `libSystem`'s `_kh_bsd_hypercall` at host dispatch.
+///
+/// Returns whether the slot was found and written. On non-Linux hosts this is a
+/// no-op (`false`).
+fn install_libsystem_hypercall(session: &mut LoadSession) -> bool {
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    {
+        let _ = session;
+        false
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        install_libsystem_hypercall_linux(session)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn install_libsystem_hypercall_linux(session: &mut LoadSession) -> bool {
+    /// Freestanding export the host patches with the dispatch entry address.
+    const SLOT: &str = "_kh_bsd_hypercall";
+
+    // Prefer freestanding-side NEON preserve (in kh-libsystem syscall7). Wire
+    // the slot to bare dispatch so we don't double-frame 0x280+0x280 on the
+    // guest worker stack under 7zz `-mmt>1` compression.
+    #[allow(clippy::as_conversions, function_casts_as_integer)]
+    let entry_u64 = {
+        let bare = u64::try_from(kh_runtime::kh_trampoline_dispatch as usize).unwrap_or(0);
+        if bare != 0 {
+            bare
+        } else {
+            kh_runtime::hypercall_entry_addr()
+        }
+    };
+    if entry_u64 == 0 {
+        return false;
+    }
+
+    for img in session.images_mut() {
+        let slide = img.slide();
+        let Some(exp) = img
+            .exports
+            .iter()
+            .find(|e| e.name == SLOT || e.name == "kh_bsd_hypercall")
+            .cloned()
+        else {
+            continue;
+        };
+        let va = exp.value.saturating_add(slide);
+        let Some(memory) = img.memory.as_mut() else {
+            continue;
+        };
+
+        // Locate covering region; DATA may be mapped RO.
+        let Some(region_idx) = memory.regions().iter().position(|region| {
+            let start = region.guest_addr;
+            let end = start.saturating_add(u64::try_from(region.host_len()).unwrap_or(0));
+            va >= start && va.saturating_add(8) <= end
+        }) else {
+            continue;
+        };
+        let Some(region) = memory.regions().get(region_idx) else {
+            continue;
+        };
+        let old_prot = region.prot;
+        let need_rw = old_prot & VM_PROT_WRITE == 0;
+        if need_rw {
+            let Some(region) = memory.regions_mut().get_mut(region_idx) else {
+                return false;
+            };
+            if mprotect_rw(region).is_err() {
+                return false;
+            }
+        }
+        let ok = memory.write_u64_le(va, entry_u64).is_some();
+        if need_rw {
+            let mut restore = (old_prot | VM_PROT_READ) & !VM_PROT_WRITE;
+            if old_prot & VM_PROT_EXECUTE != 0 {
+                restore |= VM_PROT_EXECUTE;
+            }
+            let Some(region) = memory.regions_mut().get_mut(region_idx) else {
+                return false;
+            };
+            drop(mprotect_darwin(region, restore));
+            region.prot = restore;
+        }
+        if ok {
+            tracing::info!(
+                va = format_args!("{va:#x}"),
+                entry = format_args!("{entry_u64:#x}"),
+                "wired libSystem BSD hypercall"
+            );
+            return true;
+        }
+        return false;
+    }
+    false
 }

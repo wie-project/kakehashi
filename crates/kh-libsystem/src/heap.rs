@@ -13,9 +13,10 @@ use crate::sys::{self, SYS_MMAP, SYS_MUNMAP};
 use crate::trace;
 
 const ALIGN: usize = 16;
-const ARENA_SIZE: usize = 16 * 1024 * 1024;
+/// Larger arena cuts mmap/munmap trap traffic for 7zz-class working sets.
+const ARENA_SIZE: usize = 64 * 1024 * 1024;
 /// Allocations ≥ this size go straight to anonymous `mmap` (and `munmap` on free).
-const MMAP_THRESHOLD: usize = 64 * 1024;
+const MMAP_THRESHOLD: usize = 256 * 1024;
 const PAGE: usize = 16_384;
 const MAGIC_ARENA: u32 = 0x4B48_4152; // "KHAR"
 const MAGIC_MMAP: u32 = 0x4B48_4D4D; // "KHMM"
@@ -71,7 +72,8 @@ fn unlock() {
 #[inline]
 fn align_up(value: usize, align: usize) -> usize {
     let a = align.max(1);
-    value.saturating_add(a - 1) & !(a - 1)
+    let mask = a.saturating_sub(1);
+    value.saturating_add(mask) & !mask
 }
 
 #[inline]
@@ -205,7 +207,9 @@ fn allocate_arena(need: usize) -> *mut c_void {
                 // Optional split if leftover is large enough for another header+16.
                 let leftover = sz.saturating_sub(need);
                 if leftover >= HDR_SIZE.saturating_add(ALIGN) {
-                    let split = user_ptr(cur).cast::<u8>().wrapping_add(need).cast::<Hdr>();
+                    // Payload is 16-byte aligned; `need` is too → split header aligned.
+                    let split_addr = user_ptr(cur).addr().saturating_add(need);
+                    let split = core::ptr::with_exposed_provenance_mut::<Hdr>(split_addr);
                     (*split).magic = MAGIC_ARENA;
                     (*split).flags = FLAG_FREE;
                     (*split).size = leftover.saturating_sub(HDR_SIZE);
@@ -238,9 +242,9 @@ fn allocate_arena(need: usize) -> *mut c_void {
             .compare_exchange(cur_off, next, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
-            let base = ARENA.buf.get().cast::<u8>();
-            // SAFETY: offset within ARENA_SIZE.
-            let h = unsafe { base.add(cur_off).cast::<Hdr>() };
+            // Arena base is 16-byte aligned; bump offsets are always multiples of ALIGN.
+            let base_addr = ARENA.buf.get().addr();
+            let h = core::ptr::with_exposed_provenance_mut::<Hdr>(base_addr.saturating_add(cur_off));
             unsafe {
                 (*h).magic = MAGIC_ARENA;
                 (*h).flags = 0;

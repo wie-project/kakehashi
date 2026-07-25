@@ -54,6 +54,16 @@ pub const KH_BOTTLE_MARK_VALUE: i32 = 77;
 pub const KH_HELPER_PUTS: u32 = 0x4B48_0001;
 /// Host-helper id for minimal `_printf` (literal format only).
 pub const KH_HELPER_PRINTF: u32 = 0x4B48_0002;
+/// Host-helper id for `readdir` next entry.
+pub const KH_HELPER_READDIR: u32 = 0x4B48_0003;
+/// Host-helper id for `sched_yield` / pthread backoff.
+pub const KH_HELPER_YIELD: u32 = 0x4B48_0004;
+/// Host-helper id for online CPU count (`sysconf(_SC_NPROCESSORS_ONLN)`).
+pub const KH_HELPER_NCPU: u32 = 0x4B48_0005;
+/// Host-helper id: park while `*u32 == expected` (futex wait).
+pub const KH_HELPER_PARK: u32 = 0x4B48_0006;
+/// Host-helper id: wake park waiters on a `u32` address.
+pub const KH_HELPER_WAKE: u32 = 0x4B48_0007;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

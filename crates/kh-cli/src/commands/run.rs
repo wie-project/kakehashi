@@ -46,7 +46,10 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         root,
         guest_page_size: guest,
         guest_args: args.guest_args.to_vec(),
-        max_events: args.max_syscalls,
+        // Plain `kh run` must not record trap events — max_syscalls is 50M+ and
+        // each event is a String + Mutex push (catastrophic on archive I/O).
+        // Use `kh trace` when you need a ring buffer of traps.
+        max_events: 0,
         max_syscalls: args.max_syscalls,
         dry_load: false,
     };

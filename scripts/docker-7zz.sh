@@ -13,7 +13,14 @@
 #
 # Extra env:
 #   KAKEHASHI_SMOKE_IMAGE  docker image (default: kakehashi:dev)
-#   KH_EXTRA_CARGO_ARGS    forwarded to cargo run (e.g. --release)
+#   KH_EXTRA_CARGO_ARGS    forwarded to cargo build (e.g. --release)
+#   KH_DOCKER_MOUNTS       extra docker -v mounts, space-separated
+#                          e.g. "/Users/me/Nook:/nook  /tmp/out:/out"
+#                          Guest paths: /Volumes/linux/nook/... etc.
+#
+# Fair multi-thread benches: Colima defaults to few vCPUs. 7zz reports
+# Threads:N from host online CPUs — raise VM size before comparing to native:
+#   colima stop && colima start --cpu 8 --memory 8
 
 set -euo pipefail
 
@@ -42,14 +49,26 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   docker build -t "${IMAGE}" -f Dockerfile.dev .
 fi
 
+DOCKER_VOLS=(
+  -v "${ROOT}:/src"
+  -v kh-target-cache:/src/target
+)
+# shellcheck disable=SC2206
+if [[ -n "${KH_DOCKER_MOUNTS:-}" ]]; then
+  for m in ${KH_DOCKER_MOUNTS}; do
+    DOCKER_VOLS+=(-v "$m")
+  done
+fi
+
 # Project-local registry + bottle (persists on the bind mount, not host /tmp).
 docker run --rm \
-  -v "${ROOT}:/src" \
-  -v kh-target-cache:/src/target \
+  "${DOCKER_VOLS[@]}" \
   -w /src \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
   -e CARGO_TARGET_DIR=/src/target \
+  -e "KAKEHASHI_TRAMPOLINE=${KAKEHASHI_TRAMPOLINE:-}" \
+  -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-}" \
   "${IMAGE}" \
   bash -c '
 set -euo pipefail

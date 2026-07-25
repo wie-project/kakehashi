@@ -1,8 +1,13 @@
-//! Trap backend: rewrite Darwin `svc` to `brk` and dispatch BSD syscalls.
+//! Trap backend: rewrite Darwin `svc` for Linux aarch64 translation.
 //!
 //! Linux aarch64 treats every `svc` as a Linux syscall (number in `x8`), which
-//! is incompatible with Darwin (number in `x16`, `svc #0x80`). Guest `svc`
-//! instructions are rewritten to `brk #IMM` and handled via `SIGTRAP`.
+//! is incompatible with Darwin (number in `x16`, `svc #0x80`).
+//!
+//! Prefer **userspace trampoline** so the common path never hits `SIGTRAP`:
+//! each `svc` becomes `b veneer` (no link — **preserves `x30`/LR**), and the
+//! per-site veneer saves LR, `bl`s the shared dispatcher, restores LR, then
+//! `b`s back to the instruction after the original `svc`. Fall back to
+//! `brk #IMM` + `SIGTRAP` when a branch is out of range.
 //!
 //! Live handlers require **Linux aarch64**. Patching works on any host.
 #![allow(unsafe_code)]
@@ -31,6 +36,40 @@ const SVC_BASE: u32 = 0xD400_0001;
 /// AArch64 `brk #imm16`: `0xD4200000 | (imm16 << 5)`.
 const fn brk_encoding(imm16: u32) -> u32 {
     0xD420_0000 | ((imm16 & 0xFFFF) << 5)
+}
+
+/// AArch64 PC-relative branch imm26 (±128 MiB), or `None` if out of range.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::manual_range_contains
+)]
+fn branch_imm26(from: u64, to: u64) -> Option<u32> {
+    let delta = i64::try_from(to).ok()?.wrapping_sub(i64::try_from(from).ok()?);
+    if delta & 3 != 0 {
+        return None;
+    }
+    let imm = delta >> 2;
+    // Imm26 signed range for B/BL.
+    if imm < -(1_i64 << 25) || imm >= (1_i64 << 25) {
+        return None;
+    }
+    // Truncate to 26-bit two's complement field (intentional).
+    Some((imm as u32) & 0x03FF_FFFF)
+}
+
+/// AArch64 `BL` (imm26) from `from` to `to`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn bl_encoding(from: u64, to: u64) -> Option<u32> {
+    Some(0x9400_0000 | branch_imm26(from, to)?)
+}
+
+/// AArch64 `B` (imm26, **no link** — preserves `x30`) from `from` to `to`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn b_encoding(from: u64, to: u64) -> Option<u32> {
+    Some(0x1400_0000 | branch_imm26(from, to)?)
 }
 
 /// AArch64 `PSTATE` / CPSR carry flag (bit 29 of NZCV).
@@ -119,14 +158,33 @@ static TRACE_JSON: AtomicBool = AtomicBool::new(false);
 static EXPECT_CODE: AtomicI32 = AtomicI32::new(i32::MIN);
 static EVENTS: Mutex<Vec<TrapEvent>> = Mutex::new(Vec::new());
 
-/// Patches every AArch64 `svc` instruction in executable regions to `brk #IMM`.
+/// Patches every AArch64 `svc` in executable regions.
+///
+/// On Linux aarch64: prefers `bl` into a guest-mapped trampoline (no signal).
+/// Falls back to `brk #IMM` for out-of-range sites.
 pub fn patch_svc_to_brk(regions: &mut [MappedRegion]) -> Result<usize, TrapError> {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        patch_svc_linux(regions)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    {
+        patch_svc_brk_only(regions)
+    }
+}
+
+#[cfg_attr(
+    all(target_arch = "aarch64", target_os = "linux"),
+    allow(dead_code)
+)]
+fn patch_svc_brk_only(regions: &mut [MappedRegion]) -> Result<usize, TrapError> {
     let mut patched = 0_usize;
     for region in regions.iter_mut() {
         if region.prot & VM_PROT_EXECUTE == 0 {
             continue;
         }
         mprotect_rw(region)?;
+        let guest_base = region.guest_addr;
         let bytes = region.host_bytes_mut();
         let mut off = 0_usize;
         while off.saturating_add(4) <= bytes.len() {
@@ -145,6 +203,7 @@ pub fn patch_svc_to_brk(regions: &mut [MappedRegion]) -> Result<usize, TrapError
                     patched = patched.saturating_add(1);
                 }
             }
+            let _ = guest_base;
             off = end;
         }
         let restore = (region.prot | VM_PROT_READ | VM_PROT_EXECUTE) & !VM_PROT_WRITE;
@@ -158,6 +217,521 @@ const fn is_svc(insn: u32) -> bool {
     (insn & SVC_MASK) == SVC_BASE
 }
 
+/// Linux aarch64: optional userspace trampoline (`svc`→`b veneer`).
+///
+/// Enable with `KAKEHASHI_TRAMPOLINE=1`. Default is classic `brk` + `SIGTRAP`
+/// until multi-thread compression (7zz `-mmt>1`) is fully green on the
+/// veneer path. Single-thread (`-mmt1`) and store-only (`-mx=0`) already work.
+///
+/// **Why a veneer (not a direct `bl`)?** Darwin `svc` preserves `x30` (LR). A
+/// direct `bl trampoline` overwrites LR with the resume PC; the libSystem stub
+/// then `ret`s to itself and spins. The veneer saves/restores the real LR.
+///
+/// The shared dispatcher also saves **Q0–Q31 + FPCR/FPSR** (Darwin `svc`
+/// preserves SIMD; Rust would otherwise clobber NEON used by 7zz workers).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn patch_svc_linux(regions: &mut [MappedRegion]) -> Result<usize, TrapError> {
+    if !trampoline_enabled() {
+        return patch_svc_brk_only(regions);
+    }
+    let mut patched = 0_usize;
+    for region in regions.iter_mut() {
+        if region.prot & VM_PROT_EXECUTE == 0 {
+            continue;
+        }
+        mprotect_rw(region)?;
+        let guest_base = region.guest_addr;
+        // Collect svc offsets first.
+        let mut sites = Vec::new();
+        {
+            let bytes = region.host_bytes();
+            let mut off = 0_usize;
+            while off.saturating_add(4) <= bytes.len() {
+                let end = off.saturating_add(4);
+                if let Some(word) = bytes.get(off..end)
+                    && let Ok(word_bytes) = <[u8; 4]>::try_from(word)
+                {
+                    let insn = u32::from_le_bytes(word_bytes);
+                    if is_svc(insn) {
+                        sites.push(off);
+                    }
+                }
+                off = end;
+            }
+        }
+        if sites.is_empty() {
+            let restore = (region.prot | VM_PROT_READ | VM_PROT_EXECUTE) & !VM_PROT_WRITE;
+            mprotect_darwin(region, restore)?;
+            region.prot = restore;
+            continue;
+        }
+
+        patched = patched.saturating_add(patch_region_with_veneers(region, guest_base, &sites));
+    }
+    Ok(patched)
+}
+
+/// Per-site veneer size: `str lr; bl shared; ldr lr; b site+4`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const VENEER_BYTES: usize = 16;
+
+/// How many page slots to probe above/below an RX region for a veneer hub.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const VENEER_PROBE_RADIUS: u64 = 128;
+
+/// `mov x16, x7` — AAPCS 8th arg → Darwin syscall number reg (hypercall shim).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const HYPERCALL_SHIM_PROLOGUE: [u8; 4] = [0xf0, 0x03, 0x07, 0xaa];
+
+/// Round `len` up to a multiple of `page` (page must be a power of two ≥ 1).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[inline]
+fn align_up_to_page(len: usize, page: usize) -> usize {
+    if page <= 1 {
+        return len.max(1);
+    }
+    let mask = page.saturating_sub(1);
+    len.saturating_add(mask) & !mask
+}
+
+// libgcc / compiler-rt symbol linked on Linux aarch64 toolchains.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe extern "C" {
+    fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
+}
+
+/// Opt-in trampoline: `KAKEHASHI_TRAMPOLINE=1|true|yes|on`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn trampoline_enabled() -> bool {
+    match std::env::var_os("KAKEHASHI_TRAMPOLINE") {
+        None => false,
+        Some(v) => {
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+    }
+}
+
+/// Flush D/I caches after writing executable code (aarch64 requirement).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn clear_icache(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: range is a live mapping the caller owns and just wrote.
+    unsafe {
+        let start = ptr.cast::<libc::c_void>();
+        let end = ptr.wrapping_add(len).cast::<libc::c_void>();
+        __clear_cache(start, end);
+    }
+}
+
+/// Drop trampoline bookkeeping (owned pages are munmap'd with the address space).
+pub fn clear_trampoline_cache() {
+    // Veneer hubs live only as `register_owned` mappings; nothing else to clear.
+}
+
+/// Patch one RX region: map shared dispatcher + per-site veneers near it.
+///
+/// Returns the number of sites rewritten (`b veneer` or fallback `brk`).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn patch_region_with_veneers(
+    region: &mut MappedRegion,
+    guest_base: u64,
+    sites: &[usize],
+) -> usize {
+    let n_sites = sites.len();
+    let Some(hub) = install_veneer_hub(guest_base, region.host_len(), n_sites) else {
+        return patch_sites_brk(region, sites);
+    };
+
+    let mut patched = 0_usize;
+    // SAFETY: hub mapping is RW until we mprotect RX below; length is hub.map_len.
+    let slice = unsafe { std::slice::from_raw_parts_mut(hub.ptr, hub.map_len) };
+
+    for (i, &off) in sites.iter().enumerate() {
+        let site_va = guest_base.saturating_add(u64::try_from(off).unwrap_or(0));
+        let site_ret = site_va.saturating_add(4);
+        let veneer_off = hub.veneer0.saturating_add(i.saturating_mul(VENEER_BYTES));
+        let veneer_va = hub.base_va.saturating_add(u64::try_from(veneer_off).unwrap_or(0));
+        let end = off.saturating_add(4);
+
+        let ok = write_veneer(slice, veneer_off, veneer_va, hub.shared_va, site_ret)
+            .and_then(|()| b_encoding(site_va, veneer_va))
+            .and_then(|enc| {
+                let bytes = region.host_bytes_mut();
+                let slot = bytes.get_mut(off..end)?;
+                slot.copy_from_slice(&enc.to_le_bytes());
+                Some(())
+            })
+            .is_some();
+
+        if !ok {
+            let bytes = region.host_bytes_mut();
+            let brk = brk_encoding(BRK_TRAP_IMM).to_le_bytes();
+            if let Some(slot) = bytes.get_mut(off..end) {
+                slot.copy_from_slice(&brk);
+            }
+        }
+        patched = patched.saturating_add(1);
+    }
+
+    // W^X on hub + I-cache; register owned RX.
+    let prot_rx = libc::PROT_READ | libc::PROT_EXEC;
+    if !crate::host::mprotect(hub.ptr, hub.map_len, prot_rx) {
+        let _ = crate::host::munmap(hub.ptr, hub.map_len);
+        return patch_sites_brk(region, sites);
+    }
+    clear_icache(hub.ptr, hub.map_len);
+    crate::mem::register_owned(
+        hub.base_va,
+        hub.ptr,
+        hub.map_len,
+        VM_PROT_READ | VM_PROT_EXECUTE,
+    );
+
+    let restore = (region.prot | VM_PROT_READ | VM_PROT_EXECUTE) & !VM_PROT_WRITE;
+    drop(mprotect_darwin(region, restore));
+    region.prot = restore;
+    let host = region.host_addr();
+    let len = region.host_len();
+    if let (Ok(base), true) = (usize::try_from(host), len > 0) {
+        let p = std::ptr::with_exposed_provenance_mut::<u8>(base);
+        clear_icache(p, len);
+    }
+    patched
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn patch_sites_brk(region: &mut MappedRegion, sites: &[usize]) -> usize {
+    let mut patched = 0_usize;
+    let bytes = region.host_bytes_mut();
+    for &off in sites {
+        let end = off.saturating_add(4);
+        let brk = brk_encoding(BRK_TRAP_IMM).to_le_bytes();
+        if let Some(slot) = bytes.get_mut(off..end) {
+            slot.copy_from_slice(&brk);
+            patched = patched.saturating_add(1);
+        }
+    }
+    let restore = (region.prot | VM_PROT_READ | VM_PROT_EXECUTE) & !VM_PROT_WRITE;
+    drop(mprotect_darwin(region, restore));
+    region.prot = restore;
+    patched
+}
+
+/// Shared dispatcher + veneer pool mapping.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+struct VeneerHub {
+    ptr: *mut u8,
+    map_len: usize,
+    base_va: u64,
+    shared_va: u64,
+    veneer0: usize,
+}
+
+/// Map RW hub near the RX region (enough room for `n_sites` veneers).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn install_veneer_hub(region_guest: u64, region_len: usize, n_sites: usize) -> Option<VeneerHub> {
+    let region_end = region_guest.saturating_add(u64::try_from(region_len).unwrap_or(0));
+    let site_lo = region_guest;
+    let site_hi = region_end.saturating_sub(4).max(region_guest);
+
+    let page = crate::host::page_size().unwrap_or(4096);
+    let page_u = u64::try_from(page).unwrap_or(4096);
+    let code = trampoline_template();
+    let veneer0 = code.len().saturating_add(15) & !15_usize;
+    let need = veneer0.saturating_add(n_sites.saturating_mul(VENEER_BYTES));
+    let map_len = align_up_to_page(need, page).max(page);
+
+    let flags_fixed = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | crate::host::fixed_map_flag();
+    let flags_free = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
+
+    let after0 = region_end.saturating_add(page_u.saturating_sub(1)) & !(page_u.saturating_sub(1));
+    let before0 = region_guest.saturating_sub(page_u) & !(page_u.saturating_sub(1));
+
+    for i in 0..VENEER_PROBE_RADIUS {
+        let mut candidates = [after0.saturating_add(i.saturating_mul(page_u)), 0_u64];
+        if before0 >= i.saturating_mul(page_u) {
+            candidates[1] = before0.saturating_sub(i.saturating_mul(page_u));
+        }
+        for &prefer in &candidates {
+            if prefer == 0 {
+                continue;
+            }
+            // Sites must `b` to veneers in this hub; veneers `bl` shared at base.
+            if b_encoding(site_lo, prefer).is_none() || b_encoding(site_hi, prefer).is_none() {
+                continue;
+            }
+            if let Some(ptr) =
+                crate::host::mmap(Some(prefer), map_len, prot_rw, flags_fixed, -1, 0)
+            {
+                return init_hub_slice(ptr, map_len, code, veneer0);
+            }
+        }
+    }
+
+    let ptr = crate::host::mmap(None, map_len, prot_rw, flags_free, -1, 0)?;
+    let va = crate::host::ptr_addr_u64(ptr);
+    if b_encoding(site_lo, va).is_none() || b_encoding(site_hi, va).is_none() {
+        let _ = crate::host::munmap(ptr, map_len);
+        return None;
+    }
+    init_hub_slice(ptr, map_len, code, veneer0)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn init_hub_slice(ptr: *mut u8, map_len: usize, code: &[u8], veneer0: usize) -> Option<VeneerHub> {
+    // SAFETY: fresh RW mapping of `map_len`.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, map_len) };
+    if code.len() > slice.len() || veneer0 > slice.len() {
+        let _ = crate::host::munmap(ptr, map_len);
+        return None;
+    }
+    slice.fill(0);
+    slice.get_mut(..code.len())?.copy_from_slice(code);
+    let reloc_off = trampoline_reloc_offset();
+    if let Some(slot) = slice.get_mut(reloc_off..reloc_off.saturating_add(8)) {
+        slot.copy_from_slice(&trampoline_rust_entry_addr().to_le_bytes());
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return None;
+    }
+    let base_va = crate::host::ptr_addr_u64(ptr);
+    Some(VeneerHub {
+        ptr,
+        map_len,
+        base_va,
+        shared_va: base_va,
+        veneer0,
+    })
+}
+
+/// Emit one veneer: save LR → bl shared → restore LR → b resume.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn write_veneer(
+    slice: &mut [u8],
+    veneer_off: usize,
+    veneer_va: u64,
+    shared_va: u64,
+    site_ret: u64,
+) -> Option<()> {
+    // str x30, [sp, #-16]!
+    let str_lr: u32 = 0xf81f_0ffe;
+    // ldr x30, [sp], #16
+    let ldr_lr: u32 = 0xf841_07fe;
+    let bl = bl_encoding(veneer_va.saturating_add(4), shared_va)?;
+    let b_back = b_encoding(veneer_va.saturating_add(12), site_ret)?;
+    let words = [str_lr, bl, ldr_lr, b_back];
+    let end = veneer_off.saturating_add(VENEER_BYTES);
+    let slot = slice.get_mut(veneer_off..end)?;
+    for (i, w) in words.iter().enumerate() {
+        let o = i.saturating_mul(4);
+        slot.get_mut(o..o.saturating_add(4))?.copy_from_slice(&w.to_le_bytes());
+    }
+    Some(())
+}
+
+/// Verified aarch64 trampoline (no host-relative BL).
+///
+/// Layout: code bytes + 8-byte absolute pointer (`kh_trampoline_dispatch`).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn trampoline_template() -> &'static [u8] {
+    TRAMP_BYTES
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn trampoline_reloc_offset() -> usize {
+    TRAMP_RELOC_OFF
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[allow(clippy::as_conversions, function_casts_as_integer)]
+fn trampoline_rust_entry_addr() -> u64 {
+    u64::try_from(kh_trampoline_dispatch as usize).unwrap_or(0)
+}
+
+/// Return value of the trampoline dispatch (x0=retval, x1=error flag).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[repr(C)]
+pub struct TrampRet {
+    /// Value for guest `x0`.
+    pub retval: u64,
+    /// Non-zero → set Darwin carry (error path).
+    pub error: u64,
+}
+
+/// Called from the guest-mapped trampoline (AAPCS64).
+///
+/// # Safety
+///
+/// Caller must preserve guest SIMD/GPRs around the call (veneer trampoline or
+/// freestanding NEON shim). Arguments are Darwin BSD syscall registers;
+/// `x16` holds the syscall number (or AAPCS 8th arg after the hypercall
+/// prologue). May `pthread_exit` the current host thread on
+/// `bsdthread_terminate`, or `_exit` the process on guest `exit`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kh_trampoline_dispatch(
+    x0: u64,
+    x1: u64,
+    x2: u64,
+    x3: u64,
+    x4: u64,
+    x5: u64,
+    x6: u64,
+    x16: u64,
+) -> TrampRet {
+    let sys_no = u32::try_from(x16 & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+    let result = syscall::dispatch(SyscallArgs {
+        pc: 0,
+        number: sys_no,
+        x0,
+        x1,
+        x2,
+        x3,
+        x4,
+        x5,
+        x6,
+    });
+    if MAX_EVENTS.load(Ordering::Relaxed) != 0 {
+        maybe_push_event(0, sys_no, result.name, x0, x1, x2, result.retval, result.error);
+    }
+    match result.outcome {
+        TrapOutcome::Exit { code } => finish_with_exit_code(code),
+        TrapOutcome::ThreadExit => {
+            // End this host worker only (same as bsdthread_terminate).
+            crate::thread::exit_current_guest_worker();
+        }
+        TrapOutcome::Continue => {}
+    }
+    TrampRet {
+        retval: result.retval.unwrap_or(0),
+        error: u64::from(result.error),
+    }
+}
+
+/// Process-global NEON-preserving entry for freestanding libSystem hypercalls.
+///
+/// Freestanding `_kh_bsd_hypercall` used to point at [`kh_trampoline_dispatch`]
+/// directly. That path is plain AAPCS64 and **clobbers Q0–Q31**, while Darwin
+/// `svc` preserves full SIMD — 7zz MT (`-mmt>1`) NEON workers then SEGV.
+/// Wire the slot to this shim instead (same machine code as the svc veneer hub).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub fn hypercall_entry_addr() -> u64 {
+    ensure_hypercall_shim()
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[must_use]
+pub fn hypercall_entry_addr() -> u64 {
+    0
+}
+
+/// Once-mapped RX page: `mov x16, x7` + [`TRAMP_BYTES`] (number arrives in x7
+/// per AAPCS as the 8th arg; the tramp body expects Darwin `x16`).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn ensure_hypercall_shim() -> u64 {
+    static SHIM_VA: AtomicU64 = AtomicU64::new(0);
+    static SHIM_LOCK: Mutex<()> = Mutex::new(());
+
+    let existing = SHIM_VA.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    let _guard = SHIM_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let existing = SHIM_VA.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
+
+    let code = trampoline_template();
+    let total = HYPERCALL_SHIM_PROLOGUE
+        .len()
+        .saturating_add(code.len());
+    let page = crate::host::page_size().unwrap_or(4096);
+    let map_len = align_up_to_page(total, page).max(page);
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
+    let Some(ptr) = crate::host::mmap(None, map_len, prot_rw, flags, -1, 0) else {
+        tracing::error!("hypercall shim mmap failed");
+        return 0;
+    };
+    // SAFETY: fresh RW mapping of `map_len`.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, map_len) };
+    slice.fill(0);
+    if let Some(dst) = slice.get_mut(..HYPERCALL_SHIM_PROLOGUE.len()) {
+        dst.copy_from_slice(&HYPERCALL_SHIM_PROLOGUE);
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return 0;
+    }
+    let body_off = HYPERCALL_SHIM_PROLOGUE.len();
+    if let Some(dst) = slice.get_mut(body_off..body_off.saturating_add(code.len())) {
+        dst.copy_from_slice(code);
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return 0;
+    }
+    let reloc_off = body_off.saturating_add(trampoline_reloc_offset());
+    if let Some(slot) = slice.get_mut(reloc_off..reloc_off.saturating_add(8)) {
+        slot.copy_from_slice(&trampoline_rust_entry_addr().to_le_bytes());
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return 0;
+    }
+    let prot_rx = libc::PROT_READ | libc::PROT_EXEC;
+    if !crate::host::mprotect(ptr, map_len, prot_rx) {
+        tracing::error!("hypercall shim mprotect RX failed");
+        let _ = crate::host::munmap(ptr, map_len);
+        return 0;
+    }
+    clear_icache(ptr, map_len);
+    let va = crate::host::ptr_addr_u64(ptr);
+    SHIM_VA.store(va, Ordering::Release);
+    tracing::info!(va = format_args!("{va:#x}"), "mapped NEON-preserving hypercall shim");
+    va
+}
+// ── trampoline machine code (verified via rustc/objdump aarch64) ─────────────
+
+/// Offset of the 8-byte absolute `kh_trampoline_dispatch` pointer.
+///
+/// Layout (see `TRAMP_BYTES`): `bti c` + save GPRs/NEON/FPCR + `blr` dispatch
+/// + restore + `ret` + `.quad` reloc @ 0x100.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const TRAMP_RELOC_OFF: usize = 0x100;
+
+/// Exact opcodes from assembled trampoline (`as` / objdump on Linux aarch64).
+///
+/// Saves **all Q0–Q31 + FPCR/FPSR** around the Rust call: Darwin `svc` preserves
+/// SIMD state; compression workers (7zz MT) rely on that. A bare GPR-only
+/// trampoline clobbered NEON and faulted under `-mmt>1`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[rustfmt::skip]
+const TRAMP_BYTES: &[u8] = &[
+    0x5f, 0x24, 0x03, 0xd5, 0xff, 0x03, 0x0a, 0xd1, 0xe8, 0x27, 0x00, 0xa9, 0xea, 0x2f, 0x01, 0xa9,
+    0xec, 0x37, 0x02, 0xa9, 0xee, 0x3f, 0x03, 0xa9, 0xf1, 0x4b, 0x04, 0xa9, 0xfe, 0x2b, 0x00, 0xf9,
+    0x08, 0x44, 0x3b, 0xd5, 0x29, 0x44, 0x3b, 0xd5, 0xe8, 0x27, 0x06, 0xa9, 0xe0, 0x87, 0x03, 0xad,
+    0xe2, 0x8f, 0x04, 0xad, 0xe4, 0x97, 0x05, 0xad, 0xe6, 0x9f, 0x06, 0xad, 0xe8, 0xa7, 0x07, 0xad,
+    0xea, 0xaf, 0x08, 0xad, 0xec, 0xb7, 0x09, 0xad, 0xee, 0xbf, 0x0a, 0xad, 0xf0, 0xc7, 0x0b, 0xad,
+    0xf2, 0xcf, 0x0c, 0xad, 0xf4, 0xd7, 0x0d, 0xad, 0xf6, 0xdf, 0x0e, 0xad, 0xf8, 0xe7, 0x0f, 0xad,
+    0xfa, 0xef, 0x10, 0xad, 0xfc, 0xf7, 0x11, 0xad, 0xfe, 0xff, 0x12, 0xad, 0xe7, 0x03, 0x10, 0xaa,
+    0x88, 0x04, 0x00, 0x58, 0x00, 0x01, 0x3f, 0xd6, 0x02, 0x42, 0x3b, 0xd5, 0x23, 0x00, 0x80, 0x52,
+    0x63, 0x88, 0x63, 0xd3, 0x42, 0x00, 0x23, 0x8a, 0x41, 0x00, 0x00, 0xb4, 0x42, 0x00, 0x03, 0xaa,
+    0x02, 0x42, 0x1b, 0xd5, 0xe8, 0x27, 0x46, 0xa9, 0x08, 0x44, 0x1b, 0xd5, 0x29, 0x44, 0x1b, 0xd5,
+    0xe0, 0x87, 0x43, 0xad, 0xe2, 0x8f, 0x44, 0xad, 0xe4, 0x97, 0x45, 0xad, 0xe6, 0x9f, 0x46, 0xad,
+    0xe8, 0xa7, 0x47, 0xad, 0xea, 0xaf, 0x48, 0xad, 0xec, 0xb7, 0x49, 0xad, 0xee, 0xbf, 0x4a, 0xad,
+    0xf0, 0xc7, 0x4b, 0xad, 0xf2, 0xcf, 0x4c, 0xad, 0xf4, 0xd7, 0x4d, 0xad, 0xf6, 0xdf, 0x4e, 0xad,
+    0xf8, 0xe7, 0x4f, 0xad, 0xfa, 0xef, 0x50, 0xad, 0xfc, 0xf7, 0x51, 0xad, 0xfe, 0xff, 0x52, 0xad,
+    0xfe, 0x2b, 0x40, 0xf9, 0xf1, 0x4b, 0x44, 0xa9, 0xee, 0x3f, 0x43, 0xa9, 0xec, 0x37, 0x42, 0xa9,
+    0xea, 0x2f, 0x41, 0xa9, 0xe8, 0x27, 0x40, 0xa9, 0xff, 0x03, 0x0a, 0x91, 0xc0, 0x03, 0x5f, 0xd6,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reloc .quad @ 0x100
+];
 /// Installs the `SIGTRAP` handler used by the micro execution backend.
 pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
     MAX_EVENTS.store(
@@ -376,6 +950,7 @@ unsafe extern "C" fn trap_sigaction(
     let uctx = unsafe { &mut *ctx.cast::<libc::ucontext_t>() };
     let m = &mut uctx.uc_mcontext;
     let pc = m.pc;
+    // Only pull the regs dispatch needs; avoid extra loads on the hot path.
     let x0 = m.regs[0];
     let x1 = m.regs[1];
     let x2 = m.regs[2];
@@ -385,7 +960,7 @@ unsafe extern "C" fn trap_sigaction(
     let x6 = m.regs[6];
     let x16 = m.regs[16];
 
-    let sys_no = u32::try_from(x16).unwrap_or(u32::MAX);
+    let sys_no = u32::try_from(x16 & 0xFFFF_FFFF).unwrap_or(u32::MAX);
     let result = syscall::dispatch(SyscallArgs {
         pc,
         number: sys_no,
@@ -398,16 +973,10 @@ unsafe extern "C" fn trap_sigaction(
         x6,
     });
 
-    push_event(TrapEvent {
-        pc,
-        syscall: Some(sys_no),
-        name: result.name.to_owned(),
-        arg0: x0,
-        arg1: x1,
-        arg2: x2,
-        retval: result.retval,
-        error: result.error,
-    });
+    // Zero-cost when max_events == 0 (plain `kh run`).
+    if MAX_EVENTS.load(Ordering::Relaxed) != 0 {
+        maybe_push_event(pc, sys_no, result.name, x0, x1, x2, result.retval, result.error);
+    }
 
     if let Some(ret) = result.retval {
         m.regs[0] = ret;
@@ -482,16 +1051,39 @@ fn dump_events_before_exit() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn push_event(event: TrapEvent) {
-    let max = MAX_EVENTS.load(Ordering::SeqCst);
-    let n = EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+#[allow(clippy::too_many_arguments)]
+fn maybe_push_event(
+    pc: u64,
+    sys_no: u32,
+    name: &'static str,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    retval: Option<u64>,
+    error: bool,
+) {
+    let max = MAX_EVENTS.load(Ordering::Relaxed);
+    // `kh run` sets max_events=0: single load, no String/Mutex.
+    if max == 0 {
+        return;
+    }
+    let n = EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if n >= max {
         return;
     }
     if let Ok(mut guard) = EVENTS.lock()
         && u64::try_from(guard.len()).unwrap_or(u64::MAX) < max
     {
-        guard.push(event);
+        guard.push(TrapEvent {
+            pc,
+            syscall: Some(sys_no),
+            name: name.to_owned(),
+            arg0,
+            arg1,
+            arg2,
+            retval,
+            error,
+        });
     }
 }
 

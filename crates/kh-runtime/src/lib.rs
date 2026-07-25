@@ -39,6 +39,8 @@ pub use syscall::{
 };
 pub use trap::{
     PSTATE_C, TrapConfig, TrapError, TrapEvent, TrapOutcome, clear_expect_code,
-    clear_trace_on_exit, finish_with_exit_code, install_trap_handlers, patch_svc_to_brk,
-    set_expect_code, set_trace_on_exit, take_trace_events,
+    clear_trace_on_exit, clear_trampoline_cache, finish_with_exit_code, hypercall_entry_addr,
+    install_trap_handlers, patch_svc_to_brk, set_expect_code, set_trace_on_exit, take_trace_events,
 };
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use trap::kh_trampoline_dispatch;

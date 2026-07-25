@@ -10,11 +10,51 @@
 //! wrappers). Unit tests can exercise a local [`AddressSpace`] without touching
 //! the active slot, or use the wrappers under [`test_lock`].
 
-use std::sync::Mutex;
+use std::cell::Cell;
+use std::sync::RwLock;
 
 use crate::host;
 
 use super::map::{MappedRegion, VM_PROT_READ, VM_PROT_WRITE};
+
+/// Per-thread last hit for [`check_range`] (archive I/O is highly sequential).
+#[derive(Clone, Copy)]
+struct RangeCache {
+    guest_addr: u64,
+    len: usize,
+    prot: u32,
+}
+
+impl RangeCache {
+    fn contains(self, addr: u64, len: usize) -> bool {
+        if len == 0 {
+            return addr >= self.guest_addr
+                && addr
+                    <= self
+                        .guest_addr
+                        .saturating_add(u64::try_from(self.len).unwrap_or(u64::MAX));
+        }
+        let Some(end) = addr.checked_add(u64::try_from(len).unwrap_or(u64::MAX)) else {
+            return false;
+        };
+        let reg_end = self
+            .guest_addr
+            .saturating_add(u64::try_from(self.len).unwrap_or(u64::MAX));
+        addr >= self.guest_addr && end <= reg_end
+    }
+
+    fn allows(self, need_write: bool) -> bool {
+        if need_write {
+            self.prot & VM_PROT_WRITE != 0
+        } else {
+            self.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0
+        }
+    }
+}
+
+thread_local! {
+    static LAST_RANGE: Cell<Option<RangeCache>> = const { Cell::new(None) };
+}
 
 /// One live guest mapping visible to the syscall layer.
 #[derive(Debug)]
@@ -65,6 +105,11 @@ impl RegRegion {
 pub struct AddressSpace {
     regions: Vec<RegRegion>,
 }
+
+// SAFETY: regions are only mutated under the active write lock; concurrent
+// readers only call pure range checks. Raw host pointers are not shared for
+// mutation across threads without that lock.
+unsafe impl Sync for AddressSpace {}
 
 impl AddressSpace {
     /// Empty address space (no tracked regions).
@@ -204,13 +249,16 @@ impl Drop for AddressSpace {
 }
 
 /// Active address space for the trap / syscall path (single guest process).
-static ACTIVE: Mutex<AddressSpace> = Mutex::new(AddressSpace::new());
+///
+/// `RwLock`: concurrent `check_range` on the I/O hot path must not serialize
+/// all guest threads behind a single exclusive mutex.
+static ACTIVE: RwLock<AddressSpace> = RwLock::new(AddressSpace::new());
 
 /// Installs `space` as the active trap-path address space.
 ///
 /// Returns the previous active space (caller may drop it to unmap owned regions).
 pub fn install_active(space: AddressSpace) -> AddressSpace {
-    match ACTIVE.lock() {
+    match ACTIVE.write() {
         Ok(mut guard) => std::mem::replace(&mut *guard, space),
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
@@ -227,7 +275,7 @@ pub fn take_active() -> AddressSpace {
 
 /// Runs `f` with exclusive access to the active address space.
 pub fn with_active_mut<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
-    match ACTIVE.lock() {
+    match ACTIVE.write() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => f(&mut poisoned.into_inner()),
     }
@@ -235,7 +283,7 @@ pub fn with_active_mut<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
 
 /// Runs `f` with shared access to the active address space.
 pub fn with_active<R>(f: impl FnOnce(&AddressSpace) -> R) -> R {
-    match ACTIVE.lock() {
+    match ACTIVE.read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => f(&poisoned.into_inner()),
     }
@@ -243,6 +291,7 @@ pub fn with_active<R>(f: impl FnOnce(&AddressSpace) -> R) -> R {
 
 /// Clears the active address space. Owned mappings are `munmap`'d.
 pub fn clear() {
+    LAST_RANGE.with(|c| c.set(None));
     with_active_mut(AddressSpace::clear);
 }
 
@@ -263,9 +312,49 @@ pub fn is_active() -> bool {
 }
 
 /// Validates a range against the active address space.
+///
+/// Hot path: thread-local last-hit cache (no `RwLock`) for sequential
+/// read/write into the same mapping.
 #[must_use]
 pub fn check_range(addr: u64, len: usize, need_write: bool) -> bool {
-    with_active(|space| space.check_range(addr, len, need_write))
+    if len == 0 {
+        return true;
+    }
+    if addr == 0 {
+        return false;
+    }
+    if LAST_RANGE.with(|c| {
+        c.get()
+            .is_some_and(|r| r.contains(addr, len) && r.allows(need_write))
+    }) {
+        return true;
+    }
+    with_active(|space| {
+        if space.regions.is_empty() {
+            return true;
+        }
+        for region in &space.regions {
+            if !region.contains_range(addr, len) {
+                continue;
+            }
+            let ok = if need_write {
+                region.prot & VM_PROT_WRITE != 0
+            } else {
+                region.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0
+            };
+            if ok {
+                LAST_RANGE.with(|c| {
+                    c.set(Some(RangeCache {
+                        guest_addr: region.guest_addr,
+                        len: region.len,
+                        prot: region.prot,
+                    }));
+                });
+            }
+            return ok;
+        }
+        false
+    })
 }
 
 /// Finds a covering region in the active address space.

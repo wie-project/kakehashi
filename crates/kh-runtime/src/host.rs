@@ -97,6 +97,14 @@ pub fn fcntl_set(fd: RawFd, cmd: libc::c_int, arg: libc::c_int) -> Option<i32> {
     if rc < 0 { None } else { Some(rc) }
 }
 
+/// `open(path, flags, mode)` — prefers libc over `std::fs::OpenOptions` so
+/// directories open with `O_RDONLY` (archive walks) and we avoid extra syscalls.
+pub fn open_path(path: &std::ffi::CStr, flags: libc::c_int, mode: libc::c_uint) -> Option<RawFd> {
+    // SAFETY: path is a valid C string for the duration of the call.
+    let rc = unsafe { libc::open(path.as_ptr(), flags, mode) };
+    if rc < 0 { None } else { Some(rc) }
+}
+
 /// `openat(dirfd, path, flags, mode)`.
 pub fn openat(
     dirfd: RawFd,
@@ -241,4 +249,81 @@ pub fn ptr_addr_u64(p: *mut u8) -> u64 {
 pub fn u64_as_void_ptr(addr: u64) -> *mut libc::c_void {
     let u = usize::try_from(addr).unwrap_or(0);
     ptr::with_exposed_provenance_mut::<u8>(u).cast()
+}
+
+// ── directory streams (for guest readdir) ───────────────────────────────────
+
+/// Opaque host directory stream (`DIR*`).
+#[derive(Debug)]
+pub struct HostDir {
+    ptr: *mut libc::DIR,
+}
+
+// SAFETY: process-wide guest model serializes dir mutation under ProcessState
+// write lock; readers never touch `HostDir`.
+unsafe impl Send for HostDir {}
+// SAFETY: same as `Send` — exclusive dir use under write lock only.
+unsafe impl Sync for HostDir {}
+
+impl HostDir {
+    /// Open a directory stream on a **duplicate** of `host_fd` (does not own `host_fd`).
+    pub fn open_dup(host_fd: RawFd) -> Result<Self, i32> {
+        // SAFETY: dup of a live host FD.
+        let dup = unsafe { libc::dup(host_fd) };
+        if dup < 0 {
+            return Err(last_errno_i32());
+        }
+        // SAFETY: fdopendir takes ownership of `dup`.
+        let dir = unsafe { libc::fdopendir(dup) };
+        if dir.is_null() {
+            let err = last_errno_i32();
+            // SAFETY: close the unused dup on failure.
+            unsafe {
+                libc::close(dup);
+            }
+            return Err(err);
+        }
+        Ok(Self { ptr: dir })
+    }
+
+    /// Next entry: `(name_bytes, d_type)`. `None` at end of stream.
+    pub fn read_next(&mut self) -> Option<(Vec<u8>, u8)> {
+        use std::ffi::CStr;
+        loop {
+            // SAFETY: `ptr` from fdopendir; readdir is the iterator.
+            let ent = unsafe { libc::readdir(self.ptr) };
+            if ent.is_null() {
+                return None;
+            }
+            // SAFETY: ent valid until next readdir/closedir.
+            let d_type = unsafe { (*ent).d_type };
+            let name_ptr = unsafe { (*ent).d_name.as_ptr() };
+            let name = unsafe { CStr::from_ptr(name_ptr) };
+            let bytes = name.to_bytes().to_vec();
+            if bytes.is_empty() {
+                continue;
+            }
+            return Some((bytes, d_type));
+        }
+    }
+}
+
+impl Drop for HostDir {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: owns DIR* from fdopendir.
+            unsafe {
+                let _ = libc::closedir(self.ptr);
+            }
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+fn last_errno_i32() -> i32 {
+    let raw = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(1)
+        .unsigned_abs();
+    i32::try_from(raw).unwrap_or(1)
 }

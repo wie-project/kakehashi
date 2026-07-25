@@ -10,6 +10,7 @@ use crate::sys::{
     SYS_RMDIR, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
+use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
 
 const ENOSYS: i32 = 78;
 const ENOMEM: i32 = 12;
@@ -62,7 +63,6 @@ fn trunc_i64_to_c_int(v: i64) -> c_int {
 /// C `open` → nlist `_open`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int {
-    trace::note(b"[kh-libsystem] open()\n");
     if path.is_null() {
         errno::set_errno(14);
         return -1;
@@ -365,20 +365,25 @@ pub(crate) unsafe extern "C" fn utimensat(
 
 // ── dirent ──────────────────────────────────────────────────────────────────
 //
-// Minimal directory stream: open the path as a directory FD. `readdir` is still
-// empty (no getdirentries yet) so recursive tree walks see zero children, but
-// single-file archive paths never need readdir — and we no longer hard-fail
-// `opendir` with ENOSYS (which some guests treat as fatal).
+// `opendir` opens the path as a directory FD. `readdir` fills a Darwin-shaped
+// `struct dirent` via host helper `KH_HELPER_READDIR` (Linux `fdopendir`/`readdir`
+// under the bottle). Required for recursive archive of real directory trees.
 
 const DIR_MAGIC: u32 = 0x4B48_4449; // "KHDI"
+const DIRENT_NAME_OFF: usize = 21;
+const DIRENT_SIZE: usize = 1048;
 
+/// Darwin `struct dirent` layout (arm64) packed into `ent`.
 #[repr(C)]
 struct DirStub {
     magic: u32,
     fd: c_int,
-    exhausted: c_int,
-    /// Darwin `struct dirent` is large; we only need a stable address for soft readdir.
-    ent: [u8; 1048],
+    reserved: u32,
+    /// Full Darwin dirent buffer returned to the guest.
+    ent: [u8; DIRENT_SIZE],
+    /// Scratch for host helper name out.
+    name_scratch: [u8; 256],
+    d_type_scratch: u8,
 }
 
 /// C `opendir` → nlist `_opendir`.
@@ -403,8 +408,13 @@ pub(crate) unsafe extern "C" fn opendir(name: *const c_char) -> *mut c_void {
     unsafe {
         (*d).magic = DIR_MAGIC;
         (*d).fd = fd;
-        (*d).exhausted = 0;
+        (*d).reserved = 0;
         crate::stdio::bzero((*d).ent.as_mut_ptr().cast(), (*d).ent.len());
+        crate::stdio::bzero(
+            (*d).name_scratch.as_mut_ptr().cast(),
+            (*d).name_scratch.len(),
+        );
+        (*d).d_type_scratch = 0;
     }
     raw
 }
@@ -431,9 +441,6 @@ pub(crate) unsafe extern "C" fn closedir(dirp: *mut c_void) -> c_int {
 }
 
 /// C `readdir` → nlist `_readdir`.
-///
-/// Soft empty directory: always returns NULL (end of stream). Enough for
-/// guests that only open dirs defensively; real listing needs getdirentries.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn readdir(dirp: *mut c_void) -> *mut c_void {
     if dirp.is_null() {
@@ -445,8 +452,58 @@ pub(crate) unsafe extern "C" fn readdir(dirp: *mut c_void) -> *mut c_void {
         errno::set_errno(9);
         return core::ptr::null_mut();
     }
-    // End of directory (empty listing).
-    core::ptr::null_mut()
+
+    let fd = unsafe { (*d).fd };
+    let name_ptr = unsafe { (*d).name_scratch.as_mut_ptr() };
+    let dtype_ptr = unsafe { core::ptr::addr_of_mut!((*d).d_type_scratch) };
+
+    // KH_HELPER_READDIR(fd, name_buf, &d_type) → 1 entry / 0 EOF / -errno
+    let ret = unsafe {
+        sys::helper3(
+            KH_HELPER_READDIR,
+            u64::from(fd.cast_unsigned()),
+            ptr_u64(name_ptr.cast()),
+            ptr_u64(dtype_ptr.cast()),
+        )
+    };
+    if ret < 0 {
+        errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
+        return core::ptr::null_mut();
+    }
+    if ret == 0 {
+        return core::ptr::null_mut();
+    }
+
+    // Pack Darwin dirent into `ent`.
+    unsafe {
+        let ent = (*d).ent.as_mut_ptr();
+        crate::stdio::bzero(ent.cast(), DIRENT_SIZE);
+        // d_ino = 1 (non-zero), d_seekoff = 0
+        let ino: u64 = 1;
+        core::ptr::copy_nonoverlapping(ino.to_ne_bytes().as_ptr(), ent, 8);
+        // d_reclen at +16
+        let reclen: u16 = u16::try_from(DIRENT_SIZE).unwrap_or(u16::MAX);
+        core::ptr::copy_nonoverlapping(reclen.to_ne_bytes().as_ptr(), ent.add(16), 2);
+        // name length
+        let mut namelen = 0_usize;
+        while namelen < 255 {
+            match (*d).name_scratch.get(namelen) {
+                Some(&0) | None => break,
+                Some(_) => namelen = namelen.saturating_add(1),
+            }
+        }
+        let namelen_u: u16 = u16::try_from(namelen).unwrap_or(0);
+        core::ptr::copy_nonoverlapping(namelen_u.to_ne_bytes().as_ptr(), ent.add(18), 2);
+        // d_type at +20
+        ent.add(20).write((*d).d_type_scratch);
+        // d_name at +21
+        core::ptr::copy_nonoverlapping(
+            (*d).name_scratch.as_ptr(),
+            ent.add(DIRENT_NAME_OFF),
+            namelen.saturating_add(1).min(1024),
+        );
+        ent.cast::<c_void>()
+    }
 }
 
 /// C `dirfd` → nlist `_dirfd`.
@@ -533,12 +590,20 @@ pub(crate) unsafe extern "C" fn sysconf(name: c_int) -> i64 {
         1 => 256 * 1024, // _SC_ARG_MAX
         2 => 256,        // _SC_CHILD_MAX
         3 => 100,        // _SC_CLK_TCK
-        5 => 1024,       // _SC_OPEN_MAX (must exceed guest FD numbers)
-        6 => 1,          // _SC_JOB_CONTROL
-        7 => 1,          // _SC_SAVED_IDS
-        8 => 200_809,    // _SC_VERSION
-        29 => 16_384,    // _SC_PAGE_SIZE (Darwin arm64 default guest page)
-        58 | 84 => 1,    // _SC_NPROCESSORS_ONLN / CONF (soft single-core)
+        5 => 1024,            // _SC_OPEN_MAX (must exceed guest FD numbers)
+        6 | 7 => 1,           // _SC_JOB_CONTROL / _SC_SAVED_IDS
+        8 => 200_809,         // _SC_VERSION
+        29 => 16_384,         // _SC_PAGE_SIZE (Darwin arm64 default guest page)
+        // Darwin: `_SC_NPROCESSORS_CONF=57`, `_SC_NPROCESSORS_ONLN=58`.
+        // (84 is a non-Darwin alias some guests probe.)
+        57 | 58 | 84 => {
+            let n = unsafe { sys::helper0(KH_HELPER_NCPU) };
+            if n > 0 {
+                i64::try_from(n).unwrap_or(1)
+            } else {
+                1
+            }
+        }
         _ => {
             errno::set_errno(EINVAL);
             -1

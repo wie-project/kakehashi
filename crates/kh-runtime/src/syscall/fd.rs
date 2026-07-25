@@ -1,8 +1,7 @@
 //! Guest file-descriptor table accessors and FD-related BSD syscalls.
 
-use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::RawFd;
 
 use crate::bottle::{self, translate_path};
 use crate::host;
@@ -46,7 +45,8 @@ pub(crate) fn guest_to_host_fd(x0: u64) -> Option<RawFd> {
 }
 
 fn guest_to_host_fd_i32(gfd: i32) -> Option<RawFd> {
-    process::with_ref(|p| p.fds().get(gfd))
+    // Lock-free atomic map — do not take ProcessState on every read/write.
+    process::fd_get(gfd)
 }
 
 /// Allocates a new guest FD bound to `host_fd`.
@@ -107,13 +107,16 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     let Ok(host_path) = translate_path(path) else {
         return SyscallResult::err(name, ENOENT);
     };
-    let of = darwin_open_flags(flags);
-    let mut opts = OpenOptions::new();
-    apply_open_flags(&mut opts, of);
-    let Ok(file) = opts.open(&host_path) else {
+    let host_flags = darwin_to_host_open_flags(flags);
+    let mode = 0o666_u32;
+    let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    // libc open: works for directories (opendir path) and files alike.
+    let Some(rc) = host::open_path(&c_path, host_flags, mode) else {
         return SyscallResult::err(name, ENOENT);
     };
-    finish_open(name, file.into_raw_fd())
+    finish_open(name, rc)
 }
 
 fn finish_open(name: &'static str, host_fd: RawFd) -> SyscallResult {
@@ -132,6 +135,8 @@ pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
     if gfd == 0 || gfd == 1 || gfd == 2 {
         return SyscallResult::ok(name, 0);
     }
+    // Drop readdir stream before releasing the host FD.
+    process::with_mut(|p| p.close_dir_stream(gfd));
     match take_guest_fd(gfd) {
         Some(hfd) => {
             host::close_fd(hfd);
@@ -331,30 +336,6 @@ fn darwin_open_flags(raw: u64) -> OpenFlags {
         bits |= OpenFlags::EXCLUSIVE;
     }
     OpenFlags(bits)
-}
-
-fn apply_open_flags(opts: &mut OpenOptions, flags: OpenFlags) {
-    if flags.has(OpenFlags::READ) {
-        opts.read(true);
-    }
-    if flags.has(OpenFlags::WRITE) {
-        opts.write(true);
-    }
-    if !flags.has(OpenFlags::READ) && !flags.has(OpenFlags::WRITE) {
-        opts.read(true);
-    }
-    if flags.has(OpenFlags::CREATE) {
-        opts.create(true);
-    }
-    if flags.has(OpenFlags::TRUNCATE) {
-        opts.truncate(true);
-    }
-    if flags.has(OpenFlags::APPEND) {
-        opts.append(true);
-    }
-    if flags.has(OpenFlags::CREATE) && flags.has(OpenFlags::EXCLUSIVE) {
-        opts.create_new(true);
-    }
 }
 
 fn darwin_to_host_open_flags(raw: u64) -> libc::c_int {

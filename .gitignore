@@ -32,8 +32,7 @@ core
 core.[0-9]*
 *.core
 
-# Staged guest dylib / release layout (scripts/stage-libsystem.sh)
-/dist/
-
 # Local guest/docker scratch dirs
+.tmp/
 .tmp-*/
+/tmp/kh-bench/

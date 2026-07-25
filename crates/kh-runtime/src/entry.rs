@@ -22,7 +22,7 @@ pub enum EntryError {
 /// Transfers control to `entry` with stack pointer `sp`.
 ///
 /// Does not return on success: guest code must trap into the trap backend
-/// (e.g. Darwin `exit` rewritten as `brk`) which terminates the process.
+/// (e.g. Darwin `svc` rewritten as `brk`) which terminates the process.
 ///
 /// # Safety
 ///
@@ -151,14 +151,20 @@ pub unsafe fn call_guest_args(
     #[cfg(target_arch = "aarch64")]
     {
         let mut ret: u64;
-        // Host SP lives in a callee-saved reg chosen by LLVM (`inout`), which
-        // AAPCS64 guests must preserve across `blr`/`ret`.
+        // Host SP must survive the guest call. `clobber_abi("C")` tells LLVM
+        // that `blr` is a full C call, so live values (including host SP) are
+        // kept only in callee-saved regs — never in x18. That matters because
+        // freestanding hypercalls run host Rust under **Linux** AAPCS64 (x18
+        // is scratch) while Darwin guests treat x18 as reserved; parking host
+        // SP in x18 then produced `SIGBUS BUS_ADRALN` at `si_addr=0x1` after
+        // guest `main` returned under `KAKEHASHI_HYPERCALL`.
         let mut host_sp: u64 = 0;
-        // SAFETY: caller invariants above. Volatile regs are listed as outs so
-        // Rust does not assume they survive the guest call.
+        // SAFETY: caller invariants above. `clobber_abi("C")` clobbers x0–x18 /
+        // x30; host SP and ret live in explicit callee-saved regs. x19 is
+        // reserved by LLVM on aarch64 and cannot be an asm operand.
         unsafe {
             std::arch::asm!(
-                "mov {host_sp}, sp",
+                "mov x20, sp",
                 "mov sp, {guest_sp}",
                 "mov x0, {arg0}",
                 "mov x1, {arg1}",
@@ -169,33 +175,17 @@ pub unsafe fn call_guest_args(
                 "mov x6, xzr",
                 "mov x7, xzr",
                 "blr {entry}",
-                "mov sp, {host_sp}",
-                host_sp = inout(reg) host_sp,
+                "mov x21, x0",
+                "mov sp, x20",
                 guest_sp = in(reg) sp,
                 arg0 = in(reg) x0,
                 arg1 = in(reg) x1,
                 arg2 = in(reg) x2,
                 arg3 = in(reg) x3,
                 entry = in(reg) entry,
-                lateout("x0") ret,
-                out("x1") _,
-                out("x2") _,
-                out("x3") _,
-                out("x4") _,
-                out("x5") _,
-                out("x6") _,
-                out("x7") _,
-                out("x8") _,
-                out("x9") _,
-                out("x10") _,
-                out("x11") _,
-                out("x12") _,
-                out("x13") _,
-                out("x14") _,
-                out("x15") _,
-                out("x16") _,
-                out("x17") _,
-                out("x30") _,
+                inout("x20") host_sp,
+                lateout("x21") ret,
+                clobber_abi("C"),
             );
         }
         let _ = host_sp;

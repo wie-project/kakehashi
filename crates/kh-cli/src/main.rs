@@ -231,7 +231,9 @@ fn run() -> Result<()> {
         } => commands::run::run(&commands::run::RunArgs {
             path: &path,
             root: root.as_deref(),
-            max_syscalls: max_syscalls.unwrap_or(65_536),
+            // Large trees (tens of thousands of files) need multi-million traps;
+            // 65k was only enough for micro fixtures / single-file 7zz.
+            max_syscalls: max_syscalls.unwrap_or(50_000_000),
             expect_code,
             guest_page_size,
             dry_load,

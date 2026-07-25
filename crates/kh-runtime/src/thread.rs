@@ -195,6 +195,16 @@ mod linux {
         });
     }
 
+    /// Hypercall / trap path: end this host worker (LIVE_WORKERS + pthread_exit).
+    pub(crate) fn exit_worker_now() -> ! {
+        clear_host_exit_frame();
+        worker_finished();
+        // SAFETY: intentional end of this host thread only (not the process).
+        unsafe {
+            libc::pthread_exit(std::ptr::null_mut());
+        }
+    }
+
     fn set_host_exit_frame(pc: u64, sp: u64) {
         HOST_EXIT.set(Some(HostExitFrame { pc, sp }));
     }
@@ -225,10 +235,26 @@ use linux::linux_spawn;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub(crate) use linux::redirect_ucontext_to_host_exit;
 
+/// End the current guest worker from hypercall/trap (not signal ucontext).
+///
+/// Decrements live-worker count then `pthread_exit`s this host thread only.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub(crate) fn exit_current_guest_worker() -> ! {
+    linux::exit_worker_now();
+}
+
 #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
-#[allow(dead_code)]
+#[allow(dead_code)] // live only via Linux aarch64 trap/hypercall path
 pub(crate) fn redirect_ucontext_to_host_exit() -> bool {
     false
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[allow(dead_code)] // live only via Linux aarch64 trap/hypercall path
+pub(crate) fn exit_current_guest_worker() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(test)]

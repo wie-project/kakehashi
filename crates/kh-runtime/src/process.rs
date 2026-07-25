@@ -7,9 +7,28 @@
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use crate::host;
+
+/// Process-wide syscall counter (hot path: no process-state lock).
+static SYSCALL_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Cap for [`SYSCALL_COUNT`]; updated by [`reset_run`].
+static MAX_SYSCALLS: AtomicU64 = AtomicU64::new(256);
+
+/// Max guest FD slots (stdio 0–2 + table). Keeps FDs under typical OPEN_MAX.
+const FD_SLOTS: usize = 1024;
+/// Empty slot in the lock-free FD map.
+const FD_EMPTY: i32 = -1;
+
+/// Guest → host FD map for **lookup** without the process `RwLock`.
+///
+/// Slots 0–2 are unused (stdio identity). Other slots: host fd ≥ 0, or [`FD_EMPTY`].
+/// Alloc/take update these atomics; dir streams still use the process lock.
+static FD_HOST: [AtomicI32; FD_SLOTS] = [const { AtomicI32::new(FD_EMPTY) }; FD_SLOTS];
+/// Hint for next free FD scan.
+static FD_NEXT: AtomicI32 = AtomicI32::new(3);
 
 /// Soft Darwin `sigaction` slot (handler + mask + flags).
 #[derive(Clone, Copy, Debug)]
@@ -49,68 +68,111 @@ impl SoftSigAct {
     }
 }
 
-/// Guest FD → host FD mapping (stdio 0/1/2 are identity).
-#[derive(Debug)]
-pub(crate) struct FdTable {
-    map: HashMap<i32, RawFd>,
-    next: i32,
-}
+/// Thin handle so `ProcessState` can still expose `fds_mut()` for alloc/take.
+#[derive(Debug, Default)]
+pub(crate) struct FdTable;
 
 impl FdTable {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            // Start at 3 (after stdio). Starting at 32 looked "safe" but 7zz
-            // reports OPEN_MAX:20 and rejects high descriptors → hang on archive.
-            next: 3,
-        }
+    const fn new() -> Self {
+        Self
     }
 
     pub(crate) fn reset(&mut self) {
-        for (gfd, hfd) in self.map.drain() {
-            if gfd > 2 {
-                host::close_fd(hfd);
-            }
-        }
-        self.next = 3;
-    }
-
-    #[must_use]
-    pub(crate) fn get(&self, gfd: i32) -> Option<RawFd> {
-        if gfd == 0 || gfd == 1 || gfd == 2 {
-            return Some(gfd);
-        }
-        self.map.get(&gfd).copied()
+        let _ = self;
+        reset_fd_map();
     }
 
     pub(crate) fn take(&mut self, gfd: i32) -> Option<RawFd> {
-        self.map.remove(&gfd)
+        let _ = self;
+        fd_take(gfd)
     }
 
     pub(crate) fn alloc(&mut self, host_fd: RawFd) -> Option<i32> {
-        // Prefer the lowest free slot ≥ 3 so guest FDs stay under typical
-        // OPEN_MAX / RLIMIT_NOFILE soft values reported by stubs.
-        for gfd in 3..1024 {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.map.entry(gfd) {
-                e.insert(host_fd);
-                self.next = gfd.saturating_add(1);
-                return Some(gfd);
-            }
-        }
-        None
+        let _ = self;
+        fd_alloc(host_fd)
     }
+}
+
+/// Resolve guest FD → host FD without taking the process lock (I/O hot path).
+#[must_use]
+#[inline]
+pub fn fd_get(gfd: i32) -> Option<RawFd> {
+    if gfd == 0 || gfd == 1 || gfd == 2 {
+        return Some(gfd);
+    }
+    if gfd < 0 {
+        return None;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return None;
+    };
+    let slot = FD_HOST.get(idx)?;
+    let v = slot.load(Ordering::Acquire);
+    if v < 0 { None } else { Some(v) }
+}
+
+fn fd_take(gfd: i32) -> Option<RawFd> {
+    if gfd <= 2 {
+        return None;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return None;
+    };
+    let slot = FD_HOST.get(idx)?;
+    let v = slot.swap(FD_EMPTY, Ordering::AcqRel);
+    if v < 0 { None } else { Some(v) }
+}
+
+fn fd_alloc(host_fd: RawFd) -> Option<i32> {
+    if host_fd < 0 {
+        return None;
+    }
+    let start = usize::try_from(FD_NEXT.load(Ordering::Relaxed).max(3)).unwrap_or(3);
+    for idx in start..FD_SLOTS {
+        if try_claim_slot(idx, host_fd) {
+            let gfd = i32::try_from(idx).ok()?;
+            FD_NEXT.store(gfd.saturating_add(1), Ordering::Relaxed);
+            return Some(gfd);
+        }
+    }
+    for idx in 3..start.min(FD_SLOTS) {
+        if try_claim_slot(idx, host_fd) {
+            let gfd = i32::try_from(idx).ok()?;
+            FD_NEXT.store(gfd.saturating_add(1), Ordering::Relaxed);
+            return Some(gfd);
+        }
+    }
+    None
+}
+
+fn try_claim_slot(idx: usize, host_fd: RawFd) -> bool {
+    let Some(slot) = FD_HOST.get(idx) else {
+        return false;
+    };
+    slot.compare_exchange(FD_EMPTY, host_fd, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn reset_fd_map() {
+    for (i, slot) in FD_HOST.iter().enumerate() {
+        let prev = slot.swap(FD_EMPTY, Ordering::AcqRel);
+        if i > 2 && prev >= 0 {
+            host::close_fd(prev);
+        }
+    }
+    FD_NEXT.store(3, Ordering::Relaxed);
 }
 
 /// Owned process state for one guest (or unit-test isolation via reset).
 #[derive(Debug)]
 pub struct ProcessState {
     fds: FdTable,
+    /// Guest FD → directory stream (for `readdir` host helper).
+    dir_streams: HashMap<i32, host::HostDir>,
     bottle_root: Option<PathBuf>,
     sig_mask: u32,
     sigactions: [SoftSigAct; 32],
     bsdthread: Option<BsdThreadReg>,
-    syscall_count: u64,
-    max_syscalls: u64,
 }
 
 impl ProcessState {
@@ -119,24 +181,53 @@ impl ProcessState {
     pub fn new() -> Self {
         Self {
             fds: FdTable::new(),
+            dir_streams: HashMap::new(),
             bottle_root: None,
             sig_mask: 0,
             sigactions: [SoftSigAct::zero(); 32],
             bsdthread: None,
-            syscall_count: 0,
-            max_syscalls: 256,
         }
     }
 
     /// Resets FD table, soft signals, thread reg, and counters. Preserves bottle root.
     pub fn reset_run(&mut self, max_syscalls: usize) {
+        self.dir_streams.clear();
         self.fds.reset();
         self.sig_mask = 0;
         self.sigactions = [SoftSigAct::zero(); 32];
         self.bsdthread = None;
-        self.syscall_count = 0;
-        self.max_syscalls = u64::try_from(max_syscalls).unwrap_or(256);
+        let max = u64::try_from(max_syscalls).unwrap_or(256);
+        MAX_SYSCALLS.store(max, Ordering::Relaxed);
+        SYSCALL_COUNT.store(0, Ordering::Relaxed);
         crate::thread::reset_thread_runtime();
+    }
+
+    /// Closes any directory stream associated with `gfd` (call before FD free).
+    pub(crate) fn close_dir_stream(&mut self, gfd: i32) {
+        drop(self.dir_streams.remove(&gfd));
+    }
+
+    /// Returns the next directory entry for `gfd`, opening a stream on first use.
+    ///
+    /// `None` means end-of-directory (or empty). `Err(errno)` on failure.
+    pub(crate) fn readdir_next(&mut self, gfd: i32) -> Result<Option<(Vec<u8>, u8)>, i64> {
+        let Some(host_fd) = fd_get(gfd) else {
+            return Err(9); // EBADF
+        };
+
+        if let std::collections::hash_map::Entry::Vacant(e) = self.dir_streams.entry(gfd) {
+            match host::HostDir::open_dup(host_fd) {
+                Ok(dir) => {
+                    e.insert(dir);
+                }
+                Err(err) => return Err(i64::from(err)),
+            }
+        }
+
+        let Some(stream) = self.dir_streams.get_mut(&gfd) else {
+            return Err(9);
+        };
+        Ok(stream.read_next())
     }
 
     #[must_use]
@@ -146,11 +237,6 @@ impl ProcessState {
 
     pub(crate) fn set_bsdthread(&mut self, reg: BsdThreadReg) {
         self.bsdthread = Some(reg);
-    }
-
-    #[must_use]
-    pub(crate) fn fds(&self) -> &FdTable {
-        &self.fds
     }
 
     pub(crate) fn fds_mut(&mut self) -> &mut FdTable {
@@ -188,12 +274,6 @@ impl ProcessState {
             false
         }
     }
-
-    /// Bumps the syscall counter; returns `true` if the limit was exceeded.
-    pub(crate) fn tick_syscall(&mut self) -> bool {
-        self.syscall_count = self.syscall_count.saturating_add(1);
-        self.syscall_count > self.max_syscalls
-    }
 }
 
 impl Default for ProcessState {
@@ -202,22 +282,31 @@ impl Default for ProcessState {
     }
 }
 
-fn active_mutex() -> &'static Mutex<ProcessState> {
-    static ACTIVE: OnceLock<Mutex<ProcessState>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(ProcessState::new()))
+/// Bumps the process-wide syscall counter without taking the process lock.
+///
+/// Returns `true` when the configured max has been exceeded.
+#[must_use]
+pub fn tick_syscall() -> bool {
+    let n = SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    n >= MAX_SYSCALLS.load(Ordering::Relaxed)
+}
+
+fn active_lock() -> &'static RwLock<ProcessState> {
+    static ACTIVE: OnceLock<RwLock<ProcessState>> = OnceLock::new();
+    ACTIVE.get_or_init(|| RwLock::new(ProcessState::new()))
 }
 
 /// Exclusive access to the active process state.
 pub fn with_mut<R>(f: impl FnOnce(&mut ProcessState) -> R) -> R {
-    match active_mutex().lock() {
+    match active_lock().write() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => f(&mut poisoned.into_inner()),
     }
 }
 
-/// Shared access to the active process state.
+/// Shared access to the active process state (concurrent FD lookups, etc.).
 pub fn with_ref<R>(f: impl FnOnce(&ProcessState) -> R) -> R {
-    match active_mutex().lock() {
+    match active_lock().read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => f(&poisoned.into_inner()),
     }
@@ -239,9 +328,15 @@ pub fn bottle_root() -> Option<PathBuf> {
     with_ref(|p| p.bottle_root.clone())
 }
 
+/// Borrow the bottle root without cloning (hot path for path translation).
+pub fn with_bottle_root<R>(f: impl FnOnce(Option<&std::path::Path>) -> R) -> R {
+    with_ref(|p| f(p.bottle_root.as_deref()))
+}
+
 /// Serializes tests that mutate process-wide state (address space + process).
 #[cfg(test)]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

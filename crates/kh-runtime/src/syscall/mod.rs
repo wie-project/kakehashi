@@ -44,7 +44,8 @@ pub fn reset_syscall_state(max_syscalls: usize) {
 
 /// Dispatches a Darwin BSD syscall by number.
 pub fn dispatch(args: SyscallArgs) -> SyscallResult {
-    if proc_state::with_mut(proc_state::ProcessState::tick_syscall) {
+    // Atomic tick — do not take the process lock on every SVC.
+    if proc_state::tick_syscall() {
         return SyscallResult {
             name: "max_syscalls",
             outcome: TrapOutcome::Exit { code: 1 },
@@ -53,9 +54,17 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         };
     }
 
-    // Synthetic bottle helpers (puts / minimal printf) use high x16 values.
-    if helpers::is_helper(args.number) {
-        return helpers::dispatch_helper(args);
+    // Hot numbers first (archive I/O + helpers) — avoid enum match churn.
+    match args.number {
+        // helpers: 0x4B48_xxxx
+        n if helpers::is_helper(n) => return helpers::dispatch_helper(args),
+        3 | 396 => return io::handle_read(args),
+        4 | 397 => return io::handle_write(args),
+        5 | 398 => return fd::handle_open(args),
+        6 | 399 => return fd::handle_close(args),
+        199 => return fd::handle_lseek(args),
+        92 => return fd::handle_fcntl(args),
+        _ => {}
     }
 
     match lookup(args.number) {

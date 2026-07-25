@@ -17,12 +17,13 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     let Ok(len) = usize::try_from(args.x2) else {
         return SyscallResult::err(name, EFAULT);
     };
-    if !registry_check_range(args.x1, len, false) {
-        log_io_fail("write", "EFAULT", args.x0, args.x1, args.x2);
-        return SyscallResult::err(name, EFAULT);
-    }
     if len == 0 {
         return SyscallResult::ok(name, 0);
+    }
+    // Cap ridiculous lengths; full registry walk is TLS-cached on sequential I/O.
+    if len > (1 << 30) || !registry_check_range(args.x1, len, false) {
+        log_io_fail("write", "EFAULT", args.x0, args.x1, args.x2);
+        return SyscallResult::err(name, EFAULT);
     }
 
     let slice = guest_slice(args.x1, len);
@@ -57,21 +58,18 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     let Ok(len) = usize::try_from(args.x2) else {
         return SyscallResult::err(name, EFAULT);
     };
-    if !registry_check_range(args.x1, len, true) {
-        return SyscallResult::err(name, EFAULT);
-    }
     if len == 0 {
         return SyscallResult::ok(name, 0);
     }
+    if len > (1 << 30) || !registry_check_range(args.x1, len, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
 
-    let mut buf = vec![0_u8; len];
-    match read_host_fd(host_fd, &mut buf) {
-        Ok(nread) => {
-            if let Some(src) = buf.get(..nread) {
-                guest_slice_mut(args.x1, nread).copy_from_slice(src);
-            }
-            SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0))
-        }
+    // Read straight into guest memory (identity map) — no intermediate heap
+    // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
+    let buf = guest_slice_mut(args.x1, len);
+    match read_host_fd(host_fd, buf) {
+        Ok(nread) => SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0)),
         Err(_) => SyscallResult::err(name, EPERM),
     }
 }

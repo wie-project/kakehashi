@@ -15,13 +15,16 @@ use crate::sys::{
     SYS_MUNMAP,
 };
 use crate::trace;
+use crate::{KH_HELPER_PARK, KH_HELPER_WAKE};
 
 const EAGAIN: i32 = 35;
 const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 
 const MAGIC: u64 = 0x4B48_5054_4852_4401; // "KHPTHRD\x01"
-const STACK_SIZE: usize = 1024 * 1024;
+/// Guest worker stacks must fit freestanding NEON hypercall frames + host
+/// dispatch + 7zz LZMA worker frames. 1 MiB was tight under `-mmt>1`.
+const STACK_SIZE: usize = 4 * 1024 * 1024;
 const PAGE: usize = 16_384;
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -36,8 +39,8 @@ struct KhThread {
     stack: *mut u8,
     stack_size: usize,
     /// User start routine (kept for debugging).
-    _func: usize,
-    _arg: usize,
+    start_func: usize,
+    start_arg: usize,
 }
 
 type StartFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
@@ -65,6 +68,10 @@ pub(crate) unsafe extern "C" fn kh_pthread_start(
             if (*t).magic == MAGIC {
                 (*t).result.store(ret.addr(), Ordering::Release);
                 (*t).done.store(1, Ordering::Release);
+                // Wake joiners parked on `done`.
+                let done = &(*t).done;
+                let addr = u64::try_from(core::ptr::from_ref(done).addr()).unwrap_or(0);
+                let _ = sys::helper2(KH_HELPER_WAKE, addr, u64::from(u32::MAX));
             }
         }
     }
@@ -75,11 +82,26 @@ pub(crate) unsafe extern "C" fn kh_pthread_start(
     }
 }
 
+fn trampoline_va() -> u64 {
+    // Function-item → code address for `bsdthread_register`.
+    // rustc requires `fn-item as *const () as usize` (no freestanding alternative).
+    #[allow(
+        clippy::as_conversions,
+        clippy::fn_to_numeric_cast_with_truncation,
+        function_casts_as_integer
+    )]
+    let addr = kh_pthread_start as *const () as usize;
+    u64::try_from(addr).unwrap_or(0)
+}
+
 fn ensure_registered() -> bool {
     if REGISTERED.load(Ordering::Acquire) {
         return true;
     }
-    let entry = u64::try_from(kh_pthread_start as *const () as usize).unwrap_or(0);
+    let entry = trampoline_va();
+    if entry == 0 {
+        return false;
+    }
     // bsdthread_register(threadstart, wqthread, flags, stack_hint,
     //                    targetconc, dispatchqueue_offset, tsd_offset)
     let ret = unsafe { sys::syscall7(SYS_BSDTHREAD_REGISTER, entry, 0, 0, 0, 0, 0, 0) };
@@ -92,30 +114,51 @@ fn ensure_registered() -> bool {
 }
 
 fn mmap_anon(len: usize) -> *mut u8 {
-    let total = (len.saturating_add(PAGE - 1)) & !(PAGE - 1);
+    let mask = PAGE.saturating_sub(1);
+    let total = len.saturating_add(mask) & !mask;
     let prot = 3_u64; // R|W
     let flags = 0x1000_u64 | 0x0002_u64; // ANON|PRIVATE
     let fd = !0_u64;
-    let ret = unsafe { sys::syscall6(SYS_MMAP, 0, total as u64, prot, flags, fd, 0) };
+    let total_u = u64::try_from(total).unwrap_or(0);
+    let ret = unsafe { sys::syscall6(SYS_MMAP, 0, total_u, prot, flags, fd, 0) };
     if ret < 0 {
         return core::ptr::null_mut();
     }
-    core::ptr::with_exposed_provenance_mut::<u8>(ret as usize)
+    let addr = usize::try_from(ret).unwrap_or(0);
+    core::ptr::with_exposed_provenance_mut::<u8>(addr)
 }
 
 fn munmap_anon(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
-    let total = (len.saturating_add(PAGE - 1)) & !(PAGE - 1);
-    let _ = unsafe { sys::syscall2(SYS_MUNMAP, ptr.addr() as u64, total as u64) };
+    let mask = PAGE.saturating_sub(1);
+    let total = len.saturating_add(mask) & !mask;
+    let addr = u64::try_from(ptr.addr()).unwrap_or(0);
+    let total_u = u64::try_from(total).unwrap_or(0);
+    let _ = unsafe { sys::syscall2(SYS_MUNMAP, addr, total_u) };
 }
 
 // ── mutex (first word of guest pthread_mutex_t) ─────────────────────────────
+//
+// 0 = unlocked, 1 = locked. Contended waiters park on the word via host futex
+// so we do not burn the host with yield-SVC spin storms under 7zz MT.
 
 #[inline]
 fn mutex_word(mutex: *mut c_void) -> *mut AtomicU32 {
     mutex.cast::<AtomicU32>()
+}
+
+#[inline]
+fn park_word(word: *const AtomicU32, expected: u32) {
+    let addr = u64::try_from(word.addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_PARK, addr, u64::from(expected)) };
+}
+
+#[inline]
+fn wake_word(word: *const AtomicU32, n: u32) {
+    let addr = u64::try_from(word.addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_WAKE, addr, u64::from(n)) };
 }
 
 /// C `pthread_mutex_init` → nlist `_pthread_mutex_init`.
@@ -152,13 +195,27 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
         return EINVAL;
     }
     let w = unsafe { &*mutex_word(mutex) };
-    while w
+    // Fast path: uncontended.
+    if w
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
+        .is_ok()
     {
-        core::hint::spin_loop();
+        return 0;
     }
-    0
+    // Short spin then park while still locked.
+    loop {
+        for _ in 0..64_u32 {
+            if w
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return 0;
+            }
+            core::hint::spin_loop();
+        }
+        // FUTEX_WAIT returns if value ≠ expected (unlock raced ahead).
+        park_word(w, 1);
+    }
 }
 
 /// C `pthread_mutex_unlock` → nlist `_pthread_mutex_unlock`.
@@ -167,9 +224,9 @@ pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_in
     if mutex.is_null() {
         return EINVAL;
     }
-    unsafe {
-        (*mutex_word(mutex)).store(0, Ordering::Release);
-    }
+    let w = unsafe { &*mutex_word(mutex) };
+    w.store(0, Ordering::Release);
+    wake_word(w, 1);
     0
 }
 
@@ -206,7 +263,7 @@ pub(crate) unsafe extern "C" fn pthread_cond_destroy(cond: *mut c_void) -> c_int
 
 /// C `pthread_cond_wait` → nlist `_pthread_cond_wait`.
 ///
-/// Spin-wait on generation change (works with real worker threads; burns CPU).
+/// Generation wait via host futex park (not yield-spin).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_cond_wait(
     cond: *mut c_void,
@@ -215,13 +272,11 @@ pub(crate) unsafe extern "C" fn pthread_cond_wait(
     if cond.is_null() || mutex.is_null() {
         return EINVAL;
     }
-    let snapshot = unsafe { (*cond_word(cond)).load(Ordering::Acquire) };
+    let c = unsafe { &*cond_word(cond) };
+    let snapshot = c.load(Ordering::Acquire);
     let _ = unsafe { pthread_mutex_unlock(mutex) };
-    // Spin until broadcast/signal bumps the generation; host preemption runs
-    // workers. Burns CPU but unblocks pure-userspace waits that previously
-    // hung when create returned EAGAIN.
-    while unsafe { (*cond_word(cond)).load(Ordering::Acquire) } == snapshot {
-        core::hint::spin_loop();
+    while c.load(Ordering::Acquire) == snapshot {
+        park_word(c, snapshot);
     }
     let _ = unsafe { pthread_mutex_lock(mutex) };
     0
@@ -233,9 +288,9 @@ pub(crate) unsafe extern "C" fn pthread_cond_broadcast(cond: *mut c_void) -> c_i
     if cond.is_null() {
         return EINVAL;
     }
-    unsafe {
-        let _ = (*cond_word(cond)).fetch_add(1, Ordering::Release);
-    }
+    let c = unsafe { &*cond_word(cond) };
+    let _ = c.fetch_add(1, Ordering::Release);
+    wake_word(c, u32::MAX);
     0
 }
 
@@ -304,15 +359,16 @@ pub(crate) unsafe extern "C" fn pthread_create(
         (*t).result = AtomicUsize::new(0);
         (*t).stack = stack;
         (*t).stack_size = STACK_SIZE;
-        (*t)._func = start.addr();
-        (*t)._arg = arg.addr();
+        (*t).start_func = start.addr();
+        (*t).start_arg = arg.addr();
     }
 
     // Stack grows down: pass high address (16-byte aligned).
-    let stack_top = (stack.addr() + STACK_SIZE) & !0xF;
-    let pthread_va = raw.addr() as u64;
-    let func_va = start.addr() as u64;
-    let arg_va = arg.addr() as u64;
+    let stack_top = stack.addr().saturating_add(STACK_SIZE) & !0xF_usize;
+    let pthread_va = u64::try_from(raw.addr()).unwrap_or(0);
+    let func_va = u64::try_from(start.addr()).unwrap_or(0);
+    let arg_va = u64::try_from(arg.addr()).unwrap_or(0);
+    let stack_va = u64::try_from(stack_top).unwrap_or(0);
 
     // bsdthread_create(func, func_arg, stack, pthread, flags)
     let ret = unsafe {
@@ -320,7 +376,7 @@ pub(crate) unsafe extern "C" fn pthread_create(
             SYS_BSDTHREAD_CREATE,
             func_va,
             arg_va,
-            stack_top as u64,
+            stack_va,
             pthread_va,
             0,
             0,
@@ -334,6 +390,10 @@ pub(crate) unsafe extern "C" fn pthread_create(
         munmap_anon(stack, STACK_SIZE);
         return EAGAIN;
     }
+
+    // After the first worker, freestanding hypercall falls back to svc→brk
+    // (MT-safe path). See `sys::note_worker_spawned`.
+    sys::note_worker_spawned();
 
     // *thread = pthread_t
     unsafe {
@@ -359,8 +419,9 @@ pub(crate) unsafe extern "C" fn pthread_join(
     if unsafe { (*t).detached.load(Ordering::Acquire) } != 0 {
         return EINVAL;
     }
-    while unsafe { (*t).done.load(Ordering::Acquire) } == 0 {
-        core::hint::spin_loop();
+    let done = unsafe { &(*t).done };
+    while done.load(Ordering::Acquire) == 0 {
+        park_word(done, 0);
     }
     if !value_ptr.is_null() {
         let r = unsafe { (*t).result.load(Ordering::Acquire) };
