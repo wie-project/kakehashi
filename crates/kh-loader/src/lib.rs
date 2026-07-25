@@ -31,7 +31,8 @@ pub use image::{
     SectionInfo, SegmentInfo,
 };
 pub use init::{
-    InitFunc, S_MOD_INIT_FUNC_POINTERS, collect_mod_init, plan_initializers, run_initializers,
+    InitFunc, S_INIT_FUNC_OFFSETS, S_MOD_INIT_FUNC_POINTERS, collect_mod_init, plan_initializers,
+    run_initializers,
 };
 pub use link::{DefinedSymbol, UndefinedSymbol, defined_exports, undefined_imports};
 pub use parse::{

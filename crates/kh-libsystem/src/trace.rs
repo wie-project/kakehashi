@@ -2,7 +2,9 @@
 
 use crate::sys::{self, SYS_WRITE};
 
-static TRACE_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// Off by default: every note is a Darwin `write` and burns the host
+/// `max_syscalls` budget (real guests allocate heavily in static ctors).
+static TRACE_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Writes `msg` to fd 2 when tracing is enabled.
 #[inline]

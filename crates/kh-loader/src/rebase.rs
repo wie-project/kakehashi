@@ -5,13 +5,22 @@
 //! updated before anything (guest code or the host init runner) treats them as
 //! live addresses.
 //!
-//! Phase 9 covers fixture-relevant section types only — not dyld rebase opcodes.
+//! Two mechanisms (classic dyld order, after map, before bind):
+//! 1. **Section scan** — fixture-relevant pointer array section types
+//!    (`S_MOD_INIT_FUNC_POINTERS`, …).
+//! 2. **Classic rebase opcodes** — `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` stream
+//!    (real `libSystem` / C++ guests: `__stdinp`, vtables, …).
+//!
 //! Images with [`crate::chained`] fixups skip this pass (chains rewrite DATA).
 
+use goblin::mach::Mach;
+use goblin::mach::load_command::{CommandVariant, DyldInfoCommand};
 use kh_runtime::{GuestMemory, mprotect_darwin, mprotect_rw};
+use scroll::Uleb128;
 
 use crate::error::LoadError;
 use crate::image::MachOImage;
+use crate::parse::{read_thin_arm64, thin_arm64_bytes};
 use crate::session::{ImageLoadStatus, LoadSession, ProcessImage};
 
 /// Section type: array of function pointers (`S_MOD_INIT_FUNC_POINTERS`).
@@ -28,6 +37,21 @@ pub const S_INTERPOSING: u32 = 0xd;
 
 /// Mask for Mach-O section type bits in `flags`.
 pub const SECTION_TYPE: u32 = 0xff;
+
+// Classic dyld rebase opcodes (`mach-o/loader.h` / dyld).
+const REBASE_OPCODE_MASK: u8 = 0xF0;
+const REBASE_IMMEDIATE_MASK: u8 = 0x0F;
+const REBASE_OPCODE_DONE: u8 = 0x00;
+const REBASE_OPCODE_SET_TYPE_IMM: u8 = 0x10;
+const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+const REBASE_OPCODE_ADD_ADDR_ULEB: u8 = 0x30;
+const REBASE_OPCODE_ADD_ADDR_IMM_SCALED: u8 = 0x40;
+const REBASE_OPCODE_DO_REBASE_IMM_TIMES: u8 = 0x50;
+const REBASE_OPCODE_DO_REBASE_ULEB_TIMES: u8 = 0x60;
+const REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: u8 = 0x70;
+const REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB: u8 = 0x80;
+const REBASE_TYPE_POINTER: u8 = 1;
+const POINTER_SIZE: u64 = 8;
 
 /// Returns true when this section type holds preferred absolute pointer words.
 #[must_use]
@@ -46,27 +70,46 @@ pub const fn is_rebasable_section_type(section_type: u32) -> bool {
 /// Call **after** map and **before** bind (classic dyld order).
 pub fn rebase_process(session: &mut LoadSession) -> Result<usize, LoadError> {
     let mut total = 0_usize;
-    for img in &mut session.images {
-        if !matches!(img.status, ImageLoadStatus::Mapped) {
-            continue;
-        }
+    // Snapshot paths first so we can re-open thin bytes for opcode streams.
+    let entries: Vec<_> = session
+        .images
+        .iter()
+        .enumerate()
+        .filter(|(_, img)| matches!(img.status, ImageLoadStatus::Mapped))
+        .map(|(idx, img)| (idx, img.path.clone()))
+        .collect();
+
+    for (idx, path) in entries {
+        let img = session
+            .images
+            .get_mut(idx)
+            .ok_or_else(|| LoadError::Resolve("rebase image index lost".into()))?;
         if img
             .image
             .as_ref()
             .is_some_and(crate::chained::image_has_chained_fixups)
         {
             tracing::debug!(
-                path = %img.path.display(),
+                path = %path.display(),
                 "skip section rebase (chained fixups)"
             );
             continue;
         }
-        total = total.saturating_add(rebase_image(img)?);
+        let section_n = rebase_image(img)?;
+        let opcode_n = if path.as_os_str().is_empty() {
+            0
+        } else {
+            let bytes = read_thin_arm64(&path)?;
+            apply_classic_rebase_opcodes(img, &bytes)?
+        };
+        total = total
+            .saturating_add(section_n)
+            .saturating_add(opcode_n);
     }
     Ok(total)
 }
 
-/// Rebases one mapped process image. Returns number of pointer slots rewritten.
+/// Rebases one mapped process image (section-scan only). Returns slots rewritten.
 pub fn rebase_image(img: &mut ProcessImage) -> Result<usize, LoadError> {
     let (Some(image), Some(memory)) = (img.image.as_ref(), img.memory.as_mut()) else {
         return Ok(0);
@@ -85,10 +128,210 @@ pub fn rebase_image(img: &mut ProcessImage) -> Result<usize, LoadError> {
             path = %img.path.display(),
             slide,
             slots = count,
-            "rebased pointer slots"
+            "rebased pointer slots (section scan)"
         );
     }
     Ok(count)
+}
+
+/// Applies `LC_DYLD_INFO` rebase opcodes for one mapped image.
+pub fn apply_classic_rebase_opcodes(
+    img: &mut ProcessImage,
+    file_bytes: &[u8],
+) -> Result<usize, LoadError> {
+    let (Some(image), Some(memory)) = (img.image.as_ref(), img.memory.as_mut()) else {
+        return Ok(0);
+    };
+    let slide = memory.slide();
+    if slide == 0 {
+        return Ok(0);
+    }
+    let thin = thin_arm64_bytes(file_bytes)?;
+    let stream = classic_rebase_stream(thin)?;
+    if stream.is_empty() {
+        return Ok(0);
+    }
+    let seg_vms: Vec<u64> = image.segments.iter().map(|s| s.vmaddr).collect();
+    let sites = collect_classic_rebase_sites(stream, &seg_vms)?;
+    let mut count = 0_usize;
+    for preferred_slot in sites {
+        let slot = preferred_slot.wrapping_add(slide);
+        let preferred = memory.read_u64_le(slot).ok_or_else(|| {
+            LoadError::Resolve(format!(
+                "classic rebase slot unreadable at {slot:#x} (preferred {preferred_slot:#x})"
+            ))
+        })?;
+        // Slot holds preferred absolute VA (or 0); add slide.
+        let actual = preferred.wrapping_add(slide);
+        if actual == preferred {
+            continue;
+        }
+        write_slot_rw(memory, slot, actual)?;
+        count = count.saturating_add(1);
+    }
+    if count > 0 {
+        tracing::debug!(
+            path = %img.path.display(),
+            slide,
+            slots = count,
+            "rebased pointer slots (classic opcodes)"
+        );
+    }
+    Ok(count)
+}
+
+fn classic_rebase_stream(thin: &[u8]) -> Result<&[u8], LoadError> {
+    let mach = Mach::parse(thin).map_err(|err| LoadError::Resolve(format!("mach parse: {err}")))?;
+    let macho = match mach {
+        Mach::Binary(m) => m,
+        Mach::Fat(_) => {
+            return Err(LoadError::Resolve(
+                "classic rebase expects thin arm64 bytes".into(),
+            ));
+        }
+    };
+    let Some(cmd) = dyld_info_command(&macho) else {
+        return Ok(&[]);
+    };
+    if cmd.rebase_size == 0 {
+        return Ok(&[]);
+    }
+    let start = usize::try_from(cmd.rebase_off).unwrap_or(0);
+    let len = usize::try_from(cmd.rebase_size).unwrap_or(0);
+    thin.get(start..start.saturating_add(len)).ok_or_else(|| {
+        LoadError::Resolve(format!(
+            "rebase stream out of range off={start:#x} size={len:#x}"
+        ))
+    })
+}
+
+fn dyld_info_command<'a>(macho: &'a goblin::mach::MachO<'a>) -> Option<&'a DyldInfoCommand> {
+    for lc in &macho.load_commands {
+        if let CommandVariant::DyldInfoOnly(c) | CommandVariant::DyldInfo(c) = &lc.command {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Preferred (slide-0) VAs of POINTER rebase slots from a classic opcode stream.
+fn collect_classic_rebase_sites(stream: &[u8], seg_vms: &[u64]) -> Result<Vec<u64>, LoadError> {
+    let mut out = Vec::new();
+    let mut offset = 0_usize;
+    let mut seg_index: u8 = 0;
+    let mut seg_offset: u64 = 0;
+    let mut rebase_type: u8 = REBASE_TYPE_POINTER;
+
+    while offset < stream.len() {
+        let Some(&byte) = stream.get(offset) else {
+            break;
+        };
+        offset = offset.saturating_add(1);
+        let opcode = byte & REBASE_OPCODE_MASK;
+        let imm = byte & REBASE_IMMEDIATE_MASK;
+
+        match opcode {
+            REBASE_OPCODE_DONE => break,
+            REBASE_OPCODE_SET_TYPE_IMM => {
+                rebase_type = imm;
+            }
+            REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
+                seg_index = imm;
+                seg_offset = read_uleb(stream, &mut offset)?;
+            }
+            REBASE_OPCODE_ADD_ADDR_ULEB => {
+                let add = read_uleb(stream, &mut offset)?;
+                seg_offset = seg_offset.wrapping_add(add);
+            }
+            REBASE_OPCODE_ADD_ADDR_IMM_SCALED => {
+                seg_offset = seg_offset.wrapping_add(u64::from(imm).wrapping_mul(POINTER_SIZE));
+            }
+            REBASE_OPCODE_DO_REBASE_IMM_TIMES => {
+                for _ in 0..imm {
+                    push_rebase_site(
+                        &mut out,
+                        seg_vms,
+                        seg_index,
+                        seg_offset,
+                        rebase_type,
+                    )?;
+                    seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
+                }
+            }
+            REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
+                let times = read_uleb(stream, &mut offset)?;
+                for _ in 0..times {
+                    push_rebase_site(
+                        &mut out,
+                        seg_vms,
+                        seg_index,
+                        seg_offset,
+                        rebase_type,
+                    )?;
+                    seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
+                }
+            }
+            REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
+                push_rebase_site(
+                    &mut out,
+                    seg_vms,
+                    seg_index,
+                    seg_offset,
+                    rebase_type,
+                )?;
+                let add = read_uleb(stream, &mut offset)?;
+                seg_offset = seg_offset
+                    .wrapping_add(POINTER_SIZE)
+                    .wrapping_add(add);
+            }
+            REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
+                let times = read_uleb(stream, &mut offset)?;
+                let skip = read_uleb(stream, &mut offset)?;
+                for _ in 0..times {
+                    push_rebase_site(
+                        &mut out,
+                        seg_vms,
+                        seg_index,
+                        seg_offset,
+                        rebase_type,
+                    )?;
+                    seg_offset = seg_offset
+                        .wrapping_add(POINTER_SIZE)
+                        .wrapping_add(skip);
+                }
+            }
+            _ => {
+                return Err(LoadError::Resolve(format!(
+                    "unknown rebase opcode {byte:#x} at stream offset {}",
+                    offset.saturating_sub(1)
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn push_rebase_site(
+    out: &mut Vec<u64>,
+    seg_vms: &[u64],
+    seg_index: u8,
+    seg_offset: u64,
+    rebase_type: u8,
+) -> Result<(), LoadError> {
+    if rebase_type != REBASE_TYPE_POINTER {
+        // Ignore text-absolute / other rare types for now.
+        return Ok(());
+    }
+    let idx = usize::from(seg_index);
+    let base = seg_vms.get(idx).copied().ok_or_else(|| {
+        LoadError::Resolve(format!("rebase segment index {seg_index} out of range"))
+    })?;
+    out.push(base.wrapping_add(seg_offset));
+    Ok(())
+}
+
+fn read_uleb(data: &[u8], offset: &mut usize) -> Result<u64, LoadError> {
+    Uleb128::read(data, offset).map_err(|err| LoadError::Resolve(format!("rebase uleb: {err}")))
 }
 
 /// Walks rebasable sections and adds `slide` to each non-zero pointer word.
@@ -273,7 +516,8 @@ mod tests {
             let dylib = session.images().get(dylib_idx).expect("dylib");
             let image = dylib.image.as_ref().expect("image");
             let memory = dylib.memory.as_ref().expect("memory");
-            let inits = collect_mod_init(image, memory).expect("collect preferred");
+            let inits =
+                collect_mod_init(image, memory, dylib.preferred_base()).expect("collect preferred");
             *inits.first().expect("one init")
         };
         assert!(
@@ -307,7 +551,8 @@ mod tests {
         let slot_val = memory.read_u64_le(slot).expect("slot");
         assert_eq!(slot_val, preferred.wrapping_add(DELTA));
 
-        let inits = collect_mod_init(image, memory).expect("collect post-rebase");
+        let inits =
+            collect_mod_init(image, memory, dylib.preferred_base()).expect("collect post-rebase");
         assert_eq!(inits, vec![preferred.wrapping_add(DELTA)]);
 
         drop(session);

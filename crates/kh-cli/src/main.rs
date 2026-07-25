@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
 
-        /// Cap translated syscalls (micro default 256).
+        /// Cap translated syscalls (micro default 65536).
         #[arg(long)]
         max_syscalls: Option<usize>,
 
@@ -216,7 +216,7 @@ fn run() -> Result<()> {
         } => commands::run::run(&commands::run::RunArgs {
             path: &path,
             root: root.as_deref(),
-            max_syscalls: max_syscalls.unwrap_or(256),
+            max_syscalls: max_syscalls.unwrap_or(65_536),
             expect_code,
             guest_page_size,
             dry_load,

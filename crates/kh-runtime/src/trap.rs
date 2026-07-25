@@ -180,7 +180,7 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
             return Ok(());
         }
 
-        // SAFETY: process-wide SIGTRAP handler with SA_SIGINFO.
+        // SAFETY: process-wide SIGTRAP / fault handlers with SA_SIGINFO.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_flags = libc::SA_SIGINFO;
@@ -193,10 +193,76 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
                 HANDLER_INSTALLED.store(false, Ordering::SeqCst);
                 return Err(TrapError::SignalSetup(io::Error::last_os_error()));
             }
+
+            // Guest faults: print PC/addr so `kh run` diagnoses unbound GOT / bad heap.
+            let mut fault: libc::sigaction = std::mem::zeroed();
+            fault.sa_flags = libc::SA_SIGINFO;
+            #[allow(clippy::as_conversions, function_casts_as_integer)]
+            {
+                fault.sa_sigaction = guest_fault_sigaction as *const () as usize;
+            }
+            libc::sigemptyset(std::ptr::addr_of_mut!(fault.sa_mask));
+            for sig in [libc::SIGSEGV, libc::SIGBUS] {
+                if libc::sigaction(sig, std::ptr::addr_of!(fault), std::ptr::null_mut()) != 0 {
+                    HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+                    return Err(TrapError::SignalSetup(io::Error::last_os_error()));
+                }
+            }
         }
         reset_trap_state();
         Ok(())
     }
+}
+
+/// Logs guest `SIGSEGV` / `SIGBUS` (PC, fault address, key regs) then exits.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe extern "C" fn guest_fault_sigaction(
+    signo: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+) {
+    let name = match signo {
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        _ => "FAULT",
+    };
+    let mut pc = 0_u64;
+    let mut sp = 0_u64;
+    let mut x0 = 0_u64;
+    let mut x1 = 0_u64;
+    let mut x8 = 0_u64;
+    let mut x16 = 0_u64;
+    let mut lr = 0_u64;
+    if !ctx.is_null() {
+        // SAFETY: kernel `ucontext_t` for SA_SIGINFO.
+        let uctx = unsafe { &*ctx.cast::<libc::ucontext_t>() };
+        let m = &uctx.uc_mcontext;
+        pc = m.pc;
+        sp = m.sp;
+        x0 = m.regs[0];
+        x1 = m.regs[1];
+        x8 = m.regs[8];
+        x16 = m.regs[16];
+        lr = m.regs[30];
+    }
+    let addr = if info.is_null() {
+        0_u64
+    } else {
+        // SAFETY: kernel-provided siginfo.
+        let p = unsafe { (*info).si_addr() };
+        u64::try_from(p.addr()).unwrap_or(0)
+    };
+    let msg = format!(
+        "error: guest {name} pc={pc:#x} addr={addr:#x} sp={sp:#x} lr={lr:#x} \
+         x0={x0:#x} x1={x1:#x} x8={x8:#x} x16={x16:#x}\n"
+    );
+    drop(io::stderr().write_all(msg.as_bytes()));
+    drop(io::stderr().flush());
+    if TRACE_ON_EXIT.load(Ordering::SeqCst) {
+        dump_events_before_exit();
+    }
+    // SAFETY: hard-stop after unrecoverable guest fault.
+    unsafe { libc::_exit(128_i32.saturating_add(signo)) };
 }
 
 /// Drains recorded trap events (for `kh trace`).

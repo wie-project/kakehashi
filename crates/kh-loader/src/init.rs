@@ -1,8 +1,12 @@
-//! Load-time initializers (`S_MOD_INIT_FUNC_POINTERS`).
+//! Load-time initializers (`S_MOD_INIT_FUNC_POINTERS` / `S_INIT_FUNC_OFFSETS`).
 //!
 //! After map + bind, dyld runs module constructors bottom-up (dependencies
 //! before dependents) before transferring to `LC_MAIN`. Phase 7 implements the
 //! same order for mapped images using [`kh_runtime::call_guest`].
+//!
+//! Modern Apple toolchains emit `__TEXT,__init_offsets` (`S_INIT_FUNC_OFFSETS`)
+//! with 32-bit image-relative offsets instead of classic pointer arrays. Real
+//! guests such as `7zz` use that form; classic fixtures keep `mod_init_func`.
 #![allow(unsafe_code)]
 
 use kh_runtime::{GuestMemory, call_guest};
@@ -13,6 +17,12 @@ use crate::session::{ImageLoadStatus, ImageRole, LoadSession, ProcessImage};
 
 /// Section type: array of function pointers run at load (`S_MOD_INIT_FUNC_POINTERS`).
 pub const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+
+/// Section type: 32-bit offsets to initializers (`S_INIT_FUNC_OFFSETS`).
+///
+/// Each entry is a little-endian `u32` offset from the image preferred load
+/// address (mach_header). Actual VA = preferred_base + slide + offset.
+pub const S_INIT_FUNC_OFFSETS: u32 = 0x16;
 
 /// Mask for Mach-O section type bits in `flags`.
 pub const SECTION_TYPE: u32 = 0xff;
@@ -28,46 +38,102 @@ pub struct InitFunc {
 
 /// Collects initializer VAs for one mapped image.
 ///
-/// Expects **post-rebase** guest memory: [`crate::rebase::rebase_process`]
-/// rewrites preferred pointer words in place when `slide != 0`. After that,
-/// each non-zero slot is already the callable guest VA (slide 0 ⇒ preferred
-/// equals actual, so no rewrite).
-pub fn collect_mod_init(image: &MachOImage, memory: &GuestMemory) -> Result<Vec<u64>, LoadError> {
+/// Supports both:
+/// - classic `S_MOD_INIT_FUNC_POINTERS` (8-byte preferred pointers; post-rebase
+///   they are already runnable VAs when `slide != 0`);
+/// - modern `S_INIT_FUNC_OFFSETS` (4-byte offsets from preferred image base).
+///
+/// `preferred_base` is the image's planned preferred load address (lowest
+/// non-`__PAGEZERO` segment); required for `S_INIT_FUNC_OFFSETS`.
+pub fn collect_mod_init(
+    image: &MachOImage,
+    memory: &GuestMemory,
+    preferred_base: u64,
+) -> Result<Vec<u64>, LoadError> {
     let slide = memory.slide();
     let mut out = Vec::new();
     for seg in &image.segments {
         for sect in &seg.sections {
-            if sect.flags & SECTION_TYPE != S_MOD_INIT_FUNC_POINTERS {
-                continue;
-            }
-            if sect.size == 0 {
-                continue;
-            }
-            if !sect.size.is_multiple_of(8) {
-                return Err(LoadError::Resolve(format!(
-                    "mod_init section {}/{} size {:#x} not multiple of 8",
-                    sect.segname, sect.name, sect.size
-                )));
-            }
-            let base = sect.addr.wrapping_add(slide);
-            let count = usize::try_from(sect.size.saturating_div(8)).unwrap_or(0);
-            for i in 0..count {
-                let slot_off = u64::try_from(i).unwrap_or(0).saturating_mul(8);
-                let slot = base.wrapping_add(slot_off);
-                let va = memory.read_u64_le(slot).ok_or_else(|| {
-                    LoadError::Resolve(format!(
-                        "mod_init slot unreadable at {slot:#x} ({}/{})",
-                        sect.segname, sect.name
-                    ))
-                })?;
-                if va == 0 {
-                    continue;
-                }
-                out.push(va);
+            let kind = sect.flags & SECTION_TYPE;
+            if kind == S_MOD_INIT_FUNC_POINTERS {
+                collect_mod_init_pointers(sect, memory, slide, &mut out)?;
+            } else if kind == S_INIT_FUNC_OFFSETS {
+                collect_init_func_offsets(sect, memory, preferred_base, slide, &mut out)?;
             }
         }
     }
     Ok(out)
+}
+
+fn collect_mod_init_pointers(
+    sect: &crate::image::SectionInfo,
+    memory: &GuestMemory,
+    slide: u64,
+    out: &mut Vec<u64>,
+) -> Result<(), LoadError> {
+    if sect.size == 0 {
+        return Ok(());
+    }
+    if !sect.size.is_multiple_of(8) {
+        return Err(LoadError::Resolve(format!(
+            "mod_init section {}/{} size {:#x} not multiple of 8",
+            sect.segname, sect.name, sect.size
+        )));
+    }
+    let base = sect.addr.wrapping_add(slide);
+    let count = usize::try_from(sect.size.saturating_div(8)).unwrap_or(0);
+    for i in 0..count {
+        let slot_off = u64::try_from(i).unwrap_or(0).saturating_mul(8);
+        let slot = base.wrapping_add(slot_off);
+        let va = memory.read_u64_le(slot).ok_or_else(|| {
+            LoadError::Resolve(format!(
+                "mod_init slot unreadable at {slot:#x} ({}/{})",
+                sect.segname, sect.name
+            ))
+        })?;
+        if va == 0 {
+            continue;
+        }
+        out.push(va);
+    }
+    Ok(())
+}
+
+fn collect_init_func_offsets(
+    sect: &crate::image::SectionInfo,
+    memory: &GuestMemory,
+    preferred_base: u64,
+    slide: u64,
+    out: &mut Vec<u64>,
+) -> Result<(), LoadError> {
+    if sect.size == 0 {
+        return Ok(());
+    }
+    if !sect.size.is_multiple_of(4) {
+        return Err(LoadError::Resolve(format!(
+            "init_offsets section {}/{} size {:#x} not multiple of 4",
+            sect.segname, sect.name, sect.size
+        )));
+    }
+    let base = sect.addr.wrapping_add(slide);
+    let image_load = preferred_base.wrapping_add(slide);
+    let count = usize::try_from(sect.size.saturating_div(4)).unwrap_or(0);
+    for i in 0..count {
+        let slot_off = u64::try_from(i).unwrap_or(0).saturating_mul(4);
+        let slot = base.wrapping_add(slot_off);
+        let raw = memory.read_u32_le(slot).ok_or_else(|| {
+            LoadError::Resolve(format!(
+                "init_offsets slot unreadable at {slot:#x} ({}/{})",
+                sect.segname, sect.name
+            ))
+        })?;
+        if raw == 0 {
+            continue;
+        }
+        let va = image_load.wrapping_add(u64::from(raw));
+        out.push(va);
+    }
+    Ok(())
 }
 
 /// Bottom-up initializer list: mapped dylibs in reverse map order, then main.
@@ -96,7 +162,7 @@ fn push_image_inits(img: &ProcessImage, plan: &mut Vec<InitFunc>) -> Result<(), 
     let (Some(image), Some(memory)) = (img.image.as_ref(), img.memory.as_ref()) else {
         return Ok(());
     };
-    for va in collect_mod_init(image, memory)? {
+    for va in collect_mod_init(image, memory, img.preferred_base())? {
         plan.push(InitFunc {
             va,
             image_path: img.path.display().to_string(),

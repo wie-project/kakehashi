@@ -415,6 +415,14 @@ impl GuestMemory {
         None
     }
 
+    /// Reads a little-endian `u32` from a mapped guest VA.
+    #[must_use]
+    pub fn read_u32_le(&self, guest_va: u64) -> Option<u32> {
+        let mut buf = [0_u8; 4];
+        self.read_exact(guest_va, &mut buf)?;
+        Some(u32::from_le_bytes(buf))
+    }
+
     /// Reads a little-endian `u64` from a mapped guest VA.
     #[must_use]
     pub fn read_u64_le(&self, guest_va: u64) -> Option<u64> {
