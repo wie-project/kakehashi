@@ -736,6 +736,38 @@ mod tests {
     }
 
     #[test]
+    fn dry_load_fat_arm64_wrapper_maps_like_thin() {
+        use crate::fixture::{minimal_arm64_execute, wrap_fat_arm64_only};
+
+        let _guard = map_test_lock();
+        let fat = wrap_fat_arm64_only(&minimal_arm64_execute());
+        let path = write_temp_bytes("fat-minimal", &fat);
+        let mut session = LoadSession::open(&path, None).expect("open fat");
+        let report = session.dry_load().expect("dry_load fat");
+        assert!(
+            report.regions.iter().any(|r| r.name == "__TEXT"),
+            "fat arm64 must map __TEXT"
+        );
+        let text = report
+            .regions
+            .iter()
+            .find(|r| r.name == "__TEXT")
+            .expect("TEXT");
+        assert!(text.file_bytes > 0, "TEXT must be filled from fat slice");
+        assert!(
+            report.images.iter().any(|i| {
+                i.role == "dylib"
+                    && i.status == "skipped:no_bottle"
+                    && i.install_name.contains("libSystem")
+            }),
+            "deps still soft-skipped without bottle: {:?}",
+            report.images
+        );
+        drop(session);
+        drop(std::fs::remove_file(path));
+    }
+
+    #[test]
     fn minimal_fixture_skips_libsystem_no_bottle() {
         let _guard = map_test_lock();
         let path = write_temp_fixture();

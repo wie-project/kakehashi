@@ -10,6 +10,11 @@ pub struct MachOSummary {
     pub path: String,
     /// True when the on-disk container was a fat binary.
     pub fat: bool,
+    /// Byte offset of the arm64 thin Mach-O within the on-disk container.
+    ///
+    /// Zero for thin files. Segment `fileoff` values are relative to the thin
+    /// header; map requests add this offset when reading the container path.
+    pub file_slice_offset: u64,
     /// Architecture name (e.g. `arm64`).
     pub cpu: String,
     /// File type string (e.g. `EXECUTE`).
@@ -258,7 +263,10 @@ impl ImagePlan {
                 name: seg.name.clone(),
                 vmaddr: seg.vmaddr,
                 vmsize: seg.vmsize,
-                fileoff: seg.fileoff,
+                // On-disk offset = thin-relative fileoff + fat container slice base.
+                fileoff: seg
+                    .fileoff
+                    .saturating_add(image.summary.file_slice_offset),
                 filesize: seg.filesize,
                 guest_aligned_addr: aligned_addr,
                 guest_aligned_end: aligned_end,

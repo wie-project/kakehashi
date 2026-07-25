@@ -1,6 +1,12 @@
 //! Mach-O arm64 parsing via goblin (thin + fat).
+//!
+//! Fat containers are always reduced to the **arm64 thin slice** before header /
+//! segment / nlist interpretation. [`MachOSummary::file_slice_offset`] records
+//! where that slice sits in the on-disk container so map `fileoff` values can be
+//! adjusted when reading from the original path.
 
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 
 use goblin::mach::constants::cputype::{CPU_TYPE_ARM64, CPU_TYPE_X86_64, get_arch_name_from_types};
@@ -14,6 +20,100 @@ use crate::image::{
     DylibDep, DylibKind, LoadCommandInfo, MachOImage, MachOSummary, SectionInfo, SegmentInfo,
 };
 
+/// Location of the arm64 thin Mach-O inside a file buffer (thin or fat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64Slice {
+    /// Byte offset of the thin header within the container.
+    pub offset: u64,
+    /// Thin image size in bytes.
+    pub size: u64,
+    /// True when the container was a fat binary.
+    pub was_fat: bool,
+}
+
+impl Arm64Slice {
+    /// Half-open range into the container buffer.
+    pub fn range(self) -> Result<Range<usize>, LoadError> {
+        let start = usize::try_from(self.offset)
+            .map_err(|_| LoadError::NotMachO("fat slice offset out of range".into()))?;
+        let size = usize::try_from(self.size)
+            .map_err(|_| LoadError::NotMachO("fat slice size out of range".into()))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| LoadError::NotMachO("fat slice end overflow".into()))?;
+        Ok(start..end)
+    }
+}
+
+/// Locates the arm64 thin Mach-O inside `bytes` (identity for thin arm64).
+pub fn locate_arm64_slice(bytes: &[u8]) -> Result<Arm64Slice, LoadError> {
+    let mach = Mach::parse(bytes).map_err(|err| LoadError::NotMachO(err.to_string()))?;
+    match mach {
+        Mach::Binary(macho) => {
+            if !is_arm64(&macho) {
+                let cputype = macho.header.cputype();
+                let cpusubtype = macho.header.cpusubtype();
+                let name = get_arch_name_from_types(cputype, cpusubtype)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let hint = if cputype == CPU_TYPE_X86_64 {
+                    format!("{name} (need arm64; no x86 translation in kakehashi)")
+                } else {
+                    name
+                };
+                return Err(LoadError::UnsupportedArch(hint));
+            }
+            Ok(Arm64Slice {
+                offset: 0,
+                size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                was_fat: false,
+            })
+        }
+        Mach::Fat(multi) => {
+            if let Ok(Some(arch)) = multi.find_cputype(CPU_TYPE_ARM64) {
+                return Ok(Arm64Slice {
+                    offset: u64::from(arch.offset),
+                    size: u64::from(arch.size),
+                    was_fat: true,
+                });
+            }
+            for entry in &multi {
+                let entry = entry.map_err(|err| LoadError::NotMachO(err.to_string()))?;
+                if let SingleArch::MachO(macho) = entry
+                    && is_arm64(&macho)
+                {
+                    // MultiArch iteration does not expose offset; re-scan arches.
+                    if let Ok(Some(arch)) = multi.find_cputype(macho.header.cputype()) {
+                        return Ok(Arm64Slice {
+                            offset: u64::from(arch.offset),
+                            size: u64::from(arch.size),
+                            was_fat: true,
+                        });
+                    }
+                }
+            }
+            Err(LoadError::UnsupportedArch(
+                "fat binary has no arm64 slice".to_owned(),
+            ))
+        }
+    }
+}
+
+/// Returns a view of the arm64 thin Mach-O inside `bytes`.
+pub fn thin_arm64_bytes(bytes: &[u8]) -> Result<&[u8], LoadError> {
+    let slice = locate_arm64_slice(bytes)?;
+    let range = slice.range()?;
+    bytes
+        .get(range)
+        .ok_or_else(|| LoadError::NotMachO("fat arm64 slice out of file bounds".into()))
+}
+
+/// Reads a path and returns only the arm64 thin Mach-O bytes.
+pub fn read_thin_arm64(path: &Path) -> Result<Vec<u8>, LoadError> {
+    let bytes = fs::read(path)?;
+    Ok(thin_arm64_bytes(&bytes)?.to_vec())
+}
+
 /// Reads and parses a Mach-O file, selecting the arm64 slice from fat images.
 pub fn parse_path(path: &Path) -> Result<MachOImage, LoadError> {
     let bytes = fs::read(path)?;
@@ -21,33 +121,20 @@ pub fn parse_path(path: &Path) -> Result<MachOImage, LoadError> {
 }
 
 /// Parses Mach-O bytes. `path_label` is stored in the summary for display.
+///
+/// Fat images are reduced to the arm64 thin slice; [`MachOSummary::file_slice_offset`]
+/// is the container offset of that slice (0 for thin files).
 pub fn parse_bytes(bytes: &[u8], path_label: &str) -> Result<MachOImage, LoadError> {
-    let mach = Mach::parse(bytes).map_err(|err| LoadError::NotMachO(err.to_string()))?;
+    let slice = locate_arm64_slice(bytes)?;
+    let thin = thin_arm64_bytes(bytes)?;
+    let mach = Mach::parse(thin).map_err(|err| LoadError::NotMachO(err.to_string()))?;
     match mach {
-        Mach::Binary(macho) => image_from_macho(bytes, &macho, path_label, false),
-        Mach::Fat(multi) => {
-            if let Ok(Some(arch)) = multi.find_cputype(CPU_TYPE_ARM64) {
-                let offset = usize::try_from(arch.offset).map_err(|_| {
-                    LoadError::NotMachO("fat arm64 slice offset out of range".to_owned())
-                })?;
-                let macho = MachO::parse(bytes, offset)
-                    .map_err(|err| LoadError::NotMachO(err.to_string()))?;
-                return image_from_macho(bytes, &macho, path_label, true);
-            }
-
-            for entry in &multi {
-                let entry = entry.map_err(|err| LoadError::NotMachO(err.to_string()))?;
-                if let SingleArch::MachO(macho) = entry
-                    && is_arm64(&macho)
-                {
-                    return image_from_macho(bytes, &macho, path_label, true);
-                }
-            }
-
-            Err(LoadError::UnsupportedArch(
-                "fat binary has no arm64 slice".to_owned(),
-            ))
+        Mach::Binary(macho) => {
+            image_from_macho(thin, &macho, path_label, slice.was_fat, slice.offset)
         }
+        Mach::Fat(_) => Err(LoadError::NotMachO(
+            "nested fat image inside arm64 slice".into(),
+        )),
     }
 }
 
@@ -60,6 +147,7 @@ fn image_from_macho(
     macho: &MachO<'_>,
     path_label: &str,
     fat: bool,
+    file_slice_offset: u64,
 ) -> Result<MachOImage, LoadError> {
     if !macho.is_64 {
         return Err(LoadError::UnsupportedArch(
@@ -221,6 +309,7 @@ fn image_from_macho(
     let summary = MachOSummary {
         path: path_label.to_owned(),
         fat,
+        file_slice_offset,
         cpu,
         file_type: filetype_to_str(macho.header.filetype).to_owned(),
         file_type_raw: macho.header.filetype,
@@ -385,5 +474,42 @@ mod tests {
         assert_eq!(plan.guest_page_size, 16_384);
         assert!(!plan.mappings.is_empty());
         assert!(plan.segment_count() >= 2);
+    }
+
+    #[test]
+    fn parse_fat_arm64_wrapper_sets_slice_offset() {
+        use crate::fixture::wrap_fat_arm64_only;
+
+        let thin = minimal_arm64_execute();
+        let fat = wrap_fat_arm64_only(&thin);
+        let slice = locate_arm64_slice(&fat).expect("locate");
+        assert!(slice.was_fat);
+        assert_eq!(slice.offset, 32);
+        assert_eq!(usize::try_from(slice.size).unwrap(), thin.len());
+
+        let image = parse_bytes(&fat, "fat-minimal").expect("parse fat");
+        assert!(image.summary.fat);
+        assert_eq!(image.summary.file_slice_offset, 32);
+        assert_eq!(image.summary.cpu, "arm64");
+        assert_eq!(image.summary.entry, parse_bytes(&thin, "thin").unwrap().summary.entry);
+
+        let plan = image.plan(GuestPageSize::Darwin16K);
+        let text = plan
+            .mappings
+            .iter()
+            .find(|m| m.name == "__TEXT")
+            .expect("TEXT");
+        // Thin TEXT fileoff is 0; fat plan must add container offset for map.
+        assert_eq!(text.fileoff, 32);
+    }
+
+    #[test]
+    fn thin_arm64_bytes_accepts_fat_and_thin() {
+        use crate::fixture::wrap_fat_arm64_only;
+
+        let thin = minimal_arm64_execute();
+        let fat = wrap_fat_arm64_only(&thin);
+        assert_eq!(thin_arm64_bytes(&thin).unwrap(), thin.as_slice());
+        assert_eq!(thin_arm64_bytes(&fat).unwrap(), thin.as_slice());
     }
 }

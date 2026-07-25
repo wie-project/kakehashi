@@ -18,6 +18,7 @@ use kh_runtime::GuestMemory;
 use crate::bind::{self, BindSite};
 use crate::error::LoadError;
 use crate::image::MachOImage;
+use crate::parse::thin_arm64_bytes;
 use crate::session::{LoadSession, ProcessImage};
 
 /// `dyld_chained_fixups_header` size in bytes.
@@ -92,16 +93,18 @@ pub fn apply_chained_fixups(
     image_idx: usize,
     bytes: &[u8],
 ) -> Result<usize, LoadError> {
+    // Offsets in LC_DYLD_CHAINED_FIXUPS are thin-relative.
+    let thin = thin_arm64_bytes(bytes)?;
     let preferred_base = session
         .images
         .get(image_idx)
         .map_or(0, ProcessImage::preferred_base);
     let slide = session.images.get(image_idx).map_or(0, ProcessImage::slide);
 
-    let Some((dataoff, datasize)) = chained_linkedit_range(bytes)? else {
+    let Some((dataoff, datasize)) = chained_linkedit_range(thin)? else {
         return Ok(0);
     };
-    let blob = bytes
+    let blob = thin
         .get(dataoff..dataoff.saturating_add(datasize))
         .ok_or_else(|| LoadError::Resolve("chained fixups blob OOB".into()))?;
 
@@ -173,11 +176,12 @@ struct FixupsHeader {
 }
 
 fn chained_linkedit_range(bytes: &[u8]) -> Result<Option<(usize, usize)>, LoadError> {
-    let macho = match Mach::parse(bytes) {
+    let thin = thin_arm64_bytes(bytes)?;
+    let macho = match Mach::parse(thin) {
         Ok(Mach::Binary(m)) => m,
         Ok(Mach::Fat(_)) => {
             return Err(LoadError::NotMachO(
-                "fat image passed to chained helper".into(),
+                "nested fat image inside arm64 slice".into(),
             ));
         }
         Err(err) => return Err(LoadError::NotMachO(err.to_string())),

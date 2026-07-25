@@ -6,9 +6,9 @@ use crate::KH_BOTTLE_MARK_VALUE;
 use crate::sys::{self, SYS_EXIT};
 use crate::trace;
 
-/// C `_exit` → nlist `__exit`.
+/// C `_exit` → nlist `__exit` (Rust name avoids `clippy::used_underscore_items`).
 #[unsafe(export_name = "_exit")]
-pub unsafe extern "C" fn _exit(status: c_int) -> ! {
+pub unsafe extern "C" fn exit_now(status: c_int) -> ! {
     trace::note_size(b"_exit", usize::try_from(status.max(0)).unwrap_or(0));
     let code = u64::from(status.cast_unsigned());
     // SAFETY: Darwin exit.
@@ -22,9 +22,9 @@ pub unsafe extern "C" fn _exit(status: c_int) -> ! {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exit(status: c_int) -> ! {
     trace::note_size(b"exit", usize::try_from(status.max(0)).unwrap_or(0));
-    // SAFETY: forward to `_exit`.
+    // SAFETY: forward to Darwin `_exit`.
     unsafe {
-        _exit(status);
+        exit_now(status);
     }
 }
 

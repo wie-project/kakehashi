@@ -30,16 +30,21 @@
 #![allow(unsafe_code)] // guest C ABI + raw Darwin SVC
 #![allow(clippy::missing_safety_doc)]
 
+mod cxxabi;
 mod errno;
 mod heap;
+mod posix;
 mod process;
+mod pthread;
+mod rtti;
 mod stdio;
+mod string;
 mod sys;
 mod trace;
 
 pub use errno::__error;
 pub use heap::{calloc, free, malloc, realloc};
-pub use process::{_exit, exit, kh_bottle_mark};
+pub use process::{exit, exit_now, kh_bottle_mark};
 pub use stdio::{bzero, memcpy, memmove, memset, printf, puts, strlen, write};
 
 /// Return value of [`kh_bottle_mark`] (fixture / smoke probe).
@@ -55,7 +60,7 @@ fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
     trace::note(b"panic in kh-libsystem\n");
     // SAFETY: never returns.
     unsafe {
-        process::_exit(127);
+        process::exit_now(127);
     }
 }
 

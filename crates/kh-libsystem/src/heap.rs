@@ -44,13 +44,10 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
 /// C `calloc` → nlist `_calloc`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
-    let total = match count.checked_mul(size) {
-        Some(t) => t,
-        None => {
-            errno::set_errno(12);
-            trace::note(b"[kh-libsystem] calloc overflow\n");
-            return core::ptr::null_mut();
-        }
+    let Some(total) = count.checked_mul(size) else {
+        errno::set_errno(12);
+        trace::note(b"[kh-libsystem] calloc overflow\n");
+        return core::ptr::null_mut();
     };
     trace::note_size(b"calloc", total);
     let p = allocate(total);

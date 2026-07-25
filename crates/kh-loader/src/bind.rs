@@ -5,8 +5,6 @@
 //! When an image has no bind opcodes, falls back to nlist → `__got` for the
 //! main executable (Phase 6 fixtures / tools without dyld info).
 
-use std::fs;
-
 use goblin::mach::Mach;
 use goblin::mach::bind_opcodes::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
@@ -25,6 +23,7 @@ use scroll::{Sleb128, Uleb128};
 use crate::error::LoadError;
 use crate::image::{DylibKind, MachOImage};
 use crate::link::{self, build_export_map, fill_exports};
+use crate::parse::{read_thin_arm64, thin_arm64_bytes};
 use crate::session::{ImageLoadStatus, LoadSession, ProcessImage};
 
 /// One pointer write derived from a bind opcode stream.
@@ -73,7 +72,7 @@ pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
         if !mapped || path.as_os_str().is_empty() {
             continue;
         }
-        let bytes = fs::read(&path)?;
+        let bytes = read_thin_arm64(&path)?;
         if crate::chained::bytes_have_chained_fixups(&bytes)? {
             crate::chained::apply_chained_fixups(session, idx, &bytes)?;
             used_any = true;
@@ -98,11 +97,12 @@ pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
 /// Empty when the image has no dyld info or zero-sized bind streams.
 /// Weak-bind is not interpreted yet (Phase 10).
 pub fn collect_bind_sites(bytes: &[u8]) -> Result<Vec<BindSite>, LoadError> {
-    let macho = match Mach::parse(bytes) {
+    let thin = thin_arm64_bytes(bytes)?;
+    let macho = match Mach::parse(thin) {
         Ok(Mach::Binary(m)) => m,
         Ok(Mach::Fat(_)) => {
             return Err(LoadError::NotMachO(
-                "fat image passed to bind helper".into(),
+                "nested fat image inside arm64 slice".into(),
             ));
         }
         Err(err) => return Err(LoadError::NotMachO(err.to_string())),
@@ -116,12 +116,12 @@ pub fn collect_bind_sites(bytes: &[u8]) -> Result<Vec<BindSite>, LoadError> {
     let mut sites = Vec::new();
 
     if cmd.bind_size > 0 {
-        let range = file_range(cmd.bind_off, cmd.bind_size, bytes.len())?;
-        interpret_stream(bytes, range, false, &seg_vmaddrs, &mut sites)?;
+        let range = file_range(cmd.bind_off, cmd.bind_size, thin.len())?;
+        interpret_stream(thin, range, false, &seg_vmaddrs, &mut sites)?;
     }
     if cmd.lazy_bind_size > 0 {
-        let range = file_range(cmd.lazy_bind_off, cmd.lazy_bind_size, bytes.len())?;
-        interpret_stream(bytes, range, true, &seg_vmaddrs, &mut sites)?;
+        let range = file_range(cmd.lazy_bind_off, cmd.lazy_bind_size, thin.len())?;
+        interpret_stream(thin, range, true, &seg_vmaddrs, &mut sites)?;
     }
 
     Ok(sites)
@@ -384,8 +384,9 @@ pub(crate) fn resolve_bind_symbol(
     binder_idx: usize,
     site: &BindSite,
 ) -> Result<u64, LoadError> {
-    // Specials from SET_DYLIB_SPECIAL_IMM are sign-extended to negative i16
-    // (SELF=0, MAIN=-1, FLAT=-2). Positive ordinals are 1-based LC_LOAD_* order.
+    // Specials from SET_DYLIB_SPECIAL_IMM / chained import ordinals are
+    // sign-extended to negative i16 (SELF=0, MAIN=-1, FLAT=-2, WEAK=-3).
+    // Positive ordinals are 1-based LC_LOAD_* order.
     match site.lib_ordinal {
         o if o == i16::from(BIND_SPECIAL_DYLIB_SELF) => {
             lookup_in_image(images.get(binder_idx), &site.name, site.weak)
@@ -398,6 +399,12 @@ pub(crate) fn resolve_bind_symbol(
         -2 => {
             // BIND_SPECIAL_DYLIB_FLAT_LOOKUP
             debug_assert_eq!(BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0xe);
+            lookup_flat(images, &site.name, site.weak)
+        }
+        -3 => {
+            // BIND_SPECIAL_DYLIB_WEAK_LOOKUP (object/macho: -3; not in goblin yet).
+            // Search all loaded images for a definition (weak coalescing). Same
+            // map walk as flat lookup for our micro loader.
             lookup_flat(images, &site.name, site.weak)
         }
         n if n > 0 => {

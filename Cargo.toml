@@ -89,6 +89,11 @@ large_enum_variant = "warn"
 large_stack_arrays = "warn"
 needless_pass_by_value = "warn"
 
+# Freestanding `kh-libsystem` (no_std cdylib) requires abort; host crates are
+# fine with abort too (no `catch_unwind` in the workspace).
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 lto = true
 codegen-units = 1

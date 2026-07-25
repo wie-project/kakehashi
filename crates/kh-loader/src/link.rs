@@ -6,7 +6,6 @@
 //! bind streams.
 
 use std::collections::HashMap;
-use std::fs;
 
 use goblin::mach::Mach;
 use goblin::mach::symbols::{N_EXT, N_SECT, N_TYPE, N_UNDF, N_WEAK_REF};
@@ -15,6 +14,7 @@ use kh_runtime::{mprotect_darwin, mprotect_rw};
 
 use crate::error::LoadError;
 use crate::image::MachOImage;
+use crate::parse::{read_thin_arm64, thin_arm64_bytes};
 use crate::session::{ImageLoadStatus, LoadSession, ProcessImage};
 
 /// Defined external nlist symbol (`N_SECT | N_EXT`, non-STAB).
@@ -92,7 +92,7 @@ pub(crate) fn bind_main_got_nlist(session: &mut LoadSession) -> Result<(), LoadE
         .first()
         .map(|i| i.path.clone())
         .ok_or(LoadError::NotImplemented("main missing before bind"))?;
-    let main_bytes = fs::read(&main_path)?;
+    let main_bytes = read_thin_arm64(&main_path)?;
     let undefs = undefined_imports(&main_bytes)?;
     if undefs.is_empty() {
         return Ok(());
@@ -156,7 +156,7 @@ pub(crate) fn fill_exports(session: &mut LoadSession) -> Result<(), LoadError> {
             img.exports.clear();
             continue;
         }
-        let bytes = fs::read(&img.path)?;
+        let bytes = read_thin_arm64(&img.path)?;
         img.exports = defined_exports(&bytes)?;
     }
     Ok(())
@@ -250,12 +250,13 @@ fn for_each_nlist<F>(bytes: &[u8], mut f: F) -> Result<(), LoadError>
 where
     F: FnMut(&str, goblin::mach::symbols::Nlist),
 {
-    let macho = match Mach::parse(bytes) {
+    // Accept fat containers: reduce to arm64 thin before nlist walk.
+    let thin = thin_arm64_bytes(bytes)?;
+    let macho = match Mach::parse(thin) {
         Ok(Mach::Binary(m)) => m,
         Ok(Mach::Fat(_)) => {
-            // parse_path already thin-slices; bind/export helpers expect thin bytes.
             return Err(LoadError::NotMachO(
-                "fat image passed to nlist helper".into(),
+                "nested fat image inside arm64 slice".into(),
             ));
         }
         Err(err) => return Err(LoadError::NotMachO(err.to_string())),

@@ -2,6 +2,34 @@
 //!
 //! Used by unit tests and to produce checked-in binaries under `tests/fixtures/`.
 
+/// Wraps a thin arm64 Mach-O in a single-arch fat container (big-endian fat header).
+///
+/// Used to regression-test fat → thin load / bind paths (real guests like `7zz`).
+#[must_use]
+pub fn wrap_fat_arm64_only(thin: &[u8]) -> Vec<u8> {
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+    const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
+    // 8-byte fat header + 20-byte arch → pad thin start to 32 for 8-byte align.
+    const SLICE_OFF: usize = 32;
+    const ALIGN_POW2: u32 = 3; // 2^3 = 8
+
+    let thin_size = u32::try_from(thin.len()).unwrap_or(u32::MAX);
+    let mut buf = Vec::with_capacity(SLICE_OFF.saturating_add(thin.len()));
+    buf.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+    buf.extend_from_slice(&1_u32.to_be_bytes()); // nfat_arch
+    buf.extend_from_slice(&CPU_TYPE_ARM64.to_be_bytes());
+    buf.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_be_bytes());
+    buf.extend_from_slice(&u32::try_from(SLICE_OFF).unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(&thin_size.to_be_bytes());
+    buf.extend_from_slice(&ALIGN_POW2.to_be_bytes());
+    while buf.len() < SLICE_OFF {
+        buf.push(0);
+    }
+    buf.extend_from_slice(thin);
+    buf
+}
+
 /// Builds a minimal little-endian `MH_EXECUTE` arm64 Mach-O with custom text.
 ///
 /// Layout:

@@ -2,9 +2,12 @@
 //!
 //! Mapping policy:
 //! - Lengths and host addresses are rounded to the **host** page size.
-//! - Preferred guest VAs are tried first (`MAP_FIXED_NOREPLACE` on Linux);
-//!   on failure the first region is placed by the kernel and a uniform slide
-//!   is applied to the rest.
+//! - Preferred guest VAs are tried first (`MAP_FIXED_NOREPLACE` on Linux).
+//! - On failure, a **contiguous host span** covering the whole image is
+//!   reserved, a uniform slide is derived, and each segment is placed with
+//!   `MAP_FIXED` inside that span. (Placing only the first segment free and
+//!   then `MAP_FIXED_NOREPLACE` neighbours fails on Linux when ASLR put the
+//!   first mapping next to another VMA — common for preferred base `0` dylibs.)
 //! - `__PAGEZERO`-style regions (no access, no file, huge span) are skipped.
 //! - File-backed content is copied into private anonymous pages (simpler than
 //!   partial-page `MAP_PRIVATE` file maps). Executable pages start RW, then
@@ -168,11 +171,15 @@ pub enum MapError {
     PlacementFailed,
 }
 
+/// Upper bound on a single slid reservation (guards sparse / pathological layouts).
+const MAX_SLIDE_SPAN: u64 = 512 * 1024 * 1024; // 512 MiB
+
 impl GuestMemory {
     /// Maps all non-skipped requests into the host address space.
     ///
-    /// Tries preferred addresses first; on failure unmaps and retries with a
-    /// kernel-chosen base for the first region and a uniform slide.
+    /// Tries preferred addresses first; on failure reserves a contiguous host
+    /// span for the whole image and places each segment with a uniform slide
+    /// (guest VA == host VA after placement).
     pub fn map_image(
         host: HostPageSize,
         preferred_base: u64,
@@ -189,8 +196,8 @@ impl GuestMemory {
             });
         }
 
-        // Attempt 1: preferred VAs (slide = 0).
-        match Self::try_map_all(host, preferred_base, 0, &active, file, true) {
+        // Attempt 1: preferred VAs (slide = 0, never clobber host maps).
+        match Self::try_map_all(host, preferred_base, 0, &active, file, FixedMode::NoReplace) {
             Ok(regions) => {
                 return Ok(Self {
                     regions,
@@ -204,20 +211,106 @@ impl GuestMemory {
             }
         }
 
-        // Attempt 2: kernel places first region, then fixed relative slide.
-        // Identity model: guest VA == host VA after placement.
+        // Attempt 2: reserve full image span, slide every segment into it.
+        match Self::try_map_slid_reserved(host, preferred_base, &active, file) {
+            Ok(mem) => return Ok(mem),
+            Err(err) => {
+                tracing::debug!(error = %err, "reserved-span slid map failed; trying first-region slide");
+            }
+        }
+
+        // Attempt 3 (legacy): free-place first region, fixed-relative rest.
+        // Works when the image is a single segment or the kernel left a hole.
+        Self::try_map_slid_first_region(host, preferred_base, &active, file)
+    }
+
+    /// Kernel-chosen contiguous span for the whole image, then `MAP_FIXED` each segment.
+    fn try_map_slid_reserved(
+        host: HostPageSize,
+        preferred_base: u64,
+        active: &[&MapRequest],
+        file: &mut File,
+    ) -> Result<Self, MapError> {
+        let (span_lo, span_hi) = image_preferred_span(host, active)?;
+        let span_len_u64 = span_hi.saturating_sub(span_lo);
+        if span_len_u64 == 0 {
+            return Err(MapError::Invalid("empty image span"));
+        }
+        if span_len_u64 > MAX_SLIDE_SPAN {
+            return Err(MapError::Invalid(
+                "image span too large for slid reservation",
+            ));
+        }
+        let span_len =
+            usize::try_from(span_len_u64).map_err(|_| MapError::Invalid("span too large"))?;
+
+        // Reserve with PROT_NONE so the VA range cannot be stolen before we carve it.
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        let Some(reserve_ptr) = host::mmap(None, span_len, libc::PROT_NONE, flags, -1, 0) else {
+            return Err(MapError::Sys {
+                name: "__RESERVE".into(),
+                source: std::io::Error::last_os_error(),
+            });
+        };
+        let reserve_base = host::ptr_addr_u64(reserve_ptr);
+        let slide = reserve_base.wrapping_sub(span_lo);
+
+        tracing::debug!(
+            span_lo = format_args!("{span_lo:#x}"),
+            span_hi = format_args!("{span_hi:#x}"),
+            reserve = format_args!("{reserve_base:#x}"),
+            slide = format_args!("{slide:#x}"),
+            "reserved contiguous host span for slid image"
+        );
+
+        // Carve segments with MAP_FIXED (replaces PROT_NONE pages in place).
+        match Self::try_map_all(
+            host,
+            preferred_base,
+            slide,
+            active,
+            file,
+            FixedMode::Replace,
+        ) {
+            Ok(regions) => {
+                // Carve-outs leave PROT_NONE residue in gaps; release it so the
+                // address space does not retain untracked maps.
+                unmap_span_gaps(reserve_base, span_len_u64, &regions);
+                Ok(Self {
+                    regions,
+                    slide,
+                    host,
+                    preferred_base,
+                })
+            }
+            Err(err) => {
+                // Successful segment maps were already dropped by `try_map_all`.
+                // Drop any leftover PROT_NONE from the original reservation.
+                // (May no-op for ranges already replaced+dropped.)
+                let _ = host::munmap(reserve_ptr, span_len);
+                Err(err)
+            }
+        }
+    }
+
+    /// Free-place the first region; map the rest at preferred + slide (fixed, no-replace).
+    fn try_map_slid_first_region(
+        host: HostPageSize,
+        preferred_base: u64,
+        active: &[&MapRequest],
+        file: &mut File,
+    ) -> Result<Self, MapError> {
         let first = active
             .first()
             .copied()
             .ok_or(MapError::Invalid("no active regions"))?;
-        let first_map = map_one(host, first, first.preferred_va, file, false)?;
-        // Non-fixed map_one sets guest_addr to the host address it received.
+        let first_map = map_one(host, first, first.preferred_va, file, FixedMode::Free)?;
         let slide = first_map.guest_addr.wrapping_sub(first.preferred_va);
 
         let mut regions = vec![first_map];
         for req in active.iter().skip(1) {
             let target = req.preferred_va.wrapping_add(slide);
-            match map_one(host, req, target, file, true) {
+            match map_one(host, req, target, file, FixedMode::NoReplace) {
                 Ok(region) => regions.push(region),
                 Err(err) => {
                     drop(regions);
@@ -241,7 +334,7 @@ impl GuestMemory {
         slide: u64,
         active: &[&MapRequest],
         file: &mut File,
-        fixed: bool,
+        fixed: FixedMode,
     ) -> Result<Vec<MappedRegion>, MapError> {
         let mut regions = Vec::with_capacity(active.len());
         for req in active {
@@ -400,12 +493,24 @@ impl GuestMemory {
     }
 }
 
+/// How to place a single region relative to a preferred / slid guest VA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedMode {
+    /// Kernel chooses address (`guest_addr` becomes host base).
+    Free,
+    /// Fixed address; do not clobber existing maps (`MAP_FIXED_NOREPLACE` on Linux).
+    NoReplace,
+    /// Fixed address; replace any mapping already at that VA (`MAP_FIXED`).
+    /// Used after a PROT_NONE span reservation so carve-outs succeed.
+    Replace,
+}
+
 fn map_one(
     host: HostPageSize,
     req: &MapRequest,
     target_guest: u64,
     file: &mut File,
-    fixed: bool,
+    mode: FixedMode,
 ) -> Result<MappedRegion, MapError> {
     let host_page = host.bytes();
     let map_len_u64 = PageLayout::align_up(req.vmsize, host_page)
@@ -417,8 +522,11 @@ fn map_one(
     }
 
     let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-    if fixed {
-        flags |= fixed_map_flag();
+    let fixed = matches!(mode, FixedMode::NoReplace | FixedMode::Replace);
+    match mode {
+        FixedMode::Free => {}
+        FixedMode::NoReplace => flags |= host::fixed_map_flag(),
+        FixedMode::Replace => flags |= libc::MAP_FIXED,
     }
 
     // Map RW first so we can fill file content; tighten with mprotect after.
@@ -492,8 +600,71 @@ fn map_one(
     Ok(region)
 }
 
-fn fixed_map_flag() -> libc::c_int {
-    host::fixed_map_flag()
+/// Preferred VA span covering every active segment (host-page aligned ends).
+fn image_preferred_span(
+    host: HostPageSize,
+    active: &[&MapRequest],
+) -> Result<(u64, u64), MapError> {
+    let host_page = host.bytes();
+    let mut lo = u64::MAX;
+    let mut hi = 0_u64;
+    for req in active {
+        lo = lo.min(req.preferred_va);
+        let end = req
+            .preferred_va
+            .checked_add(
+                PageLayout::align_up(req.vmsize, host_page)
+                    .ok_or(MapError::Invalid("vmsize align overflow"))?,
+            )
+            .ok_or(MapError::Invalid("segment end overflow"))?;
+        hi = hi.max(end);
+    }
+    if lo == u64::MAX || hi <= lo {
+        return Err(MapError::Invalid("no span from active segments"));
+    }
+    // Align span start down so MAP_FIXED bases stay host-page aligned when preferred is.
+    let lo = PageLayout::align_down(lo, host_page).unwrap_or(lo);
+    Ok((lo, hi))
+}
+
+/// Best-effort: release PROT_NONE pages left in the reserved span outside mapped segments.
+fn unmap_span_gaps(reserve_base: u64, span_len: u64, regions: &[MappedRegion]) {
+    if span_len == 0 || regions.is_empty() {
+        return;
+    }
+    let span_end = reserve_base.saturating_add(span_len);
+    let mut covered: Vec<(u64, u64)> = regions
+        .iter()
+        .map(|r| {
+            let start = r.guest_addr;
+            let end = start.saturating_add(u64::try_from(r.len).unwrap_or(0));
+            (start, end)
+        })
+        .collect();
+    covered.sort_by_key(|(s, _)| *s);
+
+    let mut cursor = reserve_base;
+    for (start, end) in covered {
+        if start > cursor && start <= span_end {
+            let gap_len = start.saturating_sub(cursor);
+            if let Ok(len) = usize::try_from(gap_len)
+                && len > 0
+            {
+                let ptr = host::u64_as_void_ptr(cursor).cast::<u8>();
+                let _ = host::munmap(ptr, len);
+            }
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < span_end {
+        let gap_len = span_end.saturating_sub(cursor);
+        if let Ok(len) = usize::try_from(gap_len)
+            && len > 0
+        {
+            let ptr = host::u64_as_void_ptr(cursor).cast::<u8>();
+            let _ = host::munmap(ptr, len);
+        }
+    }
 }
 
 /// Converts Darwin `VM_PROT_*` to host `PROT_*`.
@@ -648,5 +819,105 @@ mod tests {
             darwin_to_host_prot(VM_PROT_READ | VM_PROT_EXECUTE),
             libc::PROT_READ | libc::PROT_EXEC
         );
+    }
+
+    /// Real `kh-libsystem` ships with preferred base 0 (`__TEXT` at 0, BSS DATA,
+    /// LINKEDIT). Preferred fixed maps fail on Linux; slid reserved-span must work.
+    #[test]
+    fn map_base0_multi_segment_like_libsystem() {
+        let host = HostPageSize::detect().expect("host page");
+        let page = u64::from(host.bytes());
+        // Layout mirrors staged libSystem.B.dylib (16 KiB TEXT + ~272 KiB DATA BSS + LINKEDIT).
+        let text_sz = page.max(0x4000);
+        let data_sz = 0x4_4000_u64;
+        let link_sz = page.max(0x4000);
+        let text_va = 0_u64;
+        let data_va = text_sz;
+        let link_va = data_va + data_sz;
+
+        let payload = b"base0-text-payload";
+        let (mut file, path) = temp_file_with(payload);
+
+        let reqs = [
+            MapRequest {
+                name: "__TEXT".into(),
+                preferred_va: text_va,
+                vmsize: text_sz,
+                fileoff: 0,
+                filesize: u64::try_from(payload.len()).unwrap(),
+                initprot: VM_PROT_READ | VM_PROT_EXECUTE,
+                maxprot: VM_PROT_READ | VM_PROT_EXECUTE,
+            },
+            MapRequest {
+                name: "__DATA".into(),
+                preferred_va: data_va,
+                vmsize: data_sz,
+                fileoff: 0,
+                filesize: 0,
+                initprot: VM_PROT_READ | VM_PROT_WRITE,
+                maxprot: VM_PROT_READ | VM_PROT_WRITE,
+            },
+            MapRequest {
+                name: "__LINKEDIT".into(),
+                preferred_va: link_va,
+                vmsize: link_sz,
+                fileoff: 0,
+                filesize: 0,
+                initprot: VM_PROT_READ,
+                maxprot: VM_PROT_READ,
+            },
+        ];
+
+        let mem = GuestMemory::map_image(host, 0, &reqs, &mut file).expect("map base0 image");
+        assert_eq!(mem.regions().len(), 3);
+        // Relative layout must be preserved under slide.
+        let text = mem.regions().first().expect("text");
+        let data = mem.regions().get(1).expect("data");
+        let link = mem.regions().get(2).expect("link");
+        assert_eq!(
+            data.guest_addr.wrapping_sub(text.guest_addr),
+            data_va.wrapping_sub(text_va)
+        );
+        assert_eq!(
+            link.guest_addr.wrapping_sub(text.guest_addr),
+            link_va.wrapping_sub(text_va)
+        );
+        let got = text.host_bytes().get(..payload.len()).expect("text bytes");
+        assert_eq!(got, payload);
+        // Preferred base 0 never sticks on Linux; slide may be 0 only if the
+        // kernel actually accepted fixed maps at 0 (rare). Either is fine.
+        let _ = mem.slide();
+        drop(mem);
+        drop(std::fs::remove_file(path));
+    }
+
+    #[test]
+    fn image_span_covers_aligned_ends() {
+        let host = HostPageSize::detect().expect("host page");
+        let page = u64::from(host.bytes());
+        let reqs = [
+            MapRequest {
+                name: "a".into(),
+                preferred_va: 0,
+                vmsize: page,
+                fileoff: 0,
+                filesize: 0,
+                initprot: VM_PROT_READ,
+                maxprot: VM_PROT_READ,
+            },
+            MapRequest {
+                name: "b".into(),
+                preferred_va: page * 2,
+                vmsize: page,
+                fileoff: 0,
+                filesize: 0,
+                initprot: VM_PROT_READ,
+                maxprot: VM_PROT_READ,
+            },
+        ];
+        let refs: Vec<&MapRequest> = reqs.iter().collect();
+        let (lo, hi) = image_preferred_span(host, &refs).expect("span");
+        assert_eq!(lo, 0);
+        assert_eq!(hi, page * 3);
     }
 }

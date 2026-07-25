@@ -3,7 +3,7 @@
 use core::ffi::{c_char, c_int, c_void};
 
 use crate::errno;
-use crate::sys::{self, SYS_WRITE};
+use crate::sys::{self, SYS_READ, SYS_WRITE};
 use crate::trace;
 use crate::{KH_HELPER_PRINTF, KH_HELPER_PUTS};
 
@@ -176,6 +176,157 @@ unsafe fn byte_set(dst: *mut u8, byte: u8, n: usize) {
 #[inline]
 fn ptr_to_u64(p: *const c_void) -> u64 {
     u64::try_from(p.addr()).unwrap_or(0)
+}
+
+// ── stdio FILE* globals (opaque stubs for libc++ / C guests) ────────────────
+
+/// Opaque stand-in for Darwin `FILE` (layout not exposed to guests).
+#[repr(C)]
+struct FileStub {
+    fd: c_int,
+    flags: u32,
+    err: c_int,
+    _pad: [u8; 52],
+}
+
+const FILE_EOF: u32 = 1;
+const FILE_ERR: u32 = 2;
+
+static mut STDIN_FILE: FileStub = FileStub {
+    fd: 0,
+    flags: 0,
+    err: 0,
+    _pad: [0; 52],
+};
+static mut STDOUT_FILE: FileStub = FileStub {
+    fd: 1,
+    flags: 0,
+    err: 0,
+    _pad: [0; 52],
+};
+static mut STDERR_FILE: FileStub = FileStub {
+    fd: 2,
+    flags: 0,
+    err: 0,
+    _pad: [0; 52],
+};
+
+/// `FILE *__stdinp` → nlist `___stdinp`.
+#[unsafe(export_name = "__stdinp")]
+#[used]
+static mut STDINP: *mut FileStub = core::ptr::addr_of_mut!(STDIN_FILE);
+
+/// `FILE *__stdoutp` → nlist `___stdoutp`.
+#[unsafe(export_name = "__stdoutp")]
+#[used]
+static mut STDOUTP: *mut FileStub = core::ptr::addr_of_mut!(STDOUT_FILE);
+
+/// `FILE *__stderrp` → nlist `___stderrp`.
+#[unsafe(export_name = "__stderrp")]
+#[used]
+static mut STDERRP: *mut FileStub = core::ptr::addr_of_mut!(STDERR_FILE);
+
+#[inline]
+unsafe fn as_file(stream: *mut c_void) -> *mut FileStub {
+    stream.cast()
+}
+
+/// C `fileno` → nlist `_fileno`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fileno(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    unsafe { (*as_file(stream)).fd }
+}
+
+/// C `feof` → nlist `_feof`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn feof(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        return 0;
+    }
+    unsafe { i32::from(((*as_file(stream)).flags & FILE_EOF) != 0) }
+}
+
+/// C `ferror` → nlist `_ferror`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ferror(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        return 0;
+    }
+    unsafe { i32::from(((*as_file(stream)).flags & FILE_ERR) != 0) }
+}
+
+/// C `fflush` → nlist `_fflush` (no buffering).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fflush(_stream: *mut c_void) -> c_int {
+    0
+}
+
+/// C `fputc` → nlist `_fputc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fputc(c: c_int, stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    let byte = [u8::try_from(c.cast_unsigned() & 0xff).unwrap_or(0)];
+    let fd = unsafe { (*f).fd };
+    let ret = unsafe { write(fd, byte.as_ptr().cast(), 1) };
+    if ret < 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+            (*f).err = 1;
+        }
+        return -1;
+    }
+    c & 0xff
+}
+
+/// C `fputs` → nlist `_fputs`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fputs(s: *const c_char, stream: *mut c_void) -> c_int {
+    if stream.is_null() || s.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    let n = unsafe { strlen(s) };
+    let fd = unsafe { (*f).fd };
+    let ret = unsafe { write(fd, s.cast(), n) };
+    if ret < 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+        }
+        return -1;
+    }
+    0
+}
+
+/// C `fgetc` → nlist `_fgetc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fgetc(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1; // EOF
+    }
+    let f = unsafe { as_file(stream) };
+    let mut byte = [0_u8; 1];
+    let fd = unsafe { (*f).fd };
+    let fd_u = u64::from(fd.cast_unsigned());
+    let n = unsafe {
+        sys::syscall3(SYS_READ, fd_u, ptr_to_u64(byte.as_mut_ptr().cast()), 1)
+    };
+    if n <= 0 {
+        unsafe {
+            (*f).flags |= FILE_EOF;
+        }
+        return -1; // EOF
+    }
+    c_int::from(byte[0])
 }
 
 #[inline]

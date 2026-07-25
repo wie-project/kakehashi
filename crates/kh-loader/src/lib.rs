@@ -34,7 +34,9 @@ pub use init::{
     InitFunc, S_MOD_INIT_FUNC_POINTERS, collect_mod_init, plan_initializers, run_initializers,
 };
 pub use link::{DefinedSymbol, UndefinedSymbol, defined_exports, undefined_imports};
-pub use parse::{parse_bytes, parse_path};
+pub use parse::{
+    Arm64Slice, locate_arm64_slice, parse_bytes, parse_path, read_thin_arm64, thin_arm64_bytes,
+};
 pub use rebase::{
     S_INTERPOSING, S_LITERAL_POINTERS, S_MOD_TERM_FUNC_POINTERS, is_rebasable_section_type,
     rebase_image, rebase_memory, rebase_process,
