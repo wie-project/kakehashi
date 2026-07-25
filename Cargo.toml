@@ -3,6 +3,14 @@ members = [
     "crates/kh-loader",
     "crates/kh-runtime",
     "crates/kh-cli",
+    # Guest libSystem stubs — Apple Darwin dylib only (not part of Linux CI).
+    "crates/kh-libsystem",
+]
+# Default host/Linux aarch64 build surface (excludes kh-libsystem).
+default-members = [
+    "crates/kh-loader",
+    "crates/kh-runtime",
+    "crates/kh-cli",
 ]
 resolver = "2"
 

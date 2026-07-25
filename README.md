@@ -12,9 +12,10 @@ Userspace **macOS ARM64 → Linux aarch64** translation layer (CLI-first, no JIT
 
 | Crate        | Role                                                               |
 | ------------ | ------------------------------------------------------------------ |
-| `kh-cli`     | Binary `kh` — inspect / run / trace / bottle                       |
-| `kh-loader`  | Mach-O parse, image plan, map session, micro execute               |
-| `kh-runtime` | Page geometry, guest `mmap`, stack, traps, BSD table, bottle       |
+| `kh-cli`       | Binary `kh` — inspect / run / trace / bottle                     |
+| `kh-loader`    | Mach-O parse, image plan, map session, micro execute             |
+| `kh-runtime`   | Page geometry, guest `mmap`, stack, traps, BSD table, bottle     |
+| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` stubs (Apple Darwin only) |
 
 ## Requirements
 
@@ -27,8 +28,12 @@ Userspace **macOS ARM64 → Linux aarch64** translation layer (CLI-first, no JIT
 
 ```bash
 cargo build -p kh-cli
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+# Default members only (Linux host / aarch64). Guest libSystem is separate:
+cargo test --workspace --exclude kh-libsystem
+cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
+
+# Guest libSystem stubs (macOS arm64 dylib → bottle usr/lib/libSystem.B.dylib):
+cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 ```
 
 ```bash
@@ -104,7 +109,8 @@ docker run --rm --entrypoint getconf kakehashi:smoke PAGE_SIZE
 
 # Dev mount (toolchain only)
 docker build -t kakehashi:dev -f Dockerfile.dev .
-docker run --rm -v "$PWD":/src -w /src kakehashi:dev cargo test --workspace
+docker run --rm -v "$PWD":/src -w /src kakehashi:dev \
+  cargo test --workspace --exclude kh-libsystem
 ```
 
 ## License

@@ -1,0 +1,65 @@
+//! License-clean **libSystem** surface for the Kakehashi bottle (`no_std`).
+//!
+//! Guest dylib compiled for **aarch64-apple-darwin**, shipped as
+//! `/usr/lib/libSystem.B.dylib` inside the bottle. Not Apple code; no
+//! proprietary blobs. Build product is `libkh_libsystem.dylib` (rename + set
+//! install name at package time).
+//!
+//! ## Architecture
+//!
+//! * All libSystem / libc C ABI lives **here** — not in `kh-runtime` / `kh-loader`.
+//! * Bodies use Darwin `svc #0x80` (`x16` = BSD number) or Kakehashi host helpers
+//!   (`0x4B48_xxxx`) so `kh-runtime` trap translation can run them on Linux aarch64.
+//! * Trace lines go to guest stderr (fd 2) for `kh run` / `kh trace`.
+//!
+//! ## Build (not part of default Linux workspace build)
+//!
+//! ```bash
+//! rustup target add aarch64-apple-darwin   # when cross-building
+//! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+//! # → target/aarch64-apple-darwin/release/libkh_libsystem.dylib
+//! install_name_tool -id /usr/lib/libSystem.B.dylib \
+//!   target/aarch64-apple-darwin/release/libkh_libsystem.dylib
+//! # ship as usr/lib/libSystem.B.dylib
+//! ```
+//!
+//! Default `cargo test` / `cargo clippy` use workspace `default-members` and
+//! **exclude** this crate. Explicit Linux builds of this package are unsupported
+//! for the product dylib.
+
+#![no_std]
+#![allow(unsafe_code)] // guest C ABI + raw Darwin SVC
+#![allow(clippy::missing_safety_doc)]
+
+mod errno;
+mod heap;
+mod process;
+mod stdio;
+mod sys;
+mod trace;
+
+pub use errno::__error;
+pub use heap::{calloc, free, malloc, realloc};
+pub use process::{_exit, exit, kh_bottle_mark};
+pub use stdio::{bzero, memcpy, memmove, memset, printf, puts, strlen, write};
+
+/// Return value of [`kh_bottle_mark`] (fixture / smoke probe).
+pub const KH_BOTTLE_MARK_VALUE: i32 = 77;
+
+/// Host-helper id for `_puts` (must match `kh_runtime` helpers).
+pub const KH_HELPER_PUTS: u32 = 0x4B48_0001;
+/// Host-helper id for minimal `_printf` (literal format only).
+pub const KH_HELPER_PRINTF: u32 = 0x4B48_0002;
+
+#[panic_handler]
+fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
+    trace::note(b"panic in kh-libsystem\n");
+    // SAFETY: never returns.
+    unsafe {
+        process::_exit(127);
+    }
+}
+
+/// Required when linking freestanding against `libcore`; we never unwind.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_eh_personality() {}

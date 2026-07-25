@@ -17,8 +17,9 @@ COPY scripts ./scripts
 
 RUN rustup component add clippy
 
-RUN cargo clippy --workspace --all-targets -- -D warnings \
-    && cargo test --workspace \
+# `kh-libsystem` is a guest aarch64-apple-darwin dylib; exclude from Linux CI.
+RUN cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings \
+    && cargo test --workspace --exclude kh-libsystem \
     && cargo build -p kh-cli --release
 
 FROM debian:bookworm-slim
