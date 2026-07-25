@@ -14,8 +14,13 @@ Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).
 | ------------ | ---- |
 | **`kakehashi`** | Binary `kh` (install this) |
 | `kh-loader`  | Mach-O parse, map session, execute |
-| `kh-runtime` | Memory, traps, BSD syscalls, bottle |
-| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` (**not** published as a host crate; build for `aarch64-apple-darwin`) |
+| `kh-runtime` | Memory, traps, BSD syscalls, bottle; **embeds** freestanding `libSystem.B.dylib` |
+| `kh-libsystem` | Source for that dylib (build for `aarch64-apple-darwin`; not a Linux host crate) |
+
+The freestanding guest dylib is vendored at
+`crates/kh-runtime/resources/libSystem.B.dylib` and compiled into the runtime
+with `include_bytes!`. Publishing `kh-runtime` to crates.io therefore ships the
+dylib; end users do not need a separate download.
 
 ## Requirements
 
@@ -27,7 +32,7 @@ Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).
 ## Install (global, updatable)
 
 ```bash
-# Once packages are on crates.io:
+# crates.io:
 cargo install kakehashi
 
 # From a git checkout (dev):
@@ -37,14 +42,12 @@ cargo install --path crates/kh-cli
 cargo install kakehashi --force
 ```
 
-Then prepare a bottle (macOS-like root) and optional tools:
+Prepare a bottle (macOS-like root). Freestanding **libSystem is embedded** —
+no separate dylib path required:
 
 ```bash
-# Freestanding libSystem (build on macOS / cross target, ship with your release):
-cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-./scripts/stage-libsystem.sh   # → dist/guest/libSystem.B.dylib
-
-kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+kh bottle ensure
+# → installs embedded libSystem.B.dylib into the bottle
 
 # Optional: install Darwin 7-Zip into the bottle at a *real* macOS path
 kh install 7zip
@@ -89,21 +92,26 @@ cargo build -p kakehashi --release
 cargo test --workspace --exclude kh-libsystem
 cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
 
-# Guest libSystem (on macOS arm64, or with the apple-darwin target available)
+# Guest libSystem (maintainers: refresh crates.io embed after API changes)
 cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-./scripts/stage-libsystem.sh   # → dist/guest/libSystem.B.dylib
+./scripts/stage-libsystem.sh
+# → dist/guest/libSystem.B.dylib
+# → crates/kh-runtime/resources/libSystem.B.dylib  (commit before publish)
 ```
 
 ### Bottle (macOS-like root for the guest)
 
 ```bash
+kh bottle ensure                         # uses embedded dylib (crates.io path)
+# or override with a just-built tree:
 kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
 kh bottle status
 kh bottle destroy --yes
 ```
 
 Discovery for `libSystem`: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next
-to `kh` → `target/.../libkh_libsystem.dylib` → `dist/guest/libSystem.B.dylib`.
+to `kh` → `dist/guest/` / `target/…` / crate `resources/` → **embedded** bytes
+in `kh-runtime`.
 
 ### Guest tools (`kh install`)
 
@@ -165,15 +173,14 @@ When `kh` runs in Docker, the bottle bridges the Linux filesystem as
 product focus.
 
 ```bash
-kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+kh bottle ensure
 kh install 7zip
 kh run 7zz -- a /tmp/demo.7z ./README.md
 ```
 
-**Docker helper** (dev loop):
+**Docker helper** (dev loop; uses embedded libSystem unless you staged a rebuild):
 
 ```bash
-./scripts/stage-libsystem.sh
 ./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z \
   /Volumes/linux/src/README.md
 ls -lh .tmp/kh-out/demo.7z
@@ -194,7 +201,6 @@ compressors write archives that are **copied to the host** so you can inspect
 them.
 
 ```bash
-./scripts/stage-libsystem.sh
 ./scripts/bench-fair-local.sh                 # 200 MiB, mx=5, mmt=2
 SIZE_MB=64 MMT=1 ./scripts/bench-fair-local.sh
 KAKEHASHI_HYPERCALL=0 ./scripts/bench-fair-local.sh
@@ -258,7 +264,8 @@ hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
 
 | Script | Purpose |
 | ------ | ------- |
-| `scripts/stage-libsystem.sh` | Copy built guest dylib → `dist/guest/libSystem.B.dylib` |
+| `scripts/stage-libsystem.sh` | Build product → `dist/guest/` **and** `crates/kh-runtime/resources/` (crates.io embed) |
+| `scripts/install-linux.sh` | Local `cargo build` + install `kh` + `bottle ensure` |
 | `scripts/docker-smoke.sh` | Reproducible smoke suite inside `Dockerfile` image |
 | `scripts/docker-7zz.sh` | Interactive/ad-hoc Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
 | `scripts/bench-fair-local.sh` | Timed native vs kh compress; artifacts → `.tmp/kh-bench-fair` |

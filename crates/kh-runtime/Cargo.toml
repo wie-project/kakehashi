@@ -12,6 +12,10 @@ description = "Kakehashi native ARM64 execution context, memory layout, traps, a
 readme = "../../README.md"
 keywords = ["macos", "darwin", "arm64", "syscalls"]
 categories = ["emulators", "os"]
+# Freestanding guest libSystem is vendored under resources/ and embedded via
+# include_bytes! so crates.io packages can `kh bottle ensure` without a separate
+# dylib. Refresh with: ./scripts/stage-libsystem.sh
+# (Cargo packages this path by default; do not add exclude patterns that drop it.)
 
 [dependencies]
 thiserror.workspace = true

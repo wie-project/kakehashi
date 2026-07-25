@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Stage guest libSystem for bottle install / release tarballs.
+# Stage freestanding guest libSystem for bottle install and crates.io.
 #
-# Two workflows this supports:
+# Workflow (on macOS arm64, or with aarch64-apple-darwin target):
+#   cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+#   ./scripts/stage-libsystem.sh
 #
-# 1) From source (on macOS arm64, or cross aarch64-apple-darwin):
-#      cargo build -p kh-libsystem --release
-#      # or: cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-#      ./scripts/stage-libsystem.sh
-#    → dist/guest/libSystem.B.dylib  (LC_ID_DYLIB = /usr/lib/libSystem.B.dylib)
+# Outputs:
+#   1) dist/guest/libSystem.B.dylib
+#        Dev / Docker override path (`kh bottle ensure --libsystem …`).
+#   2) crates/kh-runtime/resources/libSystem.B.dylib
+#        Vendored into the kh-runtime crate and `include_bytes!`-embedded so
+#        crates.io packages can `cargo install kakehashi` + `kh bottle ensure`
+#        without a separate dylib download. Commit this file when it changes.
 #
-# 2) Release layout next to the Linux `kh` binary:
-#      kakehashi-*-linux-aarch64/
-#        bin/kh
-#        lib/kakehashi/libSystem.B.dylib   # copy staged file here
-#    Then on the Linux host:
-#      ./bin/kh bottle create
-#    auto-discovers ../lib/kakehashi/libSystem.B.dylib relative to the binary.
+# Optional env:
+#   SOURCE=…     path to libkh_libsystem.dylib (auto-detected otherwise)
+#   OUT_DIR=…    staged dist path (default: <repo>/dist/guest)
+#   EMBED=0      skip updating crates/kh-runtime/resources/ (dist only)
 #
-# Requires: a built libkh_libsystem.dylib (or pass SOURCE=).
-# install_name_tool is optional — `kh bottle create` rewrites LC_ID_DYLIB itself.
+# install_name_tool is optional — `kh bottle create|ensure` rewrites LC_ID_DYLIB.
 
 set -euo pipefail
 
@@ -26,7 +26,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 OUT_DIR="${OUT_DIR:-$ROOT/dist/guest}"
+EMBED_DIR="$ROOT/crates/kh-runtime/resources"
 SOURCE="${SOURCE:-}"
+EMBED="${EMBED:-1}"
 
 if [[ -z "$SOURCE" ]]; then
   for cand in \
@@ -43,27 +45,42 @@ fi
 
 if [[ -z "${SOURCE}" || ! -f "$SOURCE" ]]; then
   echo "error: no libkh_libsystem.dylib found." >&2
-  echo "  cargo build -p kh-libsystem --release [--target aarch64-apple-darwin]" >&2
+  echo "  cargo build -p kh-libsystem --release --target aarch64-apple-darwin" >&2
   echo "  or: SOURCE=/path/to/libkh_libsystem.dylib $0" >&2
   exit 1
 fi
 
-mkdir -p "$OUT_DIR"
-DEST="$OUT_DIR/libSystem.B.dylib"
-cp -f "$SOURCE" "$DEST"
+stage_one() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  cp -f "$SOURCE" "$dest"
+  if command -v install_name_tool >/dev/null 2>&1; then
+    install_name_tool -id /usr/lib/libSystem.B.dylib "$dest"
+  fi
+  chmod 755 "$dest" 2>/dev/null || true
+}
 
-if command -v install_name_tool >/dev/null 2>&1; then
-  install_name_tool -id /usr/lib/libSystem.B.dylib "$DEST"
-  echo "staged $DEST (install_name_tool id set)"
-else
-  echo "staged $DEST (LC_ID will be rewritten by kh bottle create)"
+DEST_DIST="$OUT_DIR/libSystem.B.dylib"
+stage_one "$DEST_DIST"
+echo "staged $DEST_DIST"
+
+if [[ "$EMBED" != "0" ]]; then
+  DEST_EMBED="$EMBED_DIR/libSystem.B.dylib"
+  stage_one "$DEST_EMBED"
+  echo "staged $DEST_EMBED  (crates.io embed — commit when shipping)"
 fi
 
 if command -v otool >/dev/null 2>&1; then
-  otool -D "$DEST" || true
+  otool -D "$DEST_DIST" || true
+elif command -v install_name_tool >/dev/null 2>&1; then
+  :
+else
+  echo "note: LC_ID will be rewritten by kh bottle create|ensure"
 fi
 
-echo "copy into a release tree as:"
-echo "  lib/kakehashi/libSystem.B.dylib"
-echo "or pass:"
-echo "  kh bottle create --libsystem $DEST"
+echo
+echo "Dev / override:"
+echo "  kh bottle ensure --libsystem $DEST_DIST"
+echo "crates.io / cargo install (uses embedded resources/ after rebuild):"
+echo "  cargo publish -p kh-runtime   # includes resources/libSystem.B.dylib"
+echo "  cargo install kakehashi && kh bottle ensure"

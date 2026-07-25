@@ -48,7 +48,8 @@ pub(crate) fn resolve_root(cli_root: Option<&std::path::Path>) -> Option<std::pa
     if let Ok(Some(p)) = kh_runtime::active_root() {
         return Some(p);
     }
-    // First-run convenience: create managed bottle if libSystem can be found.
+    // First-run convenience: create managed bottle (embedded freestanding
+    // libSystem is enough; no separate dylib on disk required).
     match kh_runtime::ensure_bottle(&kh_runtime::CreateOptions {
         path: None,
         libsystem: None,

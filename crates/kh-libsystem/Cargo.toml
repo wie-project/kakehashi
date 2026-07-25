@@ -9,8 +9,9 @@ repository.workspace = true
 description = "License-clean libSystem.B.dylib stubs for the Kakehashi bottle (not Apple code)"
 publish = false
 
-# Crate name must be a valid Rust identifier. Ship as `libSystem.B.dylib` after
-# rename + `install_name_tool -id /usr/lib/libSystem.B.dylib`.
+# Crate name must be a valid Rust identifier. Not published (`publish = false`).
+# Build product is renamed/id-patched by `./scripts/stage-libsystem.sh` into
+# `dist/guest/` and the crates.io embed `crates/kh-runtime/resources/`.
 [lib]
 name = "kh_libsystem"
 crate-type = ["cdylib"]

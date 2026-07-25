@@ -150,12 +150,17 @@ fn print_create_result(
     } else if skip_libsystem {
         println!("  libSystem: skipped (--skip-libsystem)");
     } else {
+        // Should not happen once resources/libSystem.B.dylib is packaged;
+        // keep recovery hints for stripped/custom builds.
         println!("  libSystem: not found (bottle skeleton only)");
-        println!("    build:  cargo build -p kh-libsystem --release");
-        println!("    stage:  ./scripts/stage-libsystem.sh");
-        println!("    or:     kh bottle ensure --libsystem /path/to/libSystem.B.dylib");
+        println!("    expected: freestanding dylib embedded in kh-runtime");
         println!(
-            "    or:     place libSystem.B.dylib next to `kh` / set {env}",
+            "    rebuild:  cargo build -p kh-libsystem --release --target aarch64-apple-darwin"
+        );
+        println!("    stage:    ./scripts/stage-libsystem.sh  # → resources/ + dist/guest/");
+        println!("    or:       kh bottle ensure --libsystem /path/to/libSystem.B.dylib");
+        println!(
+            "    or:       place libSystem.B.dylib next to `kh` / set {env}",
             env = bottle::ENV_LIBSYSTEM
         );
     }
@@ -167,7 +172,7 @@ fn origin_str(o: LibsystemOrigin) -> &'static str {
         LibsystemOrigin::Env => "env",
         LibsystemOrigin::Adjacent => "adjacent",
         LibsystemOrigin::DevTarget => "dev_target",
-        LibsystemOrigin::Embedded => "embedded (crates.io auto-deploy)",
+        LibsystemOrigin::Embedded => "embedded (crates.io)",
     }
 }
 

@@ -8,8 +8,10 @@
 #   and a handful of syscalls. Archives are *copied out* to the host at the end.
 #
 # Prerequisites (macOS arm64 + Colima, from repo root):
-#   ./scripts/stage-libsystem.sh
 #   docker build -t kakehashi:dev -f Dockerfile.dev .
+#   # optional: rebuild freestanding libSystem + crates.io embed
+#   # cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+#   # ./scripts/stage-libsystem.sh
 #
 # Usage:
 #   ./scripts/bench-fair-local.sh              # 200 MiB, mx=5, mmt=2
@@ -43,8 +45,12 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 
 mkdir -p "$OUT/bin" "$OUT/artifacts"
 
+# Optional refresh of dist/guest when a just-built dylib is present.
 if [[ ! -f dist/guest/libSystem.B.dylib ]]; then
-  ./scripts/stage-libsystem.sh
+  if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
+    || [[ -f target/release/libkh_libsystem.dylib ]]; then
+    ./scripts/stage-libsystem.sh
+  fi
 fi
 
 if [[ ! -x "$OUT/bin/7zz" ]]; then

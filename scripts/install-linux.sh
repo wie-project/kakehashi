@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Dev helper: build from a git checkout and run `kh bottle ensure`.
 #
-# Preferred global install (crates.io, once published):
+# Preferred global install (crates.io):
 #   cargo install kakehashi
-#   kh bottle ensure --libsystem /path/to/libSystem.B.dylib
-#   kh install 7zip    # optional guest tool into bottle /usr/local/bin
+#   kh bottle ensure          # freestanding libSystem is embedded in kh-runtime
+#   kh install 7zip           # optional guest tool into bottle /usr/local/bin
 #
 # This script is for local trees only (not a substitute for cargo install).
 set -euo pipefail
@@ -22,9 +22,12 @@ echo "==> install → $BIN_DIR/kh"
 mkdir -p "$BIN_DIR"
 install -m 755 target/release/kh "$BIN_DIR/kh"
 
+# Prefer a just-built / staged dylib when present; otherwise bottle ensure uses
+# the freestanding bytes embedded in kh-runtime (crates.io path).
 LIBARGS=()
 for cand in \
   dist/guest/libSystem.B.dylib \
+  crates/kh-runtime/resources/libSystem.B.dylib \
   target/aarch64-apple-darwin/release/libkh_libsystem.dylib
 do
   if [[ -f "$cand" ]]; then
@@ -42,4 +45,4 @@ echo "  kh bottle status"
 echo "  kh install 7zip          # optional: Darwin 7zz → /usr/local/bin in bottle"
 echo "  kh run 7zz -- a /tmp/x.7z ./file"
 echo
-echo "crates.io (when published):  cargo install kakehashi"
+echo "crates.io:  cargo install kakehashi && kh bottle ensure"

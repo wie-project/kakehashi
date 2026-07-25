@@ -1,4 +1,9 @@
 //! Create / destroy / query the single Kakehashi bottle.
+//!
+//! Guest `libSystem.B.dylib` is installed from disk discovery first, then from
+//! the freestanding dylib **embedded** in this crate (`resources/libSystem.B.dylib`).
+//! That file is published on crates.io with `kh-runtime`, so
+//! `cargo install kakehashi` → `kh bottle ensure` needs no separate dylib.
 
 use std::path::{Path, PathBuf};
 
@@ -8,6 +13,9 @@ use super::layout;
 use super::libsystem::{self, LibsystemInstall, LibsystemOrigin};
 use super::registry;
 
+/// Freestanding guest libSystem shipped with this crate (crates.io / cargo install).
+///
+/// Refresh after rebuilding `kh-libsystem` with `./scripts/stage-libsystem.sh`.
 static EMBEDDED_LIBSYSTEM: &[u8] = include_bytes!("../../resources/libSystem.B.dylib");
 
 /// Bottle management errors.
@@ -87,10 +95,9 @@ pub struct CreateResult {
 /// registry entry (path missing) is cleared automatically so create can proceed.
 ///
 /// After the skeleton is written, installs guest `libSystem.B.dylib` when a
-/// source is discovered (see [`libsystem::discover`]) unless
-/// [`CreateOptions::skip_libsystem`] is set. An explicit `--libsystem` path that
-/// does not exist is an error; a missing auto-discovered source is not (the
-/// bottle is still usable for path tests without dylibs).
+/// source is discovered (see [`libsystem::discover`]) or from the crate-embedded
+/// freestanding dylib, unless [`CreateOptions::skip_libsystem`] is set.
+/// An explicit `--libsystem` path that does not exist is an error.
 pub fn create(path: Option<&Path>) -> Result<CreateResult, BottleError> {
     create_with(&CreateOptions {
         path,
@@ -169,21 +176,14 @@ fn install_libsystem_for_create(
         return Ok(Some(libsystem::install(target, &src, origin)?));
     }
 
-    // ========================================================
-    // НАШ ФИНАЛЬНЫЙ РЕЛИЗНЫЙ FALLBACK ДЛЯ CRATES.IO
-    // Если на машине пользователя вообще ничего не нашлось, но байты вшиты
+    // crates.io / cargo install: freestanding dylib is vendored in this crate.
     if !EMBEDDED_LIBSYSTEM.is_empty() {
-        let tmp_src = std::env::temp_dir().join("kakehashi_embedded_libsystem.dylib");
-
-        std::fs::write(&tmp_src, EMBEDDED_LIBSYSTEM)?;
-
-        let install_result = libsystem::install(target, &tmp_src, LibsystemOrigin::Embedded);
-
-        drop(std::fs::remove_file(tmp_src));
-
-        return Ok(Some(install_result?));
+        return Ok(Some(libsystem::install_bytes(
+            target,
+            EMBEDDED_LIBSYSTEM,
+            LibsystemOrigin::Embedded,
+        )?));
     }
-    // ========================================================
 
     Ok(None)
 }
@@ -245,11 +245,12 @@ pub fn active_root() -> Result<Option<PathBuf>, BottleError> {
 
 /// Idempotent bottle setup: create when missing, refresh libSystem when present.
 ///
-/// Intended for Docker/dev loops so you never hand-assemble `.tmp-bottle` trees:
-///
 /// ```text
+/// # After cargo install kakehashi (uses embedded freestanding libSystem):
+/// kh bottle ensure
+///
+/// # Dev: override with a just-built dylib
 /// kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
-/// kh run tests/clang-probe/7zz.bin -- --help   # uses registered bottle
 /// ```
 ///
 /// * Valid registered bottle → reinstalls libSystem (unless `skip_libsystem`).

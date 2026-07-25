@@ -1,17 +1,22 @@
 //! Install guest `libSystem.B.dylib` into a bottle.
 //!
-//! Two supported layouts (discovery order below):
+//! Discovery / install order used by `kh bottle create|ensure`:
 //!
-//! 1. **From source** — build the freestanding dylib on macOS / Apple target:
-//!    `cargo build -p kh-libsystem --release [--target aarch64-apple-darwin]`,
-//!    then `kh bottle create` finds `target/.../libkh_libsystem.dylib` (or the
-//!    copy next to a just-built `kh` in `target/debug/`).
-//! 2. **From a release tarball** — ship `kh` (Linux aarch64) next to a
-//!    prebuilt guest dylib under `lib/kakehashi/` (or beside the binary).
-//!    Install name may already be `/usr/lib/libSystem.B.dylib` or still
-//!    `@rpath/libkh_libsystem.dylib`; create rewrites the id if needed.
+//! 1. **`--libsystem PATH`** / explicit argument
+//! 2. **`KAKEHASHI_LIBSYSTEM`**
+//! 3. Paths next to the running `kh` binary (release layout:
+//!    `lib/kakehashi/libSystem.B.dylib`, …)
+//! 4. Workspace / dev trees: `dist/guest/`, Cargo `target/…`, and the
+//!    vendored crate resource `crates/kh-runtime/resources/libSystem.B.dylib`
+//! 5. **Embedded bytes** shipped inside `kh-runtime` (`resources/libSystem.B.dylib`
+//!    on crates.io) — so `cargo install kakehashi` works with only
+//!    `kh bottle ensure` and no separate dylib download
 //!
-//! Explicit override: `--libsystem PATH` or `KAKEHASHI_LIBSYSTEM`.
+//! Build / refresh the freestanding dylib (macOS or cross target):
+//! ```text
+//! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+//! ./scripts/stage-libsystem.sh   # → dist/guest + resources/ (crates.io embed)
+//! ```
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +32,9 @@ pub const GUEST_LIBSYSTEM_ID: &str = "/usr/lib/libSystem.B.dylib";
 /// Env var for an explicit source dylib (release unpack or custom path).
 pub const ENV_LIBSYSTEM: &str = "KAKEHASHI_LIBSYSTEM";
 
+/// Synthetic `LibsystemInstall::source` when bytes came from the crate embed.
+pub const EMBEDDED_SOURCE_LABEL: &str = "<embedded>";
+
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const LC_ID_DYLIB: u32 = 0xd;
 
@@ -39,15 +47,17 @@ pub enum LibsystemOrigin {
     Env,
     /// Next to the `kh` binary (release layout or `target/debug/kh`).
     Adjacent,
-    /// Workspace `target/` outputs under the current working directory.
+    /// Workspace `target/` / `dist/guest` / crate `resources/` under cwd.
     DevTarget,
+    /// Bytes compiled into `kh-runtime` (crates.io / `cargo install` path).
     Embedded,
 }
 
 /// Result of installing libSystem into a bottle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibsystemInstall {
-    /// Host path of the source dylib that was copied.
+    /// Host path of the source dylib that was copied, or
+    /// [`EMBEDDED_SOURCE_LABEL`] when installed from the crate embed.
     pub source: PathBuf,
     /// Absolute path of `{bottle}/usr/lib/libSystem.B.dylib`.
     pub dest: PathBuf,
@@ -57,13 +67,16 @@ pub struct LibsystemInstall {
     pub id_rewritten: bool,
 }
 
-/// Discovers a guest libSystem dylib for bottle install.
+/// Discovers a guest libSystem dylib **file** for bottle install.
+///
+/// Does not cover the compile-time embed — that is handled by bottle create
+/// after this returns `None` (see `manage`).
 ///
 /// Order:
 /// 1. `explicit` argument
 /// 2. `KAKEHASHI_LIBSYSTEM`
 /// 3. Paths relative to the running `kh` executable (release layout)
-/// 4. Common Cargo `target/` outputs under the current working directory
+/// 4. Common Cargo / staged paths under the current working directory
 #[must_use]
 pub fn discover(explicit: Option<&Path>) -> Option<(PathBuf, LibsystemOrigin)> {
     if let Some(p) = explicit {
@@ -105,12 +118,33 @@ pub fn install(
         )));
     }
 
+    let bytes = fs::read(source)?;
+    let mut result = install_bytes(root, &bytes, origin)?;
+    result.source = source.to_path_buf();
+    Ok(result)
+}
+
+/// Writes raw Mach-O bytes into `{root}/usr/lib/libSystem.B.dylib`, rewriting
+/// `LC_ID_DYLIB` when needed. Used for the crates.io-embedded freestanding
+/// dylib and by [`install`] after reading a file.
+pub fn install_bytes(
+    root: &Path,
+    source_bytes: &[u8],
+    origin: LibsystemOrigin,
+) -> Result<LibsystemInstall, BottleError> {
+    if source_bytes.is_empty() {
+        return Err(BottleError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "libSystem source is empty",
+        )));
+    }
+
     let dest = root.join(GUEST_LIBSYSTEM_REL);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut bytes = fs::read(source)?;
+    let mut bytes = source_bytes.to_vec();
     let id_rewritten = ensure_libsystem_id(&mut bytes)?;
     fs::write(&dest, &bytes)?;
 
@@ -125,7 +159,7 @@ pub fn install(
     }
 
     Ok(LibsystemInstall {
-        source: source.to_path_buf(),
+        source: PathBuf::from(EMBEDDED_SOURCE_LABEL),
         dest,
         origin,
         id_rewritten,
@@ -176,6 +210,9 @@ fn discover_under_workspace(base: &Path) -> Option<PathBuf> {
     let dirs = [
         // Staged guest install name (`scripts/stage-libsystem.sh`).
         "dist/guest",
+        // Vendored crates.io embed (same bytes as `include_bytes!` in manage).
+        "crates/kh-runtime/resources",
+        "resources",
         "target/release",
         "target/debug",
         "target/aarch64-apple-darwin/release",
@@ -433,12 +470,29 @@ mod tests {
         let inst = install(&root, &src, LibsystemOrigin::Explicit).expect("install");
         assert!(inst.id_rewritten);
         assert_eq!(inst.dest, root.join(GUEST_LIBSYSTEM_REL));
+        assert_eq!(inst.source, src);
         assert!(inst.dest.is_file());
         let on_disk = fs::read(&inst.dest).expect("read dest");
         assert_eq!(read_id(&on_disk), GUEST_LIBSYSTEM_ID);
 
         drop(fs::remove_dir_all(&root));
         drop(fs::remove_dir_all(&src_dir));
+    }
+
+    #[test]
+    fn install_bytes_sets_embedded_label() {
+        let root = temp_dir("bytes");
+        super::super::layout::materialize(&root).expect("materialize");
+        let raw = minimal_dylib("@rpath/libkh_libsystem.dylib");
+        let inst = install_bytes(&root, &raw, LibsystemOrigin::Embedded).expect("install_bytes");
+        assert_eq!(inst.source, PathBuf::from(EMBEDDED_SOURCE_LABEL));
+        assert_eq!(inst.origin, LibsystemOrigin::Embedded);
+        assert!(inst.id_rewritten);
+        assert_eq!(
+            read_id(&fs::read(&inst.dest).expect("read")),
+            GUEST_LIBSYSTEM_ID
+        );
+        drop(fs::remove_dir_all(&root));
     }
 
     #[test]

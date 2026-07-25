@@ -2,8 +2,8 @@
 # Run Darwin 7zz (tests/clang-probe/7zz.bin) under kh inside Linux aarch64
 # Docker/Colima.
 #
-# Uses a project-local bottle under .kh/ (gitignored). Guest libSystem comes
-# from dist/guest/ after scripts/stage-libsystem.sh.
+# Uses a project-local bottle under .kh/ (gitignored). Guest libSystem is
+# embedded in kh-runtime; optional override via dist/guest after stage-libsystem.
 #
 # Path map (this is the bit people miss)
 # --------------------------------------
@@ -18,7 +18,6 @@
 # default) or under /Volumes/linux/src/.tmp/….
 #
 # Usage:
-#   ./scripts/stage-libsystem.sh
 #   ./scripts/docker-7zz.sh --help
 #   ./scripts/docker-7zz.sh h /Volumes/linux/src/README.md
 #
@@ -29,6 +28,10 @@
 #   # Or under the repo tree (also host-visible):
 #   ./scripts/docker-7zz.sh a /Volumes/linux/src/.tmp/demo.7z \
 #       /Volumes/linux/src/README.md
+#
+# Optional: rebuild freestanding libSystem + refresh crates.io embed:
+#   cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+#   ./scripts/stage-libsystem.sh
 #
 # Extra env:
 #   KAKEHASHI_SMOKE_IMAGE  docker image (default: kakehashi:dev)
@@ -56,12 +59,16 @@ GUEST_ARGS=("$@")
 
 mkdir -p "$KH_OUT"
 
+# Prefer a freshly staged dylib when the developer just rebuilt kh-libsystem;
+# otherwise bottle ensure falls back to the crate-embedded resources/ dylib.
 if [[ ! -f dist/guest/libSystem.B.dylib ]]; then
   if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
     || [[ -f target/release/libkh_libsystem.dylib ]]; then
     ./scripts/stage-libsystem.sh
+  elif [[ -f crates/kh-runtime/resources/libSystem.B.dylib ]]; then
+    echo "note: using embedded crates/kh-runtime/resources/libSystem.B.dylib"
   else
-    echo "error: no staged guest libSystem." >&2
+    echo "error: no guest libSystem (need resources/ embed or a built dylib)." >&2
     echo "  cargo build -p kh-libsystem --release --target aarch64-apple-darwin" >&2
     echo "  ./scripts/stage-libsystem.sh" >&2
     exit 1
