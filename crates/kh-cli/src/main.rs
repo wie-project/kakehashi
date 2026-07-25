@@ -15,8 +15,8 @@ use tracing_subscriber::EnvFilter;
 #[command(long_about = "\
 Userspace macOS translation layer for Linux ARM64 (no JIT).\n\
 \n\
-Commands: inspect | run | trace.\n\
-Env: KAKEHASHI_LOG, KAKEHASHI_ROOT.\
+Commands: inspect | run | trace | bottle.\n\
+Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR.\
 ")]
 struct Cli {
     /// Increase log verbosity (repeatable). Overrides `KAKEHASHI_LOG` when set.
@@ -115,6 +115,35 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         guest_args: Vec<String>,
     },
+
+    /// Manage the single macOS-like bottle (create / destroy / status).
+    Bottle {
+        #[command(subcommand)]
+        action: BottleAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BottleAction {
+    /// Create the bottle (fails if one is already registered).
+    Create {
+        /// Bottle directory (default: `$XDG_DATA_HOME/kakehashi/bottle`).
+        ///
+        /// The directory name is arbitrary — rename freely; the registry stores
+        /// the absolute path.
+        #[arg(long, short = 'p')]
+        path: Option<PathBuf>,
+    },
+    /// Delete the registered bottle (prompts for y/N unless `--yes`).
+    Destroy {
+        /// Skip interactive confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Print the registered bottle path.
+    Path,
+    /// Show bottle registration status.
+    Status,
 }
 
 fn init_tracing(verbose: u8) {
@@ -198,5 +227,16 @@ fn run() -> Result<()> {
             guest_args: &guest_args,
             json: cli.json,
         }),
+        Command::Bottle { action } => {
+            let cmd = match &action {
+                BottleAction::Create { path } => commands::bottle::BottleCmd::Create {
+                    path: path.as_deref(),
+                },
+                BottleAction::Destroy { yes } => commands::bottle::BottleCmd::Destroy { yes: *yes },
+                BottleAction::Path => commands::bottle::BottleCmd::Path,
+                BottleAction::Status => commands::bottle::BottleCmd::Status,
+            };
+            commands::bottle::run(&cmd, cli.json)
+        }
     }
 }

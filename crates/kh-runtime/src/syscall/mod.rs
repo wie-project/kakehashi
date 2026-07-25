@@ -94,14 +94,12 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use super::common::{guest_read_i32, guest_read_u64, guest_slice, guest_write};
+    use super::mem_sys::{DARWIN_MAP_ANON, DARWIN_MAP_PRIVATE, DARWIN_MAP_SHARED, host_page_size};
     use super::*;
     use crate::mem::{
         HostPageSize, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, map_stack, register_borrowed,
         registry_clear,
-    };
-    use super::common::{guest_read_i32, guest_read_u64, guest_slice, guest_write};
-    use super::mem_sys::{
-        DARWIN_MAP_ANON, DARWIN_MAP_PRIVATE, DARWIN_MAP_SHARED, host_page_size,
     };
     use std::io::Write;
 

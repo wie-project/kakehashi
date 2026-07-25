@@ -547,11 +547,7 @@ pub fn map_stack(host: HostPageSize, size: u64) -> Result<MappedRegion, MapError
 
 /// Temporarily makes a region read/write (for SVC patching).
 pub fn mprotect_rw(region: &MappedRegion) -> Result<(), MapError> {
-    if host::mprotect(
-        region.ptr,
-        region.len,
-        libc::PROT_READ | libc::PROT_WRITE,
-    ) {
+    if host::mprotect(region.ptr, region.len, libc::PROT_READ | libc::PROT_WRITE) {
         Ok(())
     } else {
         Err(MapError::Sys {

@@ -171,7 +171,10 @@ impl AddressSpace {
     ///
     /// Borrowed regions are removed from tracking **without** `munmap`.
     pub fn remove_range(&mut self, addr: u64, len: usize) -> RemoveOutcome {
-        let idx = self.regions.iter().position(|r| r.contains_range(addr, len));
+        let idx = self
+            .regions
+            .iter()
+            .position(|r| r.contains_range(addr, len));
         let Some(i) = idx else {
             return RemoveOutcome::NotFound;
         };

@@ -1,7 +1,7 @@
 //! Darwin BSD thread syscalls: `bsdthread_*` / `thread_selfid`.
 
-use crate::process::{BsdThreadReg, ProcessState};
 use crate::process as proc_state;
+use crate::process::{BsdThreadReg, ProcessState};
 use crate::thread::{self, GuestThreadStart};
 
 use super::common::{EINVAL, ENOSYS, SyscallArgs, SyscallResult, reg_as_i32};
@@ -103,8 +103,8 @@ pub(crate) fn handle_thread_selfid() -> SyscallResult {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::syscall::{SyscallArgs, reset_syscall_state};
     use crate::process as proc_state;
+    use crate::syscall::{SyscallArgs, reset_syscall_state};
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         proc_state::test_lock()

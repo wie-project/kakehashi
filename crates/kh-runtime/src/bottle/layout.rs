@@ -1,0 +1,192 @@
+//! macOS-like filesystem skeleton for a bottle root.
+//!
+//! Mirrors the directory tree a fresh macOS install presents at `/`, without
+//! shipping proprietary system blobs. Host Linux is linked via
+//! `Volumes/linux` → `/` so guest paths under `/Volumes/linux/...` reach the
+//! host FS through ordinary open/read/write after path translation.
+
+use std::fs;
+use std::io;
+use std::path::Path;
+
+/// Marker file name placed at the bottle root.
+///
+/// The bottle directory itself may be renamed; identity comes from this marker
+/// plus the active-bottle registry path, not from a hard-coded directory name.
+pub const MARKER_NAME: &str = ".kakehashi-bottle";
+
+/// First line of the marker file (`format_version` is currently `1`).
+pub const MARKER_MAGIC: &str = "kakehashi-bottle 1";
+
+/// Relative path (from bottle root) of the host Linux bridge directory.
+pub const VOLUMES_LINUX: &str = "Volumes/linux";
+
+/// Empty directories that form the post-install macOS root skeleton.
+///
+/// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`) are created separately.
+const DIRS: &[&str] = &[
+    "Applications",
+    "Library/Application Support",
+    "Library/Caches",
+    "Library/Logs",
+    "Library/Preferences",
+    "System/Library",
+    "Users/Shared",
+    "Volumes",
+    "bin",
+    "sbin",
+    "usr/bin",
+    "usr/lib",
+    "usr/libexec",
+    "usr/local/bin",
+    "usr/local/lib",
+    "usr/local/share",
+    "usr/sbin",
+    "usr/share",
+    "usr/standalone",
+    "private/etc",
+    "private/tmp",
+    "private/var/db",
+    "private/var/folders",
+    "private/var/log",
+    "private/var/root",
+    "private/var/run",
+    "private/var/tmp",
+    "dev",
+    "opt",
+    "cores",
+];
+
+/// Returns `true` if `root` looks like a Kakehashi bottle (marker present).
+#[must_use]
+pub fn is_bottle_root(root: &Path) -> bool {
+    let marker = root.join(MARKER_NAME);
+    match fs::read_to_string(&marker) {
+        Ok(contents) => contents.lines().next() == Some(MARKER_MAGIC),
+        Err(_) => false,
+    }
+}
+
+/// Creates the macOS-like skeleton under `root` (must not already be a bottle).
+///
+/// `root` is created if missing. Fails if a valid bottle marker already exists.
+pub fn materialize(root: &Path) -> io::Result<()> {
+    if is_bottle_root(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("bottle marker already present at {}", root.display()),
+        ));
+    }
+
+    fs::create_dir_all(root)?;
+
+    for rel in DIRS {
+        fs::create_dir_all(root.join(rel))?;
+    }
+
+    // Classic macOS private tree aliases.
+    symlink_rel(root, "private/etc", "etc")?;
+    symlink_rel(root, "private/tmp", "tmp")?;
+    symlink_rel(root, "private/var", "var")?;
+
+    // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
+    let volumes_linux = root.join(VOLUMES_LINUX);
+    if volumes_linux.exists() || volumes_linux.symlink_metadata().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", volumes_linux.display()),
+        ));
+    }
+    std::os::unix::fs::symlink("/", &volumes_linux)?;
+
+    fs::write(root.join(MARKER_NAME), format!("{MARKER_MAGIC}\n"))?;
+    Ok(())
+}
+
+/// Creates `link` as a relative symlink to `target` under `root`, if absent.
+fn symlink_rel(root: &Path, target: &str, link: &str) -> io::Result<()> {
+    let link_path = root.join(link);
+    if link_path.exists() || link_path.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    std::os::unix::fs::symlink(target, &link_path)
+}
+
+/// Removes an entire bottle directory tree. Caller must confirm.
+pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(root)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_root(prefix: &str) -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("kh-layout-{}-{}-{n}", prefix, std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        dir
+    }
+
+    #[test]
+    fn materialize_creates_marker_and_skeleton() {
+        let root = temp_root("mat");
+        materialize(&root).expect("materialize");
+        assert!(is_bottle_root(&root));
+        assert!(root.join("usr/lib").is_dir());
+        assert!(root.join("Applications").is_dir());
+        assert!(root.join("private/etc").is_dir());
+        assert!(root.join("etc").is_symlink());
+        assert!(root.join("tmp").is_symlink());
+        assert!(root.join("var").is_symlink());
+        assert!(root.join(VOLUMES_LINUX).is_symlink());
+
+        let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
+        assert_eq!(target, Path::new("/"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn materialize_twice_fails() {
+        let root = temp_root("twice");
+        materialize(&root).expect("first");
+        let err = materialize(&root).expect_err("second must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn volumes_linux_reaches_host_tmp() {
+        let root = temp_root("vol");
+        materialize(&root).expect("materialize");
+
+        let token = format!("kh-vol-rw-{}", std::process::id());
+        let host_file = std::env::temp_dir().join(&token);
+        let payload = b"outside-bottle\n";
+        fs::write(&host_file, payload).expect("write host");
+
+        // Resolve guest /Volumes/linux/<temp>/<token> via the symlink.
+        let via_bottle = root
+            .join(VOLUMES_LINUX)
+            .join(host_file.strip_prefix("/").expect("abs temp"));
+        let read_back = fs::read(&via_bottle).expect("read via bottle");
+        assert_eq!(read_back, payload);
+
+        // Write from the bottle side and verify on the host.
+        let payload2 = b"from-bottle\n";
+        fs::write(&via_bottle, payload2).expect("write via bottle");
+        let host_back = fs::read(&host_file).expect("read host");
+        assert_eq!(host_back, payload2);
+
+        drop(fs::remove_file(&host_file));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+}

@@ -17,7 +17,9 @@ pub mod thread;
 pub mod trap;
 
 pub use bottle::{
-    PathError, bottle_root, set_bottle_root, translate_path, translate_path_with_root,
+    BottleError, BottleStatus, PathError, active_root, bottle_root, create as create_bottle,
+    destroy as destroy_bottle, set_bottle_root, status as bottle_status, translate_path,
+    translate_path_with_root,
 };
 pub use process::{ProcessState, reset_run};
 

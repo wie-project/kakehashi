@@ -32,12 +32,18 @@ pub(crate) fn format_optional_hex(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_owned(), |v| format!("{v:#018x}"))
 }
 
-/// Shared resolution of bottle root from CLI / env.
+/// Shared resolution of bottle root from CLI / env / active bottle registry.
+///
+/// Order: `--root` → `KAKEHASHI_ROOT` → registered bottle (`kh bottle create`).
 #[must_use]
 pub(crate) fn resolve_root(cli_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
-    cli_root
-        .map(std::path::Path::to_path_buf)
-        .or_else(|| std::env::var_os("KAKEHASHI_ROOT").map(std::path::PathBuf::from))
+    if let Some(p) = cli_root {
+        return Some(p.to_path_buf());
+    }
+    if let Some(p) = std::env::var_os("KAKEHASHI_ROOT") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    kh_runtime::active_root().ok().flatten()
 }
 
 /// Human-friendly error when live execution is unavailable off Linux aarch64.

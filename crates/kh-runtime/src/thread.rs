@@ -158,7 +158,11 @@ mod linux {
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(std::ptr::addr_of_mut!(set));
             libc::sigaddset(std::ptr::addr_of_mut!(set), libc::SIGTRAP);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, std::ptr::addr_of!(set), std::ptr::null_mut());
+            libc::pthread_sigmask(
+                libc::SIG_UNBLOCK,
+                std::ptr::addr_of!(set),
+                std::ptr::null_mut(),
+            );
         }
     }
 

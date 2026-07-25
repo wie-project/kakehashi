@@ -12,9 +12,9 @@ Userspace **macOS ARM64 → Linux aarch64** translation layer (CLI-first, no JIT
 
 | Crate        | Role                                                               |
 | ------------ | ------------------------------------------------------------------ |
-| `kh-cli`     | Binary `kh` — inspect / run / trace                                |
+| `kh-cli`     | Binary `kh` — inspect / run / trace / bottle                       |
 | `kh-loader`  | Mach-O parse, image plan, map session, micro execute               |
-| `kh-runtime` | Page geometry, guest `mmap`, stack, traps, BSD table, bottle paths |
+| `kh-runtime` | Page geometry, guest `mmap`, stack, traps, BSD table, bottle       |
 
 ## Requirements
 
@@ -72,6 +72,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Bottle root for path-taking syscalls (open/access) and absolute dylib resolve:
 ./target/debug/kh run --root /path/to/bottle tests/fixtures/minimal_arm64_execute.macho
+
+# Single managed bottle (macOS-like skeleton + Volumes/linux → host /):
+./target/debug/kh bottle create                    # default: $XDG_DATA_HOME/kakehashi/bottle
+./target/debug/kh bottle create --path /opt/my-b   # custom path (name is free to rename)
+./target/debug/kh bottle status
+./target/debug/kh bottle destroy                   # interactive y/N
+./target/debug/kh bottle destroy --yes             # scripts / CI
+# Root resolution for run/trace: --root > KAKEHASHI_ROOT > registered bottle
 ```
 
 Text `dry-load` output is multi-image (per-image mapped/skipped lines). Prefer

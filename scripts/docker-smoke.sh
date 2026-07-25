@@ -18,6 +18,42 @@ KH=(docker run --rm --entrypoint kh -w /app "${IMAGE}")
 echo "==> kh --help"
 "${KH[@]}" --help
 
+echo "==> kh bottle create / Volumes/linux R-W / destroy (inside Linux)"
+docker run --rm --entrypoint bash -w /app "${IMAGE}" -c '
+set -euo pipefail
+export KAKEHASHI_CONFIG_DIR=/tmp/kh-cfg
+export KAKEHASHI_DATA_DIR=/tmp/kh-data
+mkdir -p "$KAKEHASHI_CONFIG_DIR" "$KAKEHASHI_DATA_DIR"
+BOTTLE=/tmp/kh-data/custom-bottle-name
+
+kh bottle create --path "$BOTTLE"
+test -L "$BOTTLE/Volumes/linux"
+test -d "$BOTTLE/usr/lib"
+test -d "$BOTTLE/Applications"
+test -L "$BOTTLE/etc"
+test -f "$BOTTLE/.kakehashi-bottle"
+
+# Host (Linux) file readable through the bottle bridge.
+TOKEN="kh-vol-$$"
+echo "hello-outside" >"/tmp/${TOKEN}"
+test "$(cat "$BOTTLE/Volumes/linux/tmp/${TOKEN}")" = "hello-outside"
+
+# Write via bottle path, observe outside the bottle on the real FS.
+echo "from-bottle" >"$BOTTLE/Volumes/linux/tmp/${TOKEN}-2"
+test "$(cat "/tmp/${TOKEN}-2")" = "from-bottle"
+
+# Exactly one bottle: second create must fail.
+if kh bottle create --path /tmp/kh-data/other 2>/dev/null; then
+  echo "expected second create to fail" >&2
+  exit 1
+fi
+
+kh bottle destroy --yes
+test ! -e "$BOTTLE"
+kh bottle status | grep -q "no bottle"
+echo "bottle lifecycle ok"
+'
+
 echo "==> kh run --dry-load (fixture)"
 "${KH[@]}" run --dry-load tests/fixtures/minimal_arm64_execute.macho
 

@@ -122,8 +122,7 @@ mod tests {
     #[test]
     fn relative_under_bottle() {
         let root = Path::new("/opt/bottle");
-        let host =
-            translate_path_with_root(Some(root), "tmp/x").expect("translate relative");
+        let host = translate_path_with_root(Some(root), "tmp/x").expect("translate relative");
         assert_eq!(host, PathBuf::from("/opt/bottle/tmp/x"));
     }
 
@@ -136,13 +135,24 @@ mod tests {
     #[test]
     fn rejects_parent_dir() {
         let root = Path::new("/opt/bottle");
-        let err = translate_path_with_root(Some(root), "/usr/../etc/passwd")
-            .expect_err("must reject ..");
+        let err =
+            translate_path_with_root(Some(root), "/usr/../etc/passwd").expect_err("must reject ..");
         assert!(matches!(err, PathError::Escape(_)));
     }
 
     #[test]
     fn empty_rejected() {
         assert_eq!(translate_path_with_root(None, ""), Err(PathError::Empty));
+    }
+
+    #[test]
+    fn volumes_linux_under_bottle() {
+        let root = Path::new("/var/lib/my-renamed-bottle");
+        let host = translate_path_with_root(Some(root), "/Volumes/linux/tmp/x")
+            .expect("translate volumes");
+        assert_eq!(
+            host,
+            PathBuf::from("/var/lib/my-renamed-bottle/Volumes/linux/tmp/x")
+        );
     }
 }
