@@ -8,20 +8,64 @@ BSD syscalls, and run real guests (clang probes, **7-Zip `7zz`**, threads).
 Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).  
 `kh inspect` and `kh run --dry-load` work on any host (including macOS).
 
-## Crates
+## Crates (crates.io)
 
-| Crate          | Role                                                           |
-| -------------- | -------------------------------------------------------------- |
-| `kh-cli`       | Binary `kh` — inspect / run / trace / bottle                   |
-| `kh-loader`    | Mach-O parse, image plan, map session, micro execute           |
-| `kh-runtime`   | Page geometry, guest `mmap`, stack, traps, BSD table, bottle   |
-| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` (build on Apple Darwin) |
+| Crate        | Role |
+| ------------ | ---- |
+| **`kakehashi`** | Binary `kh` (install this) |
+| `kh-loader`  | Mach-O parse, map session, execute |
+| `kh-runtime` | Memory, traps, BSD syscalls, bottle |
+| `kh-libsystem` | Freestanding guest `libSystem.B.dylib` (**not** published as a host crate; build for `aarch64-apple-darwin`) |
 
 ## Requirements
 
 - Rust 1.97+
 - **Linux aarch64** for live `kh run` / `kh trace`
 - Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
+- Optional: `curl`/`wget` + `tar` for `kh install 7zip`
+
+## Install (global, updatable)
+
+```bash
+# Once packages are on crates.io:
+cargo install kakehashi
+
+# From a git checkout (dev):
+cargo install --path crates/kh-cli
+
+# Update later:
+cargo install kakehashi --force
+```
+
+Then prepare a bottle (macOS-like root) and optional tools:
+
+```bash
+# Freestanding libSystem (build on macOS / cross target, ship with your release):
+cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+./scripts/stage-libsystem.sh   # → dist/guest/libSystem.B.dylib
+
+kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+
+# Optional: install Darwin 7-Zip into the bottle at a *real* macOS path
+kh install 7zip
+# → guest /usr/local/bin/7zz  =  {bottle}/usr/local/bin/7zz
+
+kh run 7zz -- a /tmp/demo.7z ./README.md
+# same as:
+kh run /usr/local/bin/7zz -- a /tmp/demo.7z ./README.md
+```
+
+Bottle layout mirrors macOS (`/usr/local/bin`, `/usr/lib`, `/Volumes/linux` → host `/`, …).
+Paths under the bottle are guest absolute paths after translation.
+
+| Host (default) | Guest |
+| -------------- | ----- |
+| `~/.local/share/kakehashi/bottle/` | `/` |
+| `…/bottle/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
+| `…/bottle/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
+| `…/bottle/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
+
+Override with `KAKEHASHI_DATA_DIR` / `KAKEHASHI_CONFIG_DIR` / `KAKEHASHI_ROOT`.
 
 ## Quick start (Docker / Colima on Apple Silicon)
 
@@ -41,7 +85,7 @@ docker run --rm kakehashi:smoke
 
 ```bash
 # Host CLI + runtime (on Linux aarch64, or inside the Docker image above)
-cargo build -p kh-cli --release
+cargo build -p kakehashi --release
 cargo test --workspace --exclude kh-libsystem
 cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
 
@@ -53,13 +97,23 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 ### Bottle (macOS-like root for the guest)
 
 ```bash
-./target/release/kh bottle ensure     # create/refresh managed bottle + libSystem
-./target/release/kh bottle status
-./target/release/kh bottle destroy --yes
+kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+kh bottle status
+kh bottle destroy --yes
 ```
 
 Discovery for `libSystem`: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next
 to `kh` → `target/.../libkh_libsystem.dylib` → `dist/guest/libSystem.B.dylib`.
+
+### Guest tools (`kh install`)
+
+Packages are installed **into the bottle** at conventional macOS locations
+(not into a random host cache). List: `kh install list`.
+
+```bash
+kh install 7zip          # → /usr/local/bin/7zz in the bottle
+kh run 7zz -- …          # PATH-style bare name under the bottle
+```
 
 ---
 
@@ -105,23 +159,24 @@ When `kh` runs in Docker, the bottle bridges the Linux filesystem as
   tests/clang-probe/puts_hello
 ```
 
-### Real guest: 7-Zip (`7zz`)
+### Example guest: 7-Zip
 
-Darwin universal binary: `tests/clang-probe/7zz.bin`.
+7-Zip is only an **optional** installed tool (first real-world target), not the
+product focus.
+
+```bash
+kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+kh install 7zip
+kh run 7zz -- a /tmp/demo.7z ./README.md
+```
+
+**Docker helper** (dev loop):
 
 ```bash
 ./scripts/stage-libsystem.sh
-
-# Help text from the guest
-./scripts/docker-7zz.sh --help
-
-# Compress README → host file .tmp/kh-out/demo.7z  (open it yourself after)
 ./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z \
   /Volumes/linux/src/README.md
-
 ls -lh .tmp/kh-out/demo.7z
-# On macOS (if you have 7z/7zz), or with the Linux binary from a prior bench:
-#   7zz t .tmp/kh-out/demo.7z
 ```
 
 Regenerate synthetic fixtures:
@@ -189,10 +244,13 @@ hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
 
 ### Performance knobs
 
-- Freestanding **hypercall** is on by default (no `SIGTRAP` on the hot path).
-  Opt out with `KAKEHASHI_HYPERCALL=0`.
-- After the first guest `pthread_create`, freestanding switches remaining
-  syscalls to patched `svc`→`brk` (MT-safe). Single-thread keeps hypercall.
+- Freestanding **hypercall** is on by default for the **main** guest thread
+  (no `SIGTRAP` on the I/O hot path). Opt out with `KAKEHASHI_HYPERCALL=0`.
+- Guest **worker** threads use `svc`→`brk` by default (7zz MT NEON compression
+  is green there). Experimental full-worker hypercall:
+  `KAKEHASHI_HYPERCALL_WORKERS=1` (still SEGV under `-mmt>1 -mx>0`).
+- Worker `pthread_join` completion is published from the **host** stack after
+  `bsdthread_terminate`.
 
 ---
 

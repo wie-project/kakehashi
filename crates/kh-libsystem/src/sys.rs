@@ -1,6 +1,6 @@
 //! Darwin arm64 syscall entry (`svc #0x80`, number in `x16`).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// BSD `exit`.
 pub(crate) const SYS_EXIT: u32 = 1;
@@ -139,21 +139,58 @@ struct HyperRet {
 #[allow(dead_code)] // written by host loader via export name
 static mut KH_BSD_HYPERCALL: usize = 0;
 
-/// Set when any guest worker has been spawned (`pthread_create` / bsdthread).
+/// Host writes 1 when worker hypercall is enabled (`KAKEHASHI_HYPERCALL_WORKERS=1`).
 ///
-/// Hypercall is ST-fast but still races under 7zz `-mmt>1` NEON workers even
-/// with full Q-reg save (host runs on the guest stack; intermittent SEGV with
-/// no fault frame). After the first worker, fall back to patched `svc`→`brk`
-/// which is green under MT. Single-thread guests keep the hypercall path.
-static WORKERS_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// Default 0: only the LC_MAIN stack uses freestanding hypercall; workers keep
+/// `svc`→`brk` (NEON MT compression is green there). When non-zero, every thread
+/// uses hypercall (experimental — may SEGV under 7zz `-mmt>1 -mx>0`).
+#[unsafe(export_name = "kh_hypercall_workers")]
+#[allow(dead_code)] // written by host loader / runtime
+static mut KH_HYPERCALL_WORKERS: u32 = 0;
 
-/// Mark that multi-thread guests are live (disables freestanding hypercall).
+/// SP bucket of the first syscall (LC_MAIN). Worker stacks are separate mmaps.
+static MAIN_STACK_SP: AtomicUsize = AtomicUsize::new(0);
+
+/// 4 MiB bucket (matches guest worker `STACK_SIZE`).
+const STACK_BUCKET: usize = 4 * 1024 * 1024;
+
+/// True when current SP is the main guest stack (or worker hypercall is on).
+#[cfg(target_arch = "aarch64")]
 #[inline]
-pub(crate) fn note_worker_spawned() {
-    WORKERS_SPAWNED.store(true, Ordering::Release);
+fn hypercall_allowed_here() -> bool {
+    // SAFETY: host writes once before / at guest entry; workers only read.
+    let workers = unsafe { core::ptr::addr_of!(KH_HYPERCALL_WORKERS).read_volatile() };
+    if workers != 0 {
+        return true;
+    }
+    let sp = read_sp();
+    let bucket = sp & !(STACK_BUCKET.saturating_sub(1));
+    match MAIN_STACK_SP.compare_exchange(0, bucket, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(main_bucket) => bucket == main_bucket,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn read_sp() -> usize {
+    let sp: u64;
+    // SAFETY: pure register read.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    usize::try_from(sp).unwrap_or(0)
 }
 
 /// Invokes a Darwin BSD syscall with up to seven arguments (`x0`–`x6`).
+///
+/// When the host has wired [`KH_BSD_HYPERCALL`]:
+/// - **Main** stack always uses freestanding hypercall (fast I/O).
+/// - **Workers** use hypercall only if [`KH_HYPERCALL_WORKERS`] ≠ 0; otherwise
+///   `svc`→`brk` (safe for 7zz MT NEON compression).
+///
+/// Join completion is published from the host stack after `bsdthread_terminate`
+/// (see `kh-runtime::thread`).
 ///
 /// # Safety
 ///
@@ -172,14 +209,12 @@ pub(crate) unsafe fn syscall7(
 ) -> isize {
     #[cfg(target_arch = "aarch64")]
     {
-        // Prefer host hypercall when wired and still single-threaded.
+        // Prefer host hypercall when wired and allowed on this stack.
         // SAFETY: slot is process-local; runtime writes once before guest entry.
         let hyper = unsafe { core::ptr::addr_of!(KH_BSD_HYPERCALL).read_volatile() };
-        if hyper != 0 && !WORKERS_SPAWNED.load(Ordering::Acquire) {
-            // Darwin `svc` preserves full SIMD. Host Rust does not. Save
-            // Q0–Q31 + FPCR/FPSR around the call (same as host veneer tramp).
+        if hyper != 0 && hypercall_allowed_here() {
             let r = unsafe {
-                hypercall_preserve_neon(hyper, a0, a1, a2, a3, a4, a5, a6, u64::from(number))
+                hypercall_thin(hyper, a0, a1, a2, a3, a4, a5, a6, u64::from(number))
             };
             if r.error != 0 {
                 let err = isize::try_from(r.retval).unwrap_or(1);
@@ -235,15 +270,14 @@ pub(crate) unsafe fn syscall7(
     }
 }
 
-/// Call host hyper entry with full NEON preserved (Darwin `svc` contract).
+/// Thin call into the host hyper entry (NEON preserved by the host tramp).
 ///
-/// `hyper` is the absolute address of the host shim / dispatcher. Args use the
-/// AAPCS64 8-arg layout (`x0`–`x6` + number in `x7`); the host NEON shim maps
-/// that to Darwin `x16` before dispatch.
+/// Args use AAPCS64 (`x0`–`x6` + number in `x7`). The host entry switches to a
+/// host alt stack and runs TRAMP_BYTES (full Q0–Q31 + FPCR/FPSR).
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn hypercall_preserve_neon(
+unsafe fn hypercall_thin(
     hyper: usize,
     a0: u64,
     a1: u64,
@@ -256,67 +290,13 @@ unsafe fn hypercall_preserve_neon(
 ) -> HyperRet {
     let mut retval: u64;
     let mut error: u64;
-    // Frame: 0x280 bytes — matches host TRAMP_BYTES layout (Q0–Q31 + FPCR/FPSR + temps).
-    // SAFETY: pure register/stack traffic; `hyper` is identity-mapped host code.
-    // Stash `hyper` at [sp,#88] before reusing x8/x9 for FPCR/FPSR — a plain
-    // `in(reg)` could land in x8 and be clobbered by `mrs x8, fpcr`.
+    // SAFETY: `hyper` is identity-mapped host code; host preserves NEON.
+    // Save x18 (Darwin-reserved) across the Linux AAPCS call.
     unsafe {
         core::arch::asm!(
-            "sub sp, sp, #0x280",
-            "str {hyper}, [sp, #88]",
-            "stp x8, x9, [sp, #0]",
-            "stp x10, x11, [sp, #16]",
-            "stp x12, x13, [sp, #32]",
-            "stp x14, x15, [sp, #48]",
-            "stp x17, x18, [sp, #64]",
-            "str x30, [sp, #80]",
-            "mrs x8, fpcr",
-            "mrs x9, fpsr",
-            "stp x8, x9, [sp, #96]",
-            "stp q0, q1, [sp, #112]",
-            "stp q2, q3, [sp, #144]",
-            "stp q4, q5, [sp, #176]",
-            "stp q6, q7, [sp, #208]",
-            "stp q8, q9, [sp, #240]",
-            "stp q10, q11, [sp, #272]",
-            "stp q12, q13, [sp, #304]",
-            "stp q14, q15, [sp, #336]",
-            "stp q16, q17, [sp, #368]",
-            "stp q18, q19, [sp, #400]",
-            "stp q20, q21, [sp, #432]",
-            "stp q22, q23, [sp, #464]",
-            "stp q24, q25, [sp, #496]",
-            "stp q26, q27, [sp, #528]",
-            "stp q28, q29, [sp, #560]",
-            "stp q30, q31, [sp, #592]",
-            "ldr x8, [sp, #88]",
-            "blr x8",
-            "ldp x8, x9, [sp, #96]",
-            "msr fpcr, x8",
-            "msr fpsr, x9",
-            "ldp q0, q1, [sp, #112]",
-            "ldp q2, q3, [sp, #144]",
-            "ldp q4, q5, [sp, #176]",
-            "ldp q6, q7, [sp, #208]",
-            "ldp q8, q9, [sp, #240]",
-            "ldp q10, q11, [sp, #272]",
-            "ldp q12, q13, [sp, #304]",
-            "ldp q14, q15, [sp, #336]",
-            "ldp q16, q17, [sp, #368]",
-            "ldp q18, q19, [sp, #400]",
-            "ldp q20, q21, [sp, #432]",
-            "ldp q22, q23, [sp, #464]",
-            "ldp q24, q25, [sp, #496]",
-            "ldp q26, q27, [sp, #528]",
-            "ldp q28, q29, [sp, #560]",
-            "ldp q30, q31, [sp, #592]",
-            "ldr x30, [sp, #80]",
-            "ldp x17, x18, [sp, #64]",
-            "ldp x14, x15, [sp, #48]",
-            "ldp x12, x13, [sp, #32]",
-            "ldp x10, x11, [sp, #16]",
-            "ldp x8, x9, [sp, #0]",
-            "add sp, sp, #0x280",
+            "str x18, [sp, #-16]!",
+            "blr {hyper}",
+            "ldr x18, [sp], #16",
             inout("x0") a0 => retval,
             inout("x1") a1 => error,
             in("x2") a2,
@@ -326,8 +306,7 @@ unsafe fn hypercall_preserve_neon(
             in("x6") a6,
             in("x7") number,
             hyper = in(reg) hyper,
-            // Preserve AAPCS callee-saved; do not let the compiler reuse our
-            // stack frame mid-sequence.
+            // Caller-saved GPRs may be clobbered by the host entry.
             out("x8") _,
             out("x9") _,
             out("x10") _,
@@ -338,7 +317,41 @@ unsafe fn hypercall_preserve_neon(
             out("x15") _,
             out("x16") _,
             out("x17") _,
-            // x18 is Darwin-reserved (cannot name in constraints); save/restore above.
+            // NEON: host tramp restores full Q0–Q31; mark clobbered so LLVM
+            // does not keep live values across the call without its own save.
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            clobber_abi("C"),
         );
     }
     HyperRet { retval, error }

@@ -1,10 +1,18 @@
 [package]
-name = "kh-cli"
+name = "kakehashi"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Kakehashi CLI front-end (inspect, run, trace)"
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/wie-project/kakehashi"
+documentation = "https://docs.rs/kakehashi"
+description = "Kakehashi CLI — run macOS ARM64 Mach-O binaries on Linux aarch64"
+readme = "../../README.md"
+keywords = ["macos", "darwin", "arm64", "compatibility", "emulator"]
+categories = ["command-line-utilities", "emulators", "os"]
+exclude = ["/target", "/.tmp", "/.kh"]
 
 [[bin]]
 name = "kh"
@@ -16,8 +24,8 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
-kh-loader = { path = "../kh-loader" }
-kh-runtime = { path = "../kh-runtime" }
+kh-loader = { version = "0.1.0", path = "../kh-loader" }
+kh-runtime = { version = "0.1.0", path = "../kh-runtime" }
 
 [lints]
 workspace = true

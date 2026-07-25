@@ -4,7 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Kakehashi native ARM64 execution context, memory layout, and trap hooks"
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/wie-project/kakehashi"
+documentation = "https://docs.rs/kh-runtime"
+description = "Kakehashi native ARM64 execution context, memory layout, traps, and bottle"
+readme = "../../README.md"
+keywords = ["macos", "darwin", "arm64", "syscalls"]
+categories = ["emulators", "os"]
 
 [dependencies]
 thiserror.workspace = true

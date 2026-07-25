@@ -15,8 +15,9 @@ use tracing_subscriber::EnvFilter;
 #[command(long_about = "\
 Userspace macOS translation layer for Linux ARM64 (no JIT).\n\
 \n\
-Commands: inspect | run | trace | bottle.\n\
-Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR.\
+Commands: inspect | run | trace | bottle | install.\n\
+Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR,\n\
+     KAKEHASHI_LIBSYSTEM, KAKEHASHI_7ZZ.\
 ")]
 struct Cli {
     /// Increase log verbosity (repeatable). Overrides `KAKEHASHI_LOG` when set.
@@ -120,6 +121,15 @@ enum Command {
     Bottle {
         #[command(subcommand)]
         action: BottleAction,
+    },
+
+    /// Install an optional guest tool into the bottle at a real macOS path.
+    ///
+    /// Example: `kh install 7zip` → bottle `/usr/local/bin/7zz`, then
+    /// `kh run 7zz -- a /tmp/out.7z ./file` (or `kh run /usr/local/bin/7zz -- …`).
+    Install {
+        /// Package name (`7zip`) or `list`.
+        package: String,
     },
 }
 
@@ -252,6 +262,13 @@ fn run() -> Result<()> {
             guest_args: &guest_args,
             json: cli.json,
         }),
+        Command::Install { package } => {
+            commands::install::require_package(&package)?;
+            commands::install::run(&commands::install::InstallArgs {
+                package: &package,
+                json: cli.json,
+            })
+        }
         Command::Bottle { action } => {
             let cmd = match &action {
                 BottleAction::Create {

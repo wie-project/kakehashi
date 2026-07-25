@@ -4,7 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Kakehashi Mach-O binary loader and process environment setup"
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/wie-project/kakehashi"
+documentation = "https://docs.rs/kh-loader"
+description = "Kakehashi Mach-O loader and process environment setup"
+readme = "../../README.md"
+keywords = ["macos", "darwin", "mach-o", "arm64"]
+categories = ["emulators", "parsing"]
 
 [dependencies]
 anyhow.workspace = true
@@ -12,7 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 goblin.workspace = true
 scroll = "0.13"
-kh-runtime = { path = "../kh-runtime" }
+kh-runtime = { version = "0.1.0", path = "../kh-runtime" }
 
 [dev-dependencies]
 # Fixture round-trip uses goblin directly in fixture tests (already a dep).

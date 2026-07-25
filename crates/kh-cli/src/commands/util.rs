@@ -34,7 +34,9 @@ pub(crate) fn format_optional_hex(value: Option<u64>) -> String {
 
 /// Shared resolution of bottle root from CLI / env / active bottle registry.
 ///
-/// Order: `--root` → `KAKEHASHI_ROOT` → registered bottle (`kh bottle create`).
+/// Order: `--root` → `KAKEHASHI_ROOT` → registered bottle → **auto
+/// `kh bottle ensure`** when none is registered (so first `kh run` can use
+/// bottle paths when libSystem is discoverable).
 #[must_use]
 pub(crate) fn resolve_root(cli_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     if let Some(p) = cli_root {
@@ -43,7 +45,18 @@ pub(crate) fn resolve_root(cli_root: Option<&std::path::Path>) -> Option<std::pa
     if let Some(p) = std::env::var_os("KAKEHASHI_ROOT") {
         return Some(std::path::PathBuf::from(p));
     }
-    kh_runtime::active_root().ok().flatten()
+    if let Ok(Some(p)) = kh_runtime::active_root() {
+        return Some(p);
+    }
+    // First-run convenience: create managed bottle if libSystem can be found.
+    match kh_runtime::ensure_bottle(&kh_runtime::CreateOptions {
+        path: None,
+        libsystem: None,
+        skip_libsystem: false,
+    }) {
+        Ok(created) => Some(created.path),
+        Err(_) => None,
+    }
 }
 
 /// Human-friendly error when live execution is unavailable off Linux aarch64.

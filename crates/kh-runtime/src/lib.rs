@@ -17,11 +17,13 @@ pub mod thread;
 pub mod trap;
 
 pub use bottle::{
-    BottleError, BottleStatus, CreateOptions, CreateResult, DEFAULT_7ZZ_PATH, ENV_7ZZ,
-    GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, PathError, active_root, bottle_root,
-    create as create_bottle, create_with as create_bottle_with, destroy as destroy_bottle,
-    discover_7zz, ensure as ensure_bottle, ensure_libcxx_symlink, has_libcxx_symlink,
-    set_bottle_root, status as bottle_status, translate_path, translate_path_with_root,
+    BottleError, BottleStatus, CreateOptions, CreateResult, DARWIN_7ZZ_URL, DEFAULT_7ZZ_PATH,
+    ENV_7ZZ, GUEST_7ZZ_REL, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_PATH_DIRS, InstallPackage,
+    InstallReport, PathError, ToolError, active_root, bottle_root, create as create_bottle,
+    create_with as create_bottle_with, destroy as destroy_bottle, discover_7zz, ensure as ensure_bottle,
+    ensure_libcxx_symlink, guest_path_to_host, has_libcxx_symlink, install_package,
+    package_host_path, resolve_guest_program, set_bottle_root, status as bottle_status,
+    translate_path, translate_path_with_root,
 };
 pub use process::{ProcessState, reset_run};
 
@@ -44,3 +46,4 @@ pub use trap::{
 };
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub use trap::kh_trampoline_dispatch;
+// `kh_hypercall_entry` is a `global_asm!` symbol; address via `hypercall_entry_addr`.

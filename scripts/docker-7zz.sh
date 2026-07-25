@@ -113,7 +113,7 @@ docker run --rm \
 set -euo pipefail
 # Always rebuild the binary we execute (a stale release in the volume cache
 # must not win over a freshly compiled debug kh).
-cargo build -p kh-cli '"${KH_EXTRA_CARGO_ARGS:-}"'
+cargo build -p kakehashi '"${KH_EXTRA_CARGO_ARGS:-}"'
 if [[ "${KH_EXTRA_CARGO_ARGS:-}" == *"--release"* ]]; then
   KH=./target/release/kh
 else
@@ -121,8 +121,12 @@ else
 fi
 "$KH" bottle ensure
 "$KH" bottle status
-# No --root: registered bottle under .kh/data is used automatically.
-exec "$KH" run tests/clang-probe/7zz.bin -- "$@"
+# Install Darwin 7zz into bottle /usr/local/bin (or use tree fixture via env).
+if [[ -x tests/clang-probe/7zz.bin ]]; then
+  export KAKEHASHI_7ZZ=/src/tests/clang-probe/7zz.bin
+fi
+"$KH" install 7zip || true
+exec "$KH" run 7zz -- "$@"
 ' -- "${GUEST_ARGS[@]}"
 
 # After success, if anything was written under KH_OUT, list it.

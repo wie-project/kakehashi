@@ -145,8 +145,8 @@ mkdir -p "$W" "$ART"
 : > /results/kh.log
 
 KH=./target/release/kh
-echo "==> cargo build -p kh-cli --release"
-cargo build -p kh-cli --release 2>&1 | tail -5
+echo "==> cargo build -p kakehashi --release"
+cargo build -p kakehashi --release 2>&1 | tail -5
 $KH bottle ensure >/dev/null
 
 {

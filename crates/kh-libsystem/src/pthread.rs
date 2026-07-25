@@ -1,9 +1,17 @@
-//! Minimal pthread: spin mutex/cond + real workers via `bsdthread_*`.
+//! Minimal pthread: park mutex/cond + real workers via `bsdthread_*`.
 //!
 //! Soft `pthread_create` → `EAGAIN` plus immediate `pthread_cond_wait` caused
 //! pure-userspace hangs in multi-thread guests (`7zz a`): main waited forever
 //! for workers that never ran. We register a freestanding trampoline, spawn
 //! host-backed guest threads through the runtime, and join on a done flag.
+//!
+//! **Join protocol (must stay in sync with `kh-runtime::thread`):**
+//! 1. Guest trampoline stores `result`, then `bsdthread_terminate`.
+//! 2. Host leaves the guest stack, then sets `done` + futex-wakes joiners.
+//! 3. `pthread_join` waits for `done`, then reclaims stack/control.
+//!
+//! Publishing `done` from the guest *before* terminate races with join's
+//! `munmap` of the worker stack while hypercall dispatch still runs on it.
 
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -21,6 +29,7 @@ const EAGAIN: i32 = 35;
 const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
 
+/// Shared with `kh-runtime::thread` (host publishes `done` after stack switch).
 const MAGIC: u64 = 0x4B48_5054_4852_4401; // "KHPTHRD\x01"
 /// Guest worker stacks must fit freestanding NEON hypercall frames + host
 /// dispatch + 7zz LZMA worker frames. 1 MiB was tight under `-mmt>1`.
@@ -30,9 +39,14 @@ const PAGE: usize = 16_384;
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Control block pointed to by guest `pthread_t`.
+///
+/// Layout is an ABI with the host worker exit path (`kh-runtime::thread`):
+/// `magic @ 0`, `done @ 8`, `detached @ 12`, `result @ 16`, then stack fields.
 #[repr(C, align(16))]
 struct KhThread {
     magic: u64,
+    /// Set to 1 by the **host** after leaving the guest stack (not by the
+    /// trampoline). Joiners park on this word via `KH_HELPER_PARK`.
     done: AtomicU32,
     detached: AtomicU32,
     result: AtomicUsize,
@@ -64,18 +78,15 @@ pub(crate) unsafe extern "C" fn kh_pthread_start(
     if !pthread.is_null() {
         let t = pthread.cast::<KhThread>();
         // SAFETY: our create allocated this block.
+        // Store result only — `done` + joiner wake are published by the host
+        // after `bsdthread_terminate` switches off this guest stack.
         unsafe {
             if (*t).magic == MAGIC {
                 (*t).result.store(ret.addr(), Ordering::Release);
-                (*t).done.store(1, Ordering::Release);
-                // Wake joiners parked on `done`.
-                let done = &(*t).done;
-                let addr = u64::try_from(core::ptr::from_ref(done).addr()).unwrap_or(0);
-                let _ = sys::helper2(KH_HELPER_WAKE, addr, u64::from(u32::MAX));
             }
         }
     }
-    // End this host worker only (runtime maps this to pthread_exit).
+    // End this host worker only (runtime: host stack → done/wake → pthread_exit).
     let _ = unsafe { sys::syscall6(SYS_BSDTHREAD_TERMINATE, 0, 0, 0, 0, 0, 0) };
     loop {
         core::hint::spin_loop();
@@ -390,10 +401,6 @@ pub(crate) unsafe extern "C" fn pthread_create(
         munmap_anon(stack, STACK_SIZE);
         return EAGAIN;
     }
-
-    // After the first worker, freestanding hypercall falls back to svc→brk
-    // (MT-safe path). See `sys::note_worker_spawned`.
-    sys::note_worker_spawned();
 
     // *thread = pthread_t
     unsafe {

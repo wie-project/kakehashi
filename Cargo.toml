@@ -20,9 +20,12 @@ rust-version = "1.97"
 license = "LGPL-3.0-only"
 authors = ["Vladislav Kalinkin"]
 repository = "https://github.com/wie-project/kakehashi"
+homepage = "https://github.com/wie-project/kakehashi"
 description = "Kakehashi — userspace macOS translation layer for Linux ARM64"
 exclude = [
     "scripts/",
+    ".tmp/",
+    ".kh/",
 ]
 
 [workspace.dependencies]

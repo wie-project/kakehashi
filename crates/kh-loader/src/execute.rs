@@ -110,9 +110,16 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     argv_owned.push(argv0.to_owned());
     argv_owned.extend(opts.guest_args.iter().cloned());
     let argv_refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+    // Minimal macOS-like environment so guests see a real PATH under the bottle.
+    let env_owned = [
+        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+        "HOME=/var/root".to_owned(),
+        "TMPDIR=/tmp".to_owned(),
+    ];
+    let env_refs: Vec<&str> = env_owned.iter().map(String::as_str).collect();
 
     let stack_base = stack.guest_addr;
-    let sp = bootstrap_stack(stack.host_bytes_mut(), stack_base, &argv_refs, &[])
+    let sp = bootstrap_stack(stack.host_bytes_mut(), stack_base, &argv_refs, &env_refs)
         .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))?;
 
     // Build process address space, then install for trap-path checks / mmap bookkeeping.
@@ -244,82 +251,106 @@ fn install_libsystem_hypercall(session: &mut LoadSession) -> bool {
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn install_libsystem_hypercall_linux(session: &mut LoadSession) -> bool {
-    /// Freestanding export the host patches with the dispatch entry address.
-    const SLOT: &str = "_kh_bsd_hypercall";
-
-    // Prefer freestanding-side NEON preserve (in kh-libsystem syscall7). Wire
-    // the slot to bare dispatch so we don't double-frame 0x280+0x280 on the
-    // guest worker stack under 7zz `-mmt>1` compression.
-    #[allow(clippy::as_conversions, function_casts_as_integer)]
-    let entry_u64 = {
-        let bare = u64::try_from(kh_runtime::kh_trampoline_dispatch as usize).unwrap_or(0);
-        if bare != 0 {
-            bare
-        } else {
-            kh_runtime::hypercall_entry_addr()
-        }
-    };
+    // Freestanding thin call → host alt stack + NEON tramp + dispatch.
+    let entry_u64 = kh_runtime::hypercall_entry_addr();
     if entry_u64 == 0 {
         return false;
     }
 
+    let workers = hypercall_workers_enabled();
+    let mut wired_entry = false;
+    let mut wired_workers = false;
+
     for img in session.images_mut() {
         let slide = img.slide();
-        let Some(exp) = img
-            .exports
-            .iter()
-            .find(|e| e.name == SLOT || e.name == "kh_bsd_hypercall")
-            .cloned()
-        else {
-            continue;
-        };
-        let va = exp.value.saturating_add(slide);
-        let Some(memory) = img.memory.as_mut() else {
-            continue;
-        };
-
-        // Locate covering region; DATA may be mapped RO.
-        let Some(region_idx) = memory.regions().iter().position(|region| {
-            let start = region.guest_addr;
-            let end = start.saturating_add(u64::try_from(region.host_len()).unwrap_or(0));
-            va >= start && va.saturating_add(8) <= end
-        }) else {
-            continue;
-        };
-        let Some(region) = memory.regions().get(region_idx) else {
-            continue;
-        };
-        let old_prot = region.prot;
-        let need_rw = old_prot & VM_PROT_WRITE == 0;
-        if need_rw {
-            let Some(region) = memory.regions_mut().get_mut(region_idx) else {
-                return false;
+        let exports: Vec<_> = img.exports.iter().cloned().collect();
+        for exp in exports {
+            let slot = exp.name.as_str();
+            let is_entry = slot == "_kh_bsd_hypercall" || slot == "kh_bsd_hypercall";
+            let is_workers = slot == "_kh_hypercall_workers" || slot == "kh_hypercall_workers";
+            if !is_entry && !is_workers {
+                continue;
+            }
+            let va = exp.value.saturating_add(slide);
+            let value = if is_entry {
+                entry_u64
+            } else {
+                u64::from(u32::from(workers))
             };
-            if mprotect_rw(region).is_err() {
-                return false;
+            if !write_libsystem_u64(img, va, value) {
+                continue;
+            }
+            if is_entry {
+                wired_entry = true;
+                tracing::info!(
+                    va = format_args!("{va:#x}"),
+                    entry = format_args!("{entry_u64:#x}"),
+                    "wired libSystem BSD hypercall"
+                );
+            } else {
+                wired_workers = true;
+                tracing::info!(
+                    va = format_args!("{va:#x}"),
+                    workers,
+                    "wired libSystem hypercall-workers flag"
+                );
             }
         }
-        let ok = memory.write_u64_le(va, entry_u64).is_some();
-        if need_rw {
-            let mut restore = (old_prot | VM_PROT_READ) & !VM_PROT_WRITE;
-            if old_prot & VM_PROT_EXECUTE != 0 {
-                restore |= VM_PROT_EXECUTE;
-            }
-            let Some(region) = memory.regions_mut().get_mut(region_idx) else {
-                return false;
-            };
+    }
+    let _ = wired_workers;
+    wired_entry
+}
+
+/// `KAKEHASHI_HYPERCALL_WORKERS=1|true|yes|on` → freestanding workers use hypercall.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn hypercall_workers_enabled() -> bool {
+    match std::env::var_os("KAKEHASHI_HYPERCALL_WORKERS") {
+        None => false,
+        Some(v) => {
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+    }
+}
+
+/// Write 8 little-endian bytes at guest VA in an image mapping (mprotect if needed).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn write_libsystem_u64(img: &mut crate::session::ProcessImage, va: u64, value: u64) -> bool {
+    let Some(memory) = img.memory.as_mut() else {
+        return false;
+    };
+    let Some(region_idx) = memory.regions().iter().position(|region| {
+        let start = region.guest_addr;
+        let end = start.saturating_add(u64::try_from(region.host_len()).unwrap_or(0));
+        va >= start && va.saturating_add(8) <= end
+    }) else {
+        return false;
+    };
+    let Some(region) = memory.regions().get(region_idx) else {
+        return false;
+    };
+    let old_prot = region.prot;
+    let need_rw = old_prot & VM_PROT_WRITE == 0;
+    if need_rw {
+        let Some(region) = memory.regions_mut().get_mut(region_idx) else {
+            return false;
+        };
+        if mprotect_rw(region).is_err() {
+            return false;
+        }
+    }
+    let ok = memory.write_u64_le(va, value).is_some();
+    if need_rw {
+        let mut restore = (old_prot | VM_PROT_READ) & !VM_PROT_WRITE;
+        if old_prot & VM_PROT_EXECUTE != 0 {
+            restore |= VM_PROT_EXECUTE;
+        }
+        if let Some(region) = memory.regions_mut().get_mut(region_idx) {
             drop(mprotect_darwin(region, restore));
             region.prot = restore;
         }
-        if ok {
-            tracing::info!(
-                va = format_args!("{va:#x}"),
-                entry = format_args!("{entry_u64:#x}"),
-                "wired libSystem BSD hypercall"
-            );
-            return true;
-        }
-        return false;
     }
-    false
+    ok
 }

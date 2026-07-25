@@ -220,8 +220,8 @@ const fn is_svc(insn: u32) -> bool {
 /// Linux aarch64: optional userspace trampoline (`svc`→`b veneer`).
 ///
 /// Enable with `KAKEHASHI_TRAMPOLINE=1`. Default is classic `brk` + `SIGTRAP`
-/// until multi-thread compression (7zz `-mmt>1`) is fully green on the
-/// veneer path. Single-thread (`-mmt1`) and store-only (`-mx=0`) already work.
+/// (safe fallback when freestanding hypercall is off). Prefer hypercall for
+/// multi-thread compression; the veneer path remains opt-in.
 ///
 /// **Why a veneer (not a direct `bl`)?** Darwin `svc` preserves `x30` (LR). A
 /// direct `bl trampoline` overwrites LR with the resume PC; the libSystem stub
@@ -278,10 +278,6 @@ const VENEER_BYTES: usize = 16;
 /// How many page slots to probe above/below an RX region for a veneer hub.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const VENEER_PROBE_RADIUS: u64 = 128;
-
-/// `mov x16, x7` — AAPCS 8th arg → Darwin syscall number reg (hypercall shim).
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-const HYPERCALL_SHIM_PROLOGUE: [u8; 4] = [0xf0, 0x03, 0x07, 0xaa];
 
 /// Round `len` up to a multiple of `page` (page must be a power of two ≥ 1).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -573,6 +569,10 @@ pub struct TrampRet {
 /// `x16` holds the syscall number (or AAPCS 8th arg after the hypercall
 /// prologue). May `pthread_exit` the current host thread on
 /// `bsdthread_terminate`, or `_exit` the process on guest `exit`.
+///
+/// Prefer [`kh_hypercall_entry`] for freestanding libSystem: that path switches
+/// onto a host alt stack first so multi-thread guests never run host Rust on
+/// guest worker stacks.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kh_trampoline_dispatch(
@@ -614,15 +614,156 @@ pub unsafe extern "C" fn kh_trampoline_dispatch(
     }
 }
 
-/// Process-global NEON-preserving entry for freestanding libSystem hypercalls.
-///
-/// Freestanding `_kh_bsd_hypercall` used to point at [`kh_trampoline_dispatch`]
-/// directly. That path is plain AAPCS64 and **clobbers Q0–Q31**, while Darwin
-/// `svc` preserves full SIMD — 7zz MT (`-mmt>1`) NEON workers then SEGV.
-/// Wire the slot to this shim instead (same machine code as the svc veneer hub).
+// Freestanding hypercall entry (`kh_hypercall_entry`):
+// Prefer host alt stack (so join/terminate never runs host Rust on a guest
+// stack that `pthread_join` may unmap). NEON preserve is TRAMP_BYTES (same as
+// the svc veneer). ABI: x0–x6 + number in x7 → TrampRet in x0/x1.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+std::arch::global_asm!(
+    r#"
+    .text
+    .align 2
+    .global kh_hypercall_entry
+    .type kh_hypercall_entry, %function
+kh_hypercall_entry:
+    // Guest prolog: args + real LR (before any `bl` clobbers x30).
+    sub sp, sp, #96
+    stp x29, x30, [sp, #0]
+    stp x0, x1, [sp, #16]
+    stp x2, x3, [sp, #32]
+    stp x4, x5, [sp, #48]
+    stp x6, x7, [sp, #64]
+    mov x29, sp
+
+    bl kh_host_alt_sp
+    cbz x0, 1f
+    mov x9, sp                 // guest prolog frame
+    mov sp, x0                 // host alt stack
+    ldr x30, [x9, #8]          // reload LR → freestanding thin caller
+    stp x9, x30, [sp, #-16]!
+    ldp x0, x1, [x9, #16]
+    ldp x2, x3, [x9, #32]
+    ldp x4, x5, [x9, #48]
+    ldp x6, x7, [x9, #64]
+    mov x16, x7
+    bl kh_neon_tramp_entry
+    ldp x9, x30, [sp], #16
+    mov sp, x9
+    ldr x29, [sp, #0]
+    add sp, sp, #96
+    ret
+1:
+    // No alt stack: NEON tramp on the guest stack (ST / fallback).
+    ldp x0, x1, [sp, #16]
+    ldp x2, x3, [sp, #32]
+    ldp x4, x5, [sp, #48]
+    ldp x6, x7, [sp, #64]
+    ldp x29, x30, [sp, #0]
+    add sp, sp, #96
+    mov x16, x7
+    b kh_neon_tramp_entry
+    .size kh_hypercall_entry, .-kh_hypercall_entry
+    "#
+);
+
+// `kh_neon_tramp_entry` + `KH_NEON_TRAMP_VA` (filled by `ensure_neon_tramp`).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+std::arch::global_asm!(
+    r#"
+    .text
+    .align 2
+    .global kh_neon_tramp_entry
+    .type kh_neon_tramp_entry, %function
+kh_neon_tramp_entry:
+    adrp x17, KH_NEON_TRAMP_VA
+    ldr x17, [x17, :lo12:KH_NEON_TRAMP_VA]
+    cbz x17, 1f
+    br x17
+1:
+    mov x7, x16
+    b kh_trampoline_dispatch
+    .size kh_neon_tramp_entry, .-kh_neon_tramp_entry
+
+    .data
+    .align 3
+    .global KH_NEON_TRAMP_VA
+KH_NEON_TRAMP_VA:
+    .quad 0
+    "#
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe extern "C" {
+    fn kh_hypercall_entry();
+    static mut KH_NEON_TRAMP_VA: u64;
+}
+
+/// Address of freestanding hypercall entry (alt stack + NEON tramp + dispatch).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[must_use]
 pub fn hypercall_entry_addr() -> u64 {
-    ensure_hypercall_shim()
+    ensure_neon_tramp();
+    #[allow(clippy::as_conversions, function_casts_as_integer)]
+    {
+        u64::try_from(kh_hypercall_entry as usize).unwrap_or(0)
+    }
+}
+
+/// Map TRAMP_BYTES once and publish its VA to `KH_NEON_TRAMP_VA`.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn ensure_neon_tramp() {
+    static ONCE: AtomicU64 = AtomicU64::new(0);
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    if ONCE.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let _g = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ONCE.load(Ordering::Acquire) != 0 {
+        return;
+    }
+
+    let code = trampoline_template();
+    let page = crate::host::page_size().unwrap_or(4096);
+    let map_len = align_up_to_page(code.len(), page).max(page);
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
+    let Some(ptr) = crate::host::mmap(None, map_len, prot_rw, flags, -1, 0) else {
+        tracing::error!("NEON tramp mmap failed");
+        return;
+    };
+    // SAFETY: fresh RW mapping.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, map_len) };
+    slice.fill(0);
+    if let Some(dst) = slice.get_mut(..code.len()) {
+        dst.copy_from_slice(code);
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return;
+    }
+    let reloc_off = trampoline_reloc_offset();
+    if let Some(slot) = slice.get_mut(reloc_off..reloc_off.saturating_add(8)) {
+        slot.copy_from_slice(&trampoline_rust_entry_addr().to_le_bytes());
+    } else {
+        let _ = crate::host::munmap(ptr, map_len);
+        return;
+    }
+    let prot_rx = libc::PROT_READ | libc::PROT_EXEC;
+    if !crate::host::mprotect(ptr, map_len, prot_rx) {
+        tracing::error!("NEON tramp mprotect RX failed");
+        let _ = crate::host::munmap(ptr, map_len);
+        return;
+    }
+    clear_icache(ptr, map_len);
+    let va = crate::host::ptr_addr_u64(ptr);
+    // SAFETY: symbol from global_asm; written once under LOCK before guest entry.
+    unsafe {
+        KH_NEON_TRAMP_VA = va;
+    }
+    ONCE.store(va, Ordering::Release);
+    tracing::info!(va = format_args!("{va:#x}"), "mapped NEON tramp for hypercall");
 }
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
@@ -631,72 +772,6 @@ pub fn hypercall_entry_addr() -> u64 {
     0
 }
 
-/// Once-mapped RX page: `mov x16, x7` + [`TRAMP_BYTES`] (number arrives in x7
-/// per AAPCS as the 8th arg; the tramp body expects Darwin `x16`).
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn ensure_hypercall_shim() -> u64 {
-    static SHIM_VA: AtomicU64 = AtomicU64::new(0);
-    static SHIM_LOCK: Mutex<()> = Mutex::new(());
-
-    let existing = SHIM_VA.load(Ordering::Acquire);
-    if existing != 0 {
-        return existing;
-    }
-    let _guard = SHIM_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let existing = SHIM_VA.load(Ordering::Acquire);
-    if existing != 0 {
-        return existing;
-    }
-
-    let code = trampoline_template();
-    let total = HYPERCALL_SHIM_PROLOGUE
-        .len()
-        .saturating_add(code.len());
-    let page = crate::host::page_size().unwrap_or(4096);
-    let map_len = align_up_to_page(total, page).max(page);
-    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-    let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
-    let Some(ptr) = crate::host::mmap(None, map_len, prot_rw, flags, -1, 0) else {
-        tracing::error!("hypercall shim mmap failed");
-        return 0;
-    };
-    // SAFETY: fresh RW mapping of `map_len`.
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, map_len) };
-    slice.fill(0);
-    if let Some(dst) = slice.get_mut(..HYPERCALL_SHIM_PROLOGUE.len()) {
-        dst.copy_from_slice(&HYPERCALL_SHIM_PROLOGUE);
-    } else {
-        let _ = crate::host::munmap(ptr, map_len);
-        return 0;
-    }
-    let body_off = HYPERCALL_SHIM_PROLOGUE.len();
-    if let Some(dst) = slice.get_mut(body_off..body_off.saturating_add(code.len())) {
-        dst.copy_from_slice(code);
-    } else {
-        let _ = crate::host::munmap(ptr, map_len);
-        return 0;
-    }
-    let reloc_off = body_off.saturating_add(trampoline_reloc_offset());
-    if let Some(slot) = slice.get_mut(reloc_off..reloc_off.saturating_add(8)) {
-        slot.copy_from_slice(&trampoline_rust_entry_addr().to_le_bytes());
-    } else {
-        let _ = crate::host::munmap(ptr, map_len);
-        return 0;
-    }
-    let prot_rx = libc::PROT_READ | libc::PROT_EXEC;
-    if !crate::host::mprotect(ptr, map_len, prot_rx) {
-        tracing::error!("hypercall shim mprotect RX failed");
-        let _ = crate::host::munmap(ptr, map_len);
-        return 0;
-    }
-    clear_icache(ptr, map_len);
-    let va = crate::host::ptr_addr_u64(ptr);
-    SHIM_VA.store(va, Ordering::Release);
-    tracing::info!(va = format_args!("{va:#x}"), "mapped NEON-preserving hypercall shim");
-    va
-}
 // ── trampoline machine code (verified via rustc/objdump aarch64) ─────────────
 
 /// Offset of the 8-byte absolute `kh_trampoline_dispatch` pointer.

@@ -14,7 +14,11 @@ mod manage;
 mod path;
 mod registry;
 
-pub use guest_tools::{DEFAULT_7ZZ_PATH, ENV_7ZZ, discover_7zz};
+pub use guest_tools::{
+    DARWIN_7ZZ_URL, DEFAULT_7ZZ_PATH, ENV_7ZZ, GUEST_7ZZ_REL, GUEST_PATH_DIRS, InstallPackage,
+    InstallReport, ToolError, discover_7zz, guest_path_to_host, install_package,
+    package_host_path, resolve_guest_program,
+};
 pub use layout::{
     GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX,
     ensure_libcxx_symlink, has_libcxx_symlink, is_bottle_root, materialize,

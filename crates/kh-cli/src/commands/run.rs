@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use kh_loader::{LoadSession, RunOptions, run_micro};
 use kh_runtime::GuestPageSize;
+use kh_runtime::bottle::{guest_path_to_host, resolve_guest_program};
 use serde_json::json;
 
 use super::util::{
@@ -35,8 +36,26 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
 
     let root = resolve_root(args.root);
 
+    // Bare names (`7zz`) resolve under the bottle at macOS paths
+    // (`/usr/local/bin/7zz`). Absolute guest paths stay as-is for translation.
+    let program = resolve_guest_program(args.path, root.as_deref());
+    let host_open = resolve_host_open_path(&program, root.as_deref());
+
     if args.dry_load {
-        return dry_load(args, guest, root);
+        return dry_load(args, guest, root, &host_open);
+    }
+
+    if !host_open.is_file() {
+        anyhow::bail!(
+            "guest program not found: {} (host {}){}",
+            program.display(),
+            host_open.display(),
+            if root.is_some() {
+                " — install tools into the bottle (`kh install 7zip`) or pass a host path"
+            } else {
+                " — create a bottle (`kh bottle ensure`) or pass an absolute host path"
+            }
+        );
     }
 
     kh_runtime::clear_trace_on_exit();
@@ -54,7 +73,7 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         dry_load: false,
     };
 
-    match run_micro(args.path, &opts) {
+    match run_micro(&host_open, &opts) {
         Ok(result) => {
             if let Some(code) = result.exit_code {
                 if code != args.expect_code {
@@ -73,8 +92,34 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
     }
 }
 
-fn dry_load(args: &RunArgs<'_>, guest: GuestPageSize, root: Option<PathBuf>) -> Result<()> {
-    let mut session = LoadSession::open_with_guest(args.path, root, guest)?;
+/// Host filesystem path used to open/map the Mach-O.
+fn resolve_host_open_path(program: &Path, bottle: Option<&Path>) -> PathBuf {
+    let Some(root) = bottle else {
+        return program.to_path_buf();
+    };
+    let s = program.to_string_lossy();
+    // Guest absolute path → under bottle. Host paths (dev fixtures) stay as-is.
+    if s.starts_with('/') {
+        let under = guest_path_to_host(root, program);
+        if under.is_file() {
+            return under;
+        }
+        // Fall back to treating the path as host absolute (e.g. /src/tests/…).
+        if program.is_file() {
+            return program.to_path_buf();
+        }
+        return under;
+    }
+    program.to_path_buf()
+}
+
+fn dry_load(
+    args: &RunArgs<'_>,
+    guest: GuestPageSize,
+    root: Option<PathBuf>,
+    host_open: &Path,
+) -> Result<()> {
+    let mut session = LoadSession::open_with_guest(host_open, root, guest)?;
     let report = session.dry_load()?;
 
     if args.json {
