@@ -263,7 +263,7 @@ fn install_libsystem_hypercall_linux(session: &mut LoadSession) -> bool {
 
     for img in session.images_mut() {
         let slide = img.slide();
-        let exports: Vec<_> = img.exports.iter().cloned().collect();
+        let exports: Vec<_> = img.exports.clone();
         for exp in exports {
             let slot = exp.name.as_str();
             let is_entry = slot == "_kh_bsd_hypercall" || slot == "kh_bsd_hypercall";

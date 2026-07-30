@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update \
@@ -9,24 +8,27 @@ RUN apt-get update \
 
 WORKDIR /src
 
+RUN rustup component add clippy
+
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
+
 COPY crates ./crates
 COPY tests ./tests
 COPY scripts ./scripts
 
-RUN rustup component add clippy
-
-# `kh-libsystem` is a guest aarch64-apple-darwin dylib; exclude from Linux CI.
-RUN cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings \
     && cargo test --workspace --exclude kh-libsystem \
-    && cargo build -p kakehashi --release
+    && cargo build -p kakehashi --release \
+    && cp /src/target/release/kh /src/kh
 
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
-COPY --from=builder /src/target/release/kh /usr/local/bin/kh
+COPY --from=builder /src/kh /usr/local/bin/kh
 
 COPY --from=builder /src/tests/fixtures /app/tests/fixtures
 COPY --from=builder /src/tests/clang-probe /app/tests/clang-probe
