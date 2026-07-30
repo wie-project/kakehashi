@@ -158,7 +158,6 @@ fn enter_host_tls_inner() {
     // Existing slot only — no HashMap insert (safe under guest TPIDR).
     let host = host_slot::with_tls_existing_mut(|m| {
         if !m.active {
-            // Slot present but inactive: treat current as host (best effort).
             m.host_tpidr = cur;
             m.active = true;
             return m.host_tpidr;
@@ -169,7 +168,6 @@ fn enter_host_tls_inner() {
         m.host_tpidr
     });
     let Some(host) = host else {
-        // No prepare yet — leave TPIDR alone.
         return;
     };
     if cur != host {
@@ -280,16 +278,20 @@ mod tests {
 
     #[test]
     fn enter_leave_restores_host() {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         {
             prepare_host_meta();
             let host = host_tpidr();
-            let fake_guest = 0x1000_u64;
+            // Real mapped guest TLS (unmapped fake VA would SEGV on probe).
+            let Some(base) = map_guest_tls_page() else {
+                return;
+            };
+            init_guest_tls_block(base, 0);
+            let fake_guest = crate::host::ptr_addr_u64(base);
             host_slot::with_tls_init(|m| {
                 m.guest_tpidr = fake_guest;
             });
-            // SAFETY: TPIDR briefly non-host; host_slot is gettid-keyed so
-            // enter_host_tls is safe; never assert while TPIDR is non-host.
+            // SAFETY: TPIDR briefly non-host; host_slot recovers host via gettid.
             let after_enter = unsafe {
                 cpu::write_tpidr_el0(fake_guest);
                 enter_host_tls();
@@ -307,6 +309,7 @@ mod tests {
 
             clear_guest_tls_on_exit();
             assert_eq!(cpu::read_tpidr_el0(), host);
+            let _ = crate::host::munmap(base, crate::host::page_size().unwrap_or(4096));
         }
     }
 }

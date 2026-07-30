@@ -37,6 +37,11 @@ static (MT data race).
 Storage is **`host_slot`** (gettid-keyed map), **not** `thread_local!`, because
 the first boundary instruction may already run under guest TPIDR.
 
+**Perf note:** hot archive workloads still pay per-hypercall `gettid`+`Mutex` and
+full NEON save/restore. Candidate speed-ups (guest-TLS slot cookie that is only
+probed under guest TPIDR; light I/O entry that skips the second NEON tramp)
+need careful multi-thread validation — prototypes SEGV'd under `7zz -mmt>1`.
+
 Exported C entry points used from asm:
 
 | Symbol | Role |
