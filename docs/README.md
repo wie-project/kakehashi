@@ -9,6 +9,7 @@ chat history when changing runtime, threading, or guest/host boundary code.
 | [Threading](threading.md) | 1:1 threads, join protocol, worker teardown |
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Non-negotiable rules (do not regress) |
+| [Roadmap](roadmap.md) | Perf ideas, order of work, allow / forbid |
 
 ## Audience and tone
 
