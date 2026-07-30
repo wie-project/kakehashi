@@ -18,9 +18,10 @@ multi-thread gate in [docs/README.md](README.md#verification-threading).
 ## TLS (`TPIDR_EL0`)
 
 8. **MUST** capture host `TPIDR_EL0` before any guest `msr` on that OS thread.
-9. **MUST** restore host TPIDR before host Rust, glibc, or panic formatting.
+9. **MUST** restore host TPIDR before host Rust, glibc, panic formatting, or `tracing`.
 10. **MUST NOT** use Rust `thread_local!` (or host TLS-dependent alloc) while guest TPIDR is live for boundary bookkeeping; use **`host_slot`** (gettid-keyed).
 11. **MUST** provide per-thread `___error` via guest TLS, not a process-global static.
+11b. **MUST NOT** leave guest `TPIDR_EL0` active across host-only code after `install_main_guest_tls`. Switch guest TPIDR only at `call_guest` / `jump_to_guest` (and restore host on return from `call_guest`). Leaving guest TPIDR active caused bare-metal Ubuntu SEGV in host `libc` at `si_addr=0xa0` before guest `main`.
 
 ## Hypercall and stacks
 

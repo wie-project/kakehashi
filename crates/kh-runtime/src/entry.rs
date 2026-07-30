@@ -69,6 +69,11 @@ pub unsafe fn jump_to_guest_args(
 
     #[cfg(target_arch = "aarch64")]
     {
+        // Guest TPIDR only for guest code (see `install_main_guest_tls`).
+        let guest = crate::tls::guest_tpidr();
+        if guest != 0 {
+            crate::tls::enter_guest_tls(guest);
+        }
         // SAFETY: caller invariants documented above. We zero FP/LR so a
         // guest return would fault rather than walk a bogus Rust frame.
         unsafe {
@@ -159,6 +164,12 @@ pub unsafe fn call_guest_args(
         // SP in x18 then produced `SIGBUS BUS_ADRALN` at `si_addr=0x1` after
         // guest `main` returned under `KAKEHASHI_HYPERCALL`.
         let mut host_sp: u64 = 0;
+        // Guest TPIDR only around guest code; restore host before returning to
+        // Rust (constructors / `main` return path use host TLS for logging etc.).
+        let guest = crate::tls::guest_tpidr();
+        if guest != 0 {
+            crate::tls::enter_guest_tls(guest);
+        }
         // SAFETY: caller invariants above. `clobber_abi("C")` clobbers x0–x18 /
         // x30; host SP and ret live in explicit callee-saved regs. x19 is
         // reserved by LLVM on aarch64 and cannot be an asm operand.
@@ -188,6 +199,7 @@ pub unsafe fn call_guest_args(
                 clobber_abi("C"),
             );
         }
+        crate::tls::enter_host_tls();
         let _ = host_sp;
         Ok(ret)
     }

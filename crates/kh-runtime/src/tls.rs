@@ -46,7 +46,13 @@ pub fn prepare_host_meta() {
     });
 }
 
-/// Installs a guest TLS block for the **main** thread and switches `TPIDR_EL0`.
+/// Allocates the main-thread guest TLS block and records it in [`host_slot`].
+///
+/// **Does not** leave `TPIDR_EL0` on the guest value. Host Rust / glibc / tracing
+/// must keep host TPIDR until [`enter_guest_tls`] at the actual guest entry
+/// (`call_guest` / `jump_to_guest`). Leaving guest TPIDR active caused immediate
+/// `SIGSEGV` in host `libc` (`si_addr=0xa0`) on some Ubuntu/glibc builds when
+/// any host code touched TLS (e.g. `tracing` thread-local dispatch).
 ///
 /// Returns the guest TLS VA, or `0` on allocation failure / non-Linux aarch64.
 #[must_use]
@@ -62,7 +68,11 @@ pub fn install_main_guest_tls() -> u64 {
         init_guest_tls_block(base, 0);
         let va = crate::host::ptr_addr_u64(base);
         MAIN_GUEST_TLS.store(va, Ordering::Release);
-        enter_guest_tls(va);
+        // Record guest TSD for the boundary; keep host TPIDR for host code.
+        host_slot::with_tls_init(|m| {
+            m.guest_tpidr = va;
+            m.active = true;
+        });
         va
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
