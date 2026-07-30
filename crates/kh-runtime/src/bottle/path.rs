@@ -40,10 +40,10 @@ pub fn bottle_root() -> Option<PathBuf> {
 
 /// Translates a guest path string into a host path.
 ///
-/// * Absolute guest path + bottle → `{root}/{relative}`
+/// * Absolute guest path + bottle → `{root}/{stripped absolute}`
 /// * Absolute guest path, no bottle → host absolute path as-is
-/// * Relative guest path + bottle → `{root}/{relative}`
-/// * Relative guest path, no bottle → host-relative path as-is
+/// * Relative guest path → **host CWD-relative** (Darwin open semantics); bottle
+///   is not applied. Still rejects `..` escape components.
 pub fn translate_path(guest: &str) -> Result<PathBuf, PathError> {
     // Avoid cloning the bottle root PathBuf on every open/stat.
     process::with_bottle_root(|root| translate_path_with_root(root, guest))
@@ -55,12 +55,24 @@ pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<Path
         return Err(PathError::Empty);
     }
 
+    // Relative paths follow host CWD (fixtures / argv paths), not the bottle tree.
+    if !guest.starts_with('/') {
+        // Reject `..` while keeping the original relative string for open(2).
+        strip_root_components(Path::new(guest))?;
+        return Ok(PathBuf::from(guest));
+    }
+
     // Fast path: no `..` and no empty components → strip leading slashes / `.`
     // without allocating intermediate PathBufs for each component.
     if let Some(rel) = try_fast_relative(guest) {
         return match root {
             Some(r) => {
-                let mut out = PathBuf::with_capacity(r.as_os_str().len().saturating_add(rel.len()).saturating_add(1));
+                let mut out = PathBuf::with_capacity(
+                    r.as_os_str()
+                        .len()
+                        .saturating_add(rel.len())
+                        .saturating_add(1),
+                );
                 out.push(r);
                 if !rel.is_empty() {
                     out.push(rel);
@@ -188,10 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn relative_under_bottle() {
+    fn relative_stays_host_cwd_even_with_bottle() {
         let root = Path::new("/opt/bottle");
         let host = translate_path_with_root(Some(root), "tmp/x").expect("translate relative");
-        assert_eq!(host, PathBuf::from("/opt/bottle/tmp/x"));
+        assert_eq!(host, PathBuf::from("tmp/x"));
+    }
+
+    #[test]
+    fn relative_rejects_dotdot() {
+        let root = Path::new("/opt/bottle");
+        let err = translate_path_with_root(Some(root), "../etc/passwd").expect_err("..");
+        assert!(matches!(err, PathError::Escape(_)));
     }
 
     #[test]

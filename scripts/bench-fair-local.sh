@@ -45,12 +45,10 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 
 mkdir -p "$OUT/bin" "$OUT/artifacts"
 
-# Optional refresh of dist/guest when a just-built dylib is present.
-if [[ ! -f dist/guest/libSystem.B.dylib ]]; then
-  if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
-    || [[ -f target/release/libkh_libsystem.dylib ]]; then
-    ./scripts/stage-libsystem.sh
-  fi
+# Optional refresh of crates.io embed when a just-built dylib is present.
+if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
+  || [[ -f target/release/libkh_libsystem.dylib ]]; then
+  ./scripts/stage-libsystem.sh
 fi
 
 if [[ ! -x "$OUT/bin/7zz" ]]; then

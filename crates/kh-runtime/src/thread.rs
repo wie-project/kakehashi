@@ -4,27 +4,20 @@
 //! - `bsdthread_register` stores the libpthread start trampoline VA.
 //! - `bsdthread_create` spawns a **host** thread that jumps into that trampoline
 //!   with Darwin `_pthread_start` register convention (`x0`–`x3`).
-//! - `bsdthread_terminate` switches back to a saved **host** stack then
-//!   `pthread_exit`s this host thread only (never exit on the guest stack).
+//! - `bsdthread_terminate` switches back to a saved **host** stack then ends
+//!   this host thread only (never exit on the guest stack).
 //! - Guest `pthread_join` completion (`done` + futex wake) is published from
 //!   the host stack so joiners never `munmap` a stack still in use.
+//! - Worker teardown uses raw `SYS_exit` (not `pthread_exit`): glibc
+//!   `pthread_exit` runs `_Unwind_ForcedUnwind`, which walks `x29` into guest /
+//!   hypercall frames and SEGV's in `libgcc_s` under 7zz MT.
 //! - Live spawn requires **Linux aarch64** (same as the trap backend).
 
 #![allow(unsafe_code)]
 
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-thread_local! {
-    static TID: Cell<u64> = const { Cell::new(0) };
-}
-
-// Per-thread host stack for freestanding hypercall dispatch (see `kh_host_alt_sp`).
-// Guest SP is unsafe for host Rust under 7zz `-mmt>1`.
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-thread_local! {
-    static HOST_ALT: Cell<Option<HostAltStack>> = const { Cell::new(None) };
-}
+use crate::host_slot;
 
 /// Monotonic guest-visible thread id counter (`thread_selfid`).
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
@@ -33,65 +26,99 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 const HOST_ALT_STACK_SIZE: usize = 512 * 1024;
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-#[derive(Clone, Copy)]
-struct HostAltStack {
-    base: *mut u8,
-    len: usize,
-    /// 16-byte-aligned top address used as initial SP.
-    top: u64,
-}
-
 /// Returns a 16-byte-aligned host SP for freestanding hypercall dispatch.
 ///
-/// Called from the hypercall asm entry **before** Rust dispatch. Lazy-maps a
-/// private stack the first time each host thread hypercalls.
+/// Prefer calling [`ensure_host_alt_stack`] while host `TPIDR_EL0` is live
+/// (worker prepare / main TLS install). The hypercall entry also restores host
+/// TLS before invoking this so a cold first map is safe.
+///
+/// Uses [`host_slot`] — never Rust `thread_local!`.
 ///
 /// # Safety
 ///
 /// Caller must restore guest SP after the call returns. The buffer is
-/// thread-local and valid until [`drop_host_alt_stack`] / process exit.
+/// valid until [`drop_host_alt_stack`] / process exit.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kh_host_alt_sp() -> u64 {
-    HOST_ALT.with(|cell| {
-        if let Some(s) = cell.get() {
+    ensure_host_alt_stack()
+}
+
+/// Map this OS thread's hypercall alt stack if missing; return its top SP.
+///
+/// Safe to call repeatedly. Must run with **host** `TPIDR_EL0` for the first
+/// map (glibc `mmap` / map mutex).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[must_use]
+pub fn ensure_host_alt_stack() -> u64 {
+    host_slot::with_alt_mut(|cell| {
+        if let Some(s) = *cell {
             return s.top;
         }
         match map_host_alt_stack() {
             Some(s) => {
-                cell.set(Some(s));
-                s.top
+                let top = s.top;
+                *cell = Some(s);
+                top
             }
             None => 0,
         }
     })
 }
 
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[must_use]
+pub fn ensure_host_alt_stack() -> u64 {
+    0
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn map_host_alt_stack() -> Option<HostAltStack> {
+fn map_host_alt_stack() -> Option<host_slot::AltStackSlot> {
     let len = HOST_ALT_STACK_SIZE;
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-    // Linux: MAP_STACK is advisory; omit for portability of the flag set.
     let prot = libc::PROT_READ | libc::PROT_WRITE;
-    let ptr = crate::host::mmap(None, len, prot, flags, -1, 0)?;
+    // Prefer raw syscall so a mistaken guest-TPIDR call does not enter glibc
+    // arena code that depends on host TLS.
+    let ptr = mmap_anon_raw(len, prot, flags)?;
     let base_u = crate::host::ptr_addr_u64(ptr);
     let top = base_u.saturating_add(u64::try_from(len).unwrap_or(0)) & !0xF;
     if top <= base_u {
         let _ = crate::host::munmap(ptr, len);
         return None;
     }
-    Some(HostAltStack {
+    Some(host_slot::AltStackSlot {
         base: ptr,
         len,
         top,
     })
 }
 
+/// Anonymous `mmap` via raw syscall (no glibc TLS dependency).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn mmap_anon_raw(len: usize, prot: libc::c_int, flags: libc::c_int) -> Option<*mut u8> {
+    // SAFETY: anonymous map; fd/offset unused with MAP_ANONYMOUS.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_mmap,
+            core::ptr::null_mut::<libc::c_void>(),
+            len,
+            prot,
+            flags,
+            -1_i32,
+            0_i64,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    let addr = usize::try_from(raw).ok()?;
+    Some(core::ptr::with_exposed_provenance_mut(addr))
+}
+
 /// Unmaps this thread's hypercall alt stack (worker exit / tests).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub(crate) fn drop_host_alt_stack() {
-    HOST_ALT.with(|cell| {
+    host_slot::with_alt_mut(|cell| {
         if let Some(s) = cell.take() {
             let _ = crate::host::munmap(s.base, s.len);
         }
@@ -122,15 +149,15 @@ pub fn alloc_tid() -> u64 {
 }
 
 /// Current host thread's guest tid (stable for the host thread lifetime).
+///
+/// Uses [`host_slot`] so it remains safe under guest `TPIDR_EL0`.
 #[must_use]
 pub fn thread_selfid() -> u64 {
-    TID.with(|c| {
-        let mut v = c.get();
-        if v == 0 {
-            v = alloc_tid();
-            c.set(v);
+    host_slot::with_worker_mut(|w| {
+        if w.guest_tid == 0 {
+            w.guest_tid = alloc_tid();
         }
-        v
+        w.guest_tid
     })
 }
 
@@ -174,7 +201,7 @@ pub fn spawn_guest_thread(start: GuestThreadStart) -> Result<(), i64> {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 mod linux {
     use super::{EAGAIN, GuestThreadStart, LIVE_WORKERS, thread_selfid};
-    use std::cell::Cell;
+    use crate::host_slot;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Must match freestanding `kh-libsystem` `KhThread` / `MAGIC`.
@@ -186,22 +213,10 @@ mod linux {
     /// offset 12: detached: AtomicU32
     /// offset 16: result: AtomicUsize
     /// … stack fields follow; host only touches magic + done.
+    /// offset 56: tsd
     /// ```
     const KH_THREAD_MAGIC: u64 = 0x4B48_5054_4852_4401;
     const KH_THREAD_DONE_OFF: usize = 8;
-
-    /// Host `(pc, sp)` used when a guest worker hits `bsdthread_terminate`.
-    #[derive(Clone, Copy)]
-    struct HostExitFrame {
-        pc: u64,
-        sp: u64,
-    }
-
-    thread_local! {
-        static HOST_EXIT: Cell<Option<HostExitFrame>> = const { Cell::new(None) };
-        /// Guest `pthread_t` VA for this worker (identity-mapped `KhThread`).
-        static GUEST_PTHREAD: Cell<u64> = const { Cell::new(0) };
-    }
 
     pub(super) fn linux_spawn(start: GuestThreadStart) -> Result<(), i64> {
         if start.entry == 0 || start.sp == 0 || !start.sp.is_multiple_of(16) {
@@ -220,17 +235,31 @@ mod linux {
 
     fn guest_worker_main(start: GuestThreadStart) {
         let _ = thread_selfid();
-        GUEST_PTHREAD.set(start.pthread);
+        host_slot::with_worker_mut(|w| {
+            w.guest_pthread = start.pthread;
+        });
+
+        // Capture host TPIDR *before* guest code may msr guest TSD into TPIDR_EL0.
+        crate::tls::prepare_host_meta();
+        // Map hypercall alt stack while host TLS is still live (workers hit
+        // freestanding hypercall immediately under 7zz `-mmt>1`).
+        let _ = super::ensure_host_alt_stack();
 
         // `bsdthread_create` runs inside the SIGTRAP handler, where SIGTRAP is
         // blocked. `std::thread::spawn` copies that mask, so the worker would
         // die on the first guest `brk` unless we unblock here.
         unblock_sigtrap();
 
-        let host_sp = read_sp();
+        let host_sp = crate::cpu::read_sp();
         // Leave room for host exit / join-publish frames (not just 512 B).
         let frame_sp = host_sp.saturating_sub(4096) & !0xF;
         set_host_exit_frame(host_thread_exit_pc(), frame_sp);
+
+        // Prefer freestanding KhThread.tsd (offset 56) when present; else guest
+        // trampoline will install TLS itself and boundary will mrs it.
+        if let Some(tsd) = guest_tsd_from_pthread(start.pthread) {
+            crate::tls::enter_guest_tls(tsd);
+        }
 
         // SAFETY: trap handlers installed by `run_micro` before create; entry/stack
         // are guest `bsdthread_create` arguments (mapped stack region).
@@ -251,6 +280,28 @@ mod linux {
         finish_worker_on_host();
     }
 
+    /// Freestanding `KhThread` layout: `tsd: *mut GuestTls` at offset 56.
+    const KH_THREAD_TSD_OFF: usize = 56;
+
+    fn guest_tsd_from_pthread(pthread: u64) -> Option<u64> {
+        let base = usize::try_from(pthread).ok()?;
+        if base == 0 {
+            return None;
+        }
+        // SAFETY: identity-mapped freestanding KhThread from pthread_create.
+        let magic_ptr = std::ptr::with_exposed_provenance::<u64>(base);
+        let magic = unsafe { core::ptr::read_volatile(magic_ptr) };
+        if magic != KH_THREAD_MAGIC {
+            return None;
+        }
+        let tsd_ptr = std::ptr::with_exposed_provenance::<u64>(base.saturating_add(KH_THREAD_TSD_OFF));
+        let tsd = unsafe { core::ptr::read_volatile(tsd_ptr) };
+        if tsd == 0 {
+            return None;
+        }
+        Some(tsd)
+    }
+
     fn unblock_sigtrap() {
         // SAFETY: only clears the per-thread SIGTRAP block bit inherited from
         // the spawning signal handler; disposition is already installed.
@@ -264,15 +315,6 @@ mod linux {
                 std::ptr::null_mut(),
             );
         }
-    }
-
-    fn read_sp() -> u64 {
-        let sp: u64;
-        // SAFETY: reading SP is a pure register move.
-        unsafe {
-            std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
-        }
-        sp
     }
 
     #[allow(clippy::as_conversions, function_casts_as_integer)]
@@ -291,13 +333,27 @@ mod linux {
     /// `pthread_join` may munmap once `done` is visible).
     fn finish_worker_on_host() -> ! {
         clear_host_exit_frame();
+        // Host TLS before any further host libc (join publish, munmap, exit).
+        crate::tls::clear_guest_tls_on_exit();
         publish_guest_join_done();
-        GUEST_PTHREAD.set(0);
+        host_slot::with_worker_mut(|w| {
+            w.guest_pthread = 0;
+        });
         super::drop_host_alt_stack();
+        host_slot::clear_current();
         worker_finished();
-        // SAFETY: intentional end of this host thread only (not the process).
+        // End **this** OS thread only. Do **not** call `pthread_exit`:
+        // glibc runs `_Unwind_ForcedUnwind` for cleanup handlers; after a
+        // hypercall/guest jump the FP chain still points into guest memory
+        // and the DWARF walker SEGV's in `libgcc_s` (seen as pc=libgcc+0xe320
+        // under 7zz `-mmt>1`). Raw `SYS_exit` skips forced unwind.
+        // SAFETY: Linux `exit` (not `exit_group`) terminates only the caller.
         unsafe {
-            libc::pthread_exit(std::ptr::null_mut());
+            libc::syscall(libc::SYS_exit, 0);
+        }
+        // syscall exit is noreturn; keep the type checker happy.
+        loop {
+            core::hint::spin_loop();
         }
     }
 
@@ -308,7 +364,7 @@ mod linux {
     /// guest stack while hypercall terminate / Rust still ran on it (intermittent
     /// SEGV under 7zz `-mmt>1` with freestanding hypercall).
     fn publish_guest_join_done() {
-        let pthread = GUEST_PTHREAD.get();
+        let pthread = host_slot::worker_get().guest_pthread;
         if pthread == 0 {
             return;
         }
@@ -359,20 +415,28 @@ mod linux {
 
     /// Hypercall / trap path: leave the guest stack, then end this host worker.
     ///
-    /// Switching SP before `pthread_exit` is mandatory: freestanding hypercall
-    /// runs host Rust on the guest stack, and joiners reclaim that stack once
-    /// the worker is joinable.
+    /// Switching SP (and clearing FP) before teardown is mandatory: freestanding
+    /// hypercall may have left `x29` pointing at a guest frame that joiners
+    /// munmap once `done` is published; forced unwind must never see that chain.
     pub(crate) fn exit_worker_now() -> ! {
-        let frame = HOST_EXIT.take();
-        if let Some(frame) = frame {
+        let (pc, sp, has) = host_slot::with_worker_mut(|w| {
+            let has = w.has_exit;
+            let pc = w.exit_pc;
+            let sp = w.exit_sp;
+            w.has_exit = false;
+            (pc, sp, has)
+        });
+        if has {
             // SAFETY: frame was recorded on this host thread before guest entry;
             // `pc` is `host_thread_exit`, `sp` is 16-byte aligned host stack.
+            // Zero `x29` so any accidental libc unwind cannot follow guest FP.
             unsafe {
                 std::arch::asm!(
                     "mov sp, {sp}",
+                    "mov x29, xzr",
                     "br {pc}",
-                    sp = in(reg) frame.sp,
-                    pc = in(reg) frame.pc,
+                    sp = in(reg) sp,
+                    pc = in(reg) pc,
                     options(noreturn),
                 );
             }
@@ -382,23 +446,31 @@ mod linux {
     }
 
     fn set_host_exit_frame(pc: u64, sp: u64) {
-        HOST_EXIT.set(Some(HostExitFrame { pc, sp }));
+        host_slot::with_worker_mut(|w| {
+            w.exit_pc = pc;
+            w.exit_sp = sp;
+            w.has_exit = true;
+        });
     }
 
     fn clear_host_exit_frame() {
-        HOST_EXIT.set(None);
+        host_slot::with_worker_mut(|w| {
+            w.has_exit = false;
+        });
     }
 
-    /// Rewrite `mcontext` so sigreturn jumps to the host `pthread_exit` trampoline.
+    /// Rewrite `mcontext` so sigreturn jumps to the host worker-exit trampoline.
     pub(crate) fn redirect_ucontext_to_host_exit(m: &mut libc::mcontext_t) -> bool {
-        HOST_EXIT.with(|cell| {
-            let Some(frame) = cell.get() else {
+        host_slot::with_worker_mut(|w| {
+            if !w.has_exit {
                 return false;
-            };
+            }
             // Consume so a second terminate does not reuse a stale frame.
-            cell.set(None);
-            m.pc = frame.pc;
-            m.sp = frame.sp;
+            w.has_exit = false;
+            m.pc = w.exit_pc;
+            m.sp = w.exit_sp;
+            // Drop guest FP chain (same rationale as `exit_worker_now`).
+            m.regs[29] = 0;
             true
         })
     }
@@ -407,7 +479,7 @@ mod linux {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use linux::linux_spawn;
 
-/// Rewrite `mcontext` so sigreturn jumps to the host `pthread_exit` trampoline.
+/// Rewrite `mcontext` so sigreturn jumps to the host worker-exit trampoline.
 ///
 /// Returns `false` when no frame is installed (main thread / non-worker).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -415,7 +487,8 @@ pub(crate) use linux::redirect_ucontext_to_host_exit;
 
 /// End the current guest worker from hypercall/trap (not signal ucontext).
 ///
-/// Switches to the saved host stack, publishes join `done`, then `pthread_exit`s.
+/// Switches to the saved host stack, publishes join `done`, then ends the
+/// host OS thread (`SYS_exit` — see `finish_worker_on_host`).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub(crate) fn exit_current_guest_worker() -> ! {
     linux::exit_worker_now();

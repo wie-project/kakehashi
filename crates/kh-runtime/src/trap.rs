@@ -567,8 +567,9 @@ pub struct TrampRet {
 /// Caller must preserve guest SIMD/GPRs around the call (veneer trampoline or
 /// freestanding NEON shim). Arguments are Darwin BSD syscall registers;
 /// `x16` holds the syscall number (or AAPCS 8th arg after the hypercall
-/// prologue). May `pthread_exit` the current host thread on
-/// `bsdthread_terminate`, or `_exit` the process on guest `exit`.
+/// prologue). May end the current host worker thread on
+/// `bsdthread_terminate` (`SYS_exit`, not `pthread_exit`), or `_exit` the
+/// process on guest `exit`.
 ///
 /// Prefer [`kh_hypercall_entry`] for freestanding libSystem: that path switches
 /// onto a host alt stack first so multi-thread guests never run host Rust on
@@ -616,8 +617,20 @@ pub unsafe extern "C" fn kh_trampoline_dispatch(
 
 // Freestanding hypercall entry (`kh_hypercall_entry`):
 // Prefer host alt stack (so join/terminate never runs host Rust on a guest
-// stack that `pthread_join` may unmap). NEON preserve is TRAMP_BYTES (same as
-// the svc veneer). ABI: x0–x6 + number in x7 → TrampRet in x0/x1.
+// stack that `pthread_join` may unmap).
+//
+// **NEON:** Darwin `svc` preserves Q0–Q31. We must too. Any `bl` into Rust/C
+// (TLS enter, alt-stack map) clobbers caller-saved SIMD under AAPCS64, so full
+// Q0–Q31 + FPCR/FPSR are saved on the *guest* prolog frame *before* any `bl`.
+// TRAMP_BYTES still saves around the dispatch body (belt-and-braces).
+//
+// ABI: x0–x6 + number in x7 → TrampRet in x0/x1.
+// Guest frame layout (640 B):
+//   [0]   x29,x30
+//   [16]  x0,x1  [32] x2,x3  [48] x4,x5  [64] x6,x7
+//   [80]  pad
+//   [96]  q0..q31 (512 B)
+//   [608] fpcr,fpsr
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 std::arch::global_asm!(
     r#"
@@ -626,42 +639,121 @@ std::arch::global_asm!(
     .global kh_hypercall_entry
     .type kh_hypercall_entry, %function
 kh_hypercall_entry:
-    // Guest prolog: args + real LR (before any `bl` clobbers x30).
-    sub sp, sp, #96
+    // Guest prolog: GPRs + full NEON *before* any bl (NEON must survive host TLS).
+    sub sp, sp, #640
     stp x29, x30, [sp, #0]
     stp x0, x1, [sp, #16]
     stp x2, x3, [sp, #32]
     stp x4, x5, [sp, #48]
     stp x6, x7, [sp, #64]
     mov x29, sp
+    stp q0, q1, [sp, #96]
+    stp q2, q3, [sp, #128]
+    stp q4, q5, [sp, #160]
+    stp q6, q7, [sp, #192]
+    stp q8, q9, [sp, #224]
+    stp q10, q11, [sp, #256]
+    stp q12, q13, [sp, #288]
+    stp q14, q15, [sp, #320]
+    stp q16, q17, [sp, #352]
+    stp q18, q19, [sp, #384]
+    stp q20, q21, [sp, #416]
+    stp q22, q23, [sp, #448]
+    stp q24, q25, [sp, #480]
+    stp q26, q27, [sp, #512]
+    stp q28, q29, [sp, #544]
+    stp q30, q31, [sp, #576]
+    mrs x9, fpcr
+    mrs x10, fpsr
+    // #608 exceeds signed LDP imm7*8 range (±512); use base+add.
+    add x11, sp, #608
+    stp x9, x10, [x11]
 
+    // Host glibc TLS *before* alt-stack lookup/alloc (mmap/mutex need host TPIDR).
+    bl kh_tls_enter_host
     bl kh_host_alt_sp
     cbz x0, 1f
     mov x9, sp                 // guest prolog frame
     mov sp, x0                 // host alt stack
     ldr x30, [x9, #8]          // reload LR → freestanding thin caller
+    // Host frame: [guest_frame, lr]
     stp x9, x30, [sp, #-16]!
+    // Reload guest frame ptr / args (enter_host + alt_sp clobbered temps).
+    ldr x9, [sp]
     ldp x0, x1, [x9, #16]
     ldp x2, x3, [x9, #32]
     ldp x4, x5, [x9, #48]
     ldp x6, x7, [x9, #64]
     mov x16, x7
     bl kh_neon_tramp_entry
+    // Preserve TrampRet (x0/x1) across TLS restore.
+    stp x0, x1, [sp, #-16]!
+    bl kh_tls_leave_host
+    ldp x0, x1, [sp], #16
     ldp x9, x30, [sp], #16
     mov sp, x9
+    // Restore guest NEON from prolog (pre-bl snapshot).
+    ldp q0, q1, [sp, #96]
+    ldp q2, q3, [sp, #128]
+    ldp q4, q5, [sp, #160]
+    ldp q6, q7, [sp, #192]
+    ldp q8, q9, [sp, #224]
+    ldp q10, q11, [sp, #256]
+    ldp q12, q13, [sp, #288]
+    ldp q14, q15, [sp, #320]
+    ldp q16, q17, [sp, #352]
+    ldp q18, q19, [sp, #384]
+    ldp q20, q21, [sp, #416]
+    ldp q22, q23, [sp, #448]
+    ldp q24, q25, [sp, #480]
+    ldp q26, q27, [sp, #512]
+    ldp q28, q29, [sp, #544]
+    ldp q30, q31, [sp, #576]
+    add x11, sp, #608
+    ldp x9, x10, [x11]
+    msr fpcr, x9
+    msr fpsr, x10
     ldr x29, [sp, #0]
-    add sp, sp, #96
+    add sp, sp, #640
     ret
 1:
-    // No alt stack: NEON tramp on the guest stack (ST / fallback).
+    // No alt stack: dispatch on the guest stack (ST / fallback only).
+    // Already on host TLS from the enter above.
     ldp x0, x1, [sp, #16]
     ldp x2, x3, [sp, #32]
     ldp x4, x5, [sp, #48]
     ldp x6, x7, [sp, #64]
-    ldp x29, x30, [sp, #0]
-    add sp, sp, #96
     mov x16, x7
-    b kh_neon_tramp_entry
+    // Preserve real LR across the call (still on guest prolog frame).
+    ldr x30, [sp, #8]
+    bl kh_neon_tramp_entry
+    stp x0, x1, [sp, #-16]!
+    bl kh_tls_leave_host
+    ldp x0, x1, [sp], #16
+    // Restore guest NEON from prolog.
+    ldp q0, q1, [sp, #96]
+    ldp q2, q3, [sp, #128]
+    ldp q4, q5, [sp, #160]
+    ldp q6, q7, [sp, #192]
+    ldp q8, q9, [sp, #224]
+    ldp q10, q11, [sp, #256]
+    ldp q12, q13, [sp, #288]
+    ldp q14, q15, [sp, #320]
+    ldp q16, q17, [sp, #352]
+    ldp q18, q19, [sp, #384]
+    ldp q20, q21, [sp, #416]
+    ldp q22, q23, [sp, #448]
+    ldp q24, q25, [sp, #480]
+    ldp q26, q27, [sp, #512]
+    ldp q28, q29, [sp, #544]
+    ldp q30, q31, [sp, #576]
+    add x11, sp, #608
+    ldp x9, x10, [x11]
+    msr fpcr, x9
+    msr fpsr, x10
+    ldp x29, x30, [sp, #0]
+    add sp, sp, #640
+    ret
     .size kh_hypercall_entry, .-kh_hypercall_entry
     "#
 );
@@ -888,6 +980,8 @@ unsafe extern "C" fn guest_fault_sigaction(
     info: *mut libc::siginfo_t,
     ctx: *mut libc::c_void,
 ) {
+    // May run under guest TPIDR; restore host before formatting / write.
+    crate::tls::enter_host_tls();
     let name = match signo {
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGBUS => "SIGBUS",
@@ -924,6 +1018,29 @@ unsafe extern "C" fn guest_fault_sigaction(
          x0={x0:#x} x1={x1:#x} x8={x8:#x} x16={x16:#x}\n"
     );
     drop(io::stderr().write_all(msg.as_bytes()));
+    // Best-effort: which mapping owns PC / fault address (helps MT diagnosis).
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for &va in &[pc, addr, lr, x16] {
+            for line in maps.lines() {
+                let Some((range, rest)) = line.split_once(' ') else {
+                    continue;
+                };
+                let Some((a, b)) = range.split_once('-') else {
+                    continue;
+                };
+                let (Ok(lo), Ok(hi)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))
+                else {
+                    continue;
+                };
+                if va >= lo && va < hi {
+                    let off = va.saturating_sub(lo);
+                    let m = format!("  map {va:#x} = {lo:#x}+{off:#x} {rest}\n");
+                    drop(io::stderr().write_all(m.as_bytes()));
+                    break;
+                }
+            }
+        }
+    }
     drop(io::stderr().flush());
     if TRACE_ON_EXIT.load(Ordering::SeqCst) {
         dump_events_before_exit();
@@ -1021,6 +1138,9 @@ unsafe extern "C" fn trap_sigaction(
         return;
     }
 
+    // Guest may have TPIDR_EL0 = guest TSD; restore host TLS before Rust/libc.
+    crate::tls::enter_host_tls();
+
     // SAFETY: kernel provides a valid `ucontext_t` for SA_SIGINFO deliveries.
     let uctx = unsafe { &mut *ctx.cast::<libc::ucontext_t>() };
     let m = &mut uctx.uc_mcontext;
@@ -1069,8 +1189,11 @@ unsafe extern "C" fn trap_sigaction(
         }
         TrapOutcome::Continue => {
             m.pc = pc.wrapping_add(4);
+            // Return to guest with guest TPIDR restored.
+            crate::tls::leave_host_tls();
         }
         TrapOutcome::ThreadExit => {
+            // Stay on host TLS; exit trampoline publishes join then pthread_exit.
             // Redirect ucontext to a host `pthread_exit` trampoline on this
             // thread's original stack (see `crate::thread`). Main thread
             // (no host frame) falls back to process exit.

@@ -249,8 +249,8 @@ pub fn active_root() -> Result<Option<PathBuf>, BottleError> {
 /// # After cargo install kakehashi (uses embedded freestanding libSystem):
 /// kh bottle ensure
 ///
-/// # Dev: override with a just-built dylib
-/// kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+/// # Dev: override with a just-built / staged dylib
+/// kh bottle ensure --libsystem crates/kh-runtime/resources/libSystem.B.dylib
 /// ```
 ///
 /// * Valid registered bottle → reinstalls libSystem (unless `skip_libsystem`).

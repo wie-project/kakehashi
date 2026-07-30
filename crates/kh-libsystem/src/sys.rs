@@ -1,7 +1,5 @@
 //! Darwin arm64 syscall entry (`svc #0x80`, number in `x16`).
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 /// BSD `exit`.
 pub(crate) const SYS_EXIT: u32 = 1;
 /// BSD `read`.
@@ -139,55 +137,18 @@ struct HyperRet {
 #[allow(dead_code)] // written by host loader via export name
 static mut KH_BSD_HYPERCALL: usize = 0;
 
-/// Host writes 1 when worker hypercall is enabled (`KAKEHASHI_HYPERCALL_WORKERS=1`).
-///
-/// Default 0: only the LC_MAIN stack uses freestanding hypercall; workers keep
-/// `svc`→`brk` (NEON MT compression is green there). When non-zero, every thread
-/// uses hypercall (experimental — may SEGV under 7zz `-mmt>1 -mx>0`).
+/// Legacy export kept for loader compatibility. New runtime always uses
+/// hypercall on every thread when [`KH_BSD_HYPERCALL`] is wired (TLS + host alt
+/// stack boundary). Value is ignored by freestanding code.
 #[unsafe(export_name = "kh_hypercall_workers")]
 #[allow(dead_code)] // written by host loader / runtime
-static mut KH_HYPERCALL_WORKERS: u32 = 0;
-
-/// SP bucket of the first syscall (LC_MAIN). Worker stacks are separate mmaps.
-static MAIN_STACK_SP: AtomicUsize = AtomicUsize::new(0);
-
-/// 4 MiB bucket (matches guest worker `STACK_SIZE`).
-const STACK_BUCKET: usize = 4 * 1024 * 1024;
-
-/// True when current SP is the main guest stack (or worker hypercall is on).
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn hypercall_allowed_here() -> bool {
-    // SAFETY: host writes once before / at guest entry; workers only read.
-    let workers = unsafe { core::ptr::addr_of!(KH_HYPERCALL_WORKERS).read_volatile() };
-    if workers != 0 {
-        return true;
-    }
-    let sp = read_sp();
-    let bucket = sp & !(STACK_BUCKET.saturating_sub(1));
-    match MAIN_STACK_SP.compare_exchange(0, bucket, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => true,
-        Err(main_bucket) => bucket == main_bucket,
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn read_sp() -> usize {
-    let sp: u64;
-    // SAFETY: pure register read.
-    unsafe {
-        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
-    }
-    usize::try_from(sp).unwrap_or(0)
-}
+static mut KH_HYPERCALL_WORKERS: u32 = 1;
 
 /// Invokes a Darwin BSD syscall with up to seven arguments (`x0`–`x6`).
 ///
-/// When the host has wired [`KH_BSD_HYPERCALL`]:
-/// - **Main** stack always uses freestanding hypercall (fast I/O).
-/// - **Workers** use hypercall only if [`KH_HYPERCALL_WORKERS`] ≠ 0; otherwise
-///   `svc`→`brk` (safe for 7zz MT NEON compression).
+/// When the host has wired [`KH_BSD_HYPERCALL`], **all** threads use the
+/// freestanding hypercall (host alt stack + TPIDR save/restore). Otherwise
+/// fall back to `svc #0x80` (real Darwin or unpatched path).
 ///
 /// Join completion is published from the host stack after `bsdthread_terminate`
 /// (see `kh-runtime::thread`).
@@ -209,10 +170,10 @@ pub(crate) unsafe fn syscall7(
 ) -> isize {
     #[cfg(target_arch = "aarch64")]
     {
-        // Prefer host hypercall when wired and allowed on this stack.
+        // Prefer host hypercall when wired (every guest thread).
         // SAFETY: slot is process-local; runtime writes once before guest entry.
         let hyper = unsafe { core::ptr::addr_of!(KH_BSD_HYPERCALL).read_volatile() };
-        if hyper != 0 && hypercall_allowed_here() {
+        if hyper != 0 {
             let r = unsafe {
                 hypercall_thin(hyper, a0, a1, a2, a3, a4, a5, a6, u64::from(number))
             };

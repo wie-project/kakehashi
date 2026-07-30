@@ -31,17 +31,33 @@ const ENOMEM: i32 = 12;
 
 /// Shared with `kh-runtime::thread` (host publishes `done` after stack switch).
 const MAGIC: u64 = 0x4B48_5054_4852_4401; // "KHPTHRD\x01"
+/// Guest TLS magic — keep in sync with `kh-runtime::tls::GUEST_TLS_MAGIC`.
+const TLS_MAGIC: u64 = 0x4B48_544C_5301; // "KHTLS\x01"
 /// Guest worker stacks must fit freestanding NEON hypercall frames + host
 /// dispatch + 7zz LZMA worker frames. 1 MiB was tight under `-mmt>1`.
 const STACK_SIZE: usize = 4 * 1024 * 1024;
 const PAGE: usize = 16_384;
+const TLS_SIZE: usize = 64;
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Per-thread guest TLS block pointed to by `TPIDR_EL0`.
+///
+/// Layout ABI with `kh-runtime::tls` / `errno`:
+/// `magic @ 0`, `errno @ 8`, `pthread_self @ 16`.
+#[repr(C, align(16))]
+struct GuestTls {
+    magic: u64,
+    errno: i32,
+    pad: u32,
+    pthread_self: u64,
+}
 
 /// Control block pointed to by guest `pthread_t`.
 ///
 /// Layout is an ABI with the host worker exit path (`kh-runtime::thread`):
-/// `magic @ 0`, `done @ 8`, `detached @ 12`, `result @ 16`, then stack fields.
+/// `magic @ 0`, `done @ 8`, `detached @ 12`, `result @ 16`, stack fields,
+/// then `tsd @ 56` (guest TPIDR base).
 #[repr(C, align(16))]
 struct KhThread {
     magic: u64,
@@ -55,6 +71,8 @@ struct KhThread {
     /// User start routine (kept for debugging).
     start_func: usize,
     start_arg: usize,
+    /// Guest TLS base for `TPIDR_EL0` (host may install before jump).
+    tsd: *mut GuestTls,
 }
 
 type StartFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
@@ -70,6 +88,24 @@ pub(crate) unsafe extern "C" fn kh_pthread_start(
     func: *mut c_void,
     arg: *mut c_void,
 ) {
+    // Install guest TPIDR before any libSystem call that uses ___error / TSD.
+    // Host runtime also installs this when KhThread.tsd is visible; idempotent.
+    if !pthread.is_null() {
+        let t = pthread.cast::<KhThread>();
+        // SAFETY: control block from our pthread_create.
+        unsafe {
+            if (*t).magic == MAGIC {
+                let tsd = (*t).tsd;
+                if !tsd.is_null() {
+                    let va = u64::try_from(tsd.addr()).unwrap_or(0);
+                    if va != 0 {
+                        write_tpidr_el0(va);
+                    }
+                }
+            }
+        }
+    }
+
     let mut ret: *mut c_void = core::ptr::null_mut();
     if !func.is_null() {
         let f: StartFn = unsafe { core::mem::transmute(func) };
@@ -92,6 +128,23 @@ pub(crate) unsafe extern "C" fn kh_pthread_start(
         core::hint::spin_loop();
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn write_tpidr_el0(val: u64) {
+    // SAFETY: guest TLS block lives until join reclaims the thread.
+    unsafe {
+        core::arch::asm!(
+            "msr tpidr_el0, {}",
+            in(reg) val,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn write_tpidr_el0(_val: u64) {}
 
 fn trampoline_va() -> u64 {
     // Function-item → code address for `bsdthread_register`.
@@ -207,8 +260,7 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
     }
     let w = unsafe { &*mutex_word(mutex) };
     // Fast path: uncontended.
-    if w
-        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+    if w.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
     {
         return 0;
@@ -216,8 +268,7 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
     // Short spin then park while still locked.
     loop {
         for _ in 0..64_u32 {
-            if w
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            if w.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 return 0;
@@ -276,10 +327,7 @@ pub(crate) unsafe extern "C" fn pthread_cond_destroy(cond: *mut c_void) -> c_int
 ///
 /// Generation wait via host futex park (not yield-spin).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn pthread_cond_wait(
-    cond: *mut c_void,
-    mutex: *mut c_void,
-) -> c_int {
+pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     if cond.is_null() || mutex.is_null() {
         return EINVAL;
     }
@@ -362,8 +410,23 @@ pub(crate) unsafe extern "C" fn pthread_create(
         munmap_anon(stack, STACK_SIZE);
         return EAGAIN;
     }
+    let tsd_raw = unsafe { malloc(core::mem::size_of::<GuestTls>().max(TLS_SIZE)) };
+    if tsd_raw.is_null() {
+        unsafe {
+            free(raw);
+        }
+        munmap_anon(stack, STACK_SIZE);
+        return EAGAIN;
+    }
+    let tsd = tsd_raw.cast::<GuestTls>();
     let t = raw.cast::<KhThread>();
+    let pthread_va = u64::try_from(raw.addr()).unwrap_or(0);
     unsafe {
+        (*tsd).magic = TLS_MAGIC;
+        (*tsd).errno = 0;
+        (*tsd).pad = 0;
+        (*tsd).pthread_self = pthread_va;
+
         (*t).magic = MAGIC;
         (*t).done = AtomicU32::new(0);
         (*t).detached = AtomicU32::new(0);
@@ -372,11 +435,11 @@ pub(crate) unsafe extern "C" fn pthread_create(
         (*t).stack_size = STACK_SIZE;
         (*t).start_func = start.addr();
         (*t).start_arg = arg.addr();
+        (*t).tsd = tsd;
     }
 
     // Stack grows down: pass high address (16-byte aligned).
     let stack_top = stack.addr().saturating_add(STACK_SIZE) & !0xF_usize;
-    let pthread_va = u64::try_from(raw.addr()).unwrap_or(0);
     let func_va = u64::try_from(start.addr()).unwrap_or(0);
     let arg_va = u64::try_from(arg.addr()).unwrap_or(0);
     let stack_va = u64::try_from(stack_top).unwrap_or(0);
@@ -396,6 +459,7 @@ pub(crate) unsafe extern "C" fn pthread_create(
     if ret < 0 {
         trace::note(b"[kh-libsystem] bsdthread_create failed\n");
         unsafe {
+            free(tsd_raw);
             free(raw);
         }
         munmap_anon(stack, STACK_SIZE);
@@ -436,11 +500,15 @@ pub(crate) unsafe extern "C" fn pthread_join(
             value_ptr.write(core::ptr::with_exposed_provenance_mut(r));
         }
     }
-    // Reclaim stack + control block.
+    // Reclaim TLS + stack + control block (after done; worker is finished).
     let stack = unsafe { (*t).stack };
     let stack_size = unsafe { (*t).stack_size };
+    let tsd = unsafe { (*t).tsd };
     munmap_anon(stack, stack_size);
     unsafe {
+        if !tsd.is_null() {
+            free(tsd.cast::<c_void>());
+        }
         free(thread);
     }
     0

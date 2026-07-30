@@ -3,17 +3,21 @@
 //! Dependency rule: this crate must not depend on `kh-loader` or `kh-cli`.
 //!
 //! `unsafe` is denied by workspace lints and only allowed in tightly scoped
-//! modules (`host`, `mem/*`, `trap`, `entry`, and `bottle::read_c_string`).
+//! modules (`cpu`, `host`, `host_slot`, `mem/*`, `trap`, `entry`, `thread`,
+//! `tls`, and `bottle::read_c_string`).
 
 pub mod bottle;
+pub mod cpu;
 pub mod entry;
 pub mod host;
+pub mod host_slot;
 pub mod mem;
 pub mod process;
 pub mod regs;
 pub mod stack;
 pub mod syscall;
 pub mod thread;
+pub mod tls;
 pub mod trap;
 
 pub use bottle::{
@@ -28,6 +32,9 @@ pub use bottle::{
 pub use process::{ProcessState, reset_run};
 
 pub use entry::{EntryError, call_guest, call_guest_args, jump_to_guest, jump_to_guest_args};
+pub use tls::{
+    GUEST_TLS_MAGIC, install_main_guest_tls, prepare_host_meta, enter_host_tls, leave_host_tls,
+};
 pub use mem::{
     AddressSpace, DARWIN_ARM64_PAGE_SIZE, GuestMemory, GuestPageSize, HostPageSize, MapError,
     MapRequest, MappedRegion, PageError, PageLayout, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,

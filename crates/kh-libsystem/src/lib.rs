@@ -3,10 +3,9 @@
 //! Guest dylib compiled for **aarch64-apple-darwin**, shipped as
 //! `/usr/lib/libSystem.B.dylib` inside the bottle. Not Apple code; no
 //! proprietary blobs. Build product is `libkh_libsystem.dylib`; stage with
-//! `./scripts/stage-libsystem.sh` to:
-//! * `dist/guest/libSystem.B.dylib` (dev override), and
-//! * `crates/kh-runtime/resources/libSystem.B.dylib` (crates.io embed for
-//!   `cargo install kakehashi` → `kh bottle ensure`).
+//! `./scripts/stage-libsystem.sh` into
+//! `crates/kh-runtime/resources/libSystem.B.dylib` (crates.io embed for
+//! `cargo install kakehashi` → `kh bottle ensure`).
 //!
 //! ## Architecture
 //!
@@ -22,7 +21,6 @@
 //! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 //! # → target/aarch64-apple-darwin/release/libkh_libsystem.dylib
 //! ./scripts/stage-libsystem.sh
-//! # → dist/guest/libSystem.B.dylib
 //! # → crates/kh-runtime/resources/libSystem.B.dylib  (commit for crates.io)
 //! kh bottle create               # copies + sets LC_ID_DYLIB to /usr/lib/...
 //! ```

@@ -49,13 +49,13 @@ fn guest_to_host_fd_i32(gfd: i32) -> Option<RawFd> {
     process::fd_get(gfd)
 }
 
-/// Allocates a new guest FD bound to `host_fd`.
+/// Allocates a new guest FD bound to `host_fd` (lock-free).
 pub(crate) fn alloc_guest_fd(host_fd: RawFd) -> Option<i32> {
-    process::with_mut(|p| p.fds_mut().alloc(host_fd))
+    process::fd_alloc(host_fd)
 }
 
 fn take_guest_fd(gfd: i32) -> Option<RawFd> {
-    process::with_mut(|p| p.fds_mut().take(gfd))
+    process::fd_take(gfd)
 }
 
 /// `open` — path in `x0`, flags in `x1`, mode in `x2` (ignored unless create).

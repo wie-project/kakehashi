@@ -3,7 +3,7 @@
 # Docker/Colima.
 #
 # Uses a project-local bottle under .kh/ (gitignored). Guest libSystem is
-# embedded in kh-runtime; optional override via dist/guest after stage-libsystem.
+# embedded in kh-runtime (crates/kh-runtime/resources after stage-libsystem).
 #
 # Path map (this is the bit people miss)
 # --------------------------------------
@@ -61,18 +61,16 @@ mkdir -p "$KH_OUT"
 
 # Prefer a freshly staged dylib when the developer just rebuilt kh-libsystem;
 # otherwise bottle ensure falls back to the crate-embedded resources/ dylib.
-if [[ ! -f dist/guest/libSystem.B.dylib ]]; then
-  if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
-    || [[ -f target/release/libkh_libsystem.dylib ]]; then
-    ./scripts/stage-libsystem.sh
-  elif [[ -f crates/kh-runtime/resources/libSystem.B.dylib ]]; then
-    echo "note: using embedded crates/kh-runtime/resources/libSystem.B.dylib"
-  else
-    echo "error: no guest libSystem (need resources/ embed or a built dylib)." >&2
-    echo "  cargo build -p kh-libsystem --release --target aarch64-apple-darwin" >&2
-    echo "  ./scripts/stage-libsystem.sh" >&2
-    exit 1
-  fi
+if [[ -f target/aarch64-apple-darwin/release/libkh_libsystem.dylib ]] \
+  || [[ -f target/release/libkh_libsystem.dylib ]]; then
+  ./scripts/stage-libsystem.sh
+elif [[ -f crates/kh-runtime/resources/libSystem.B.dylib ]]; then
+  echo "note: using crates/kh-runtime/resources/libSystem.B.dylib"
+else
+  echo "error: no guest libSystem (need resources/ embed or a built dylib)." >&2
+  echo "  cargo build -p kh-libsystem --release --target aarch64-apple-darwin" >&2
+  echo "  ./scripts/stage-libsystem.sh" >&2
+  exit 1
 fi
 
 # Ensure dev image exists (toolchain only; repo is bind-mounted).

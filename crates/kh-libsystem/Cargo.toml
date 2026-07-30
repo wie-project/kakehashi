@@ -11,7 +11,7 @@ publish = false
 
 # Crate name must be a valid Rust identifier. Not published (`publish = false`).
 # Build product is renamed/id-patched by `./scripts/stage-libsystem.sh` into
-# `dist/guest/` and the crates.io embed `crates/kh-runtime/resources/`.
+# the crates.io embed `crates/kh-runtime/resources/`.
 [lib]
 name = "kh_libsystem"
 crate-type = ["cdylib"]

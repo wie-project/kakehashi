@@ -145,7 +145,7 @@ enum BottleAction {
         path: Option<PathBuf>,
         /// Guest `libSystem.B.dylib` (or `libkh_libsystem.dylib`) to install under
         /// `usr/lib/`. When omitted: `KAKEHASHI_LIBSYSTEM` → next to `kh` →
-        /// `dist/guest/` / Cargo `target/` → freestanding dylib embedded in
+        /// Cargo `target/` / crate `resources/` → freestanding dylib embedded in
         /// `kh-runtime` (crates.io / `cargo install` path).
         #[arg(long)]
         libsystem: Option<PathBuf>,

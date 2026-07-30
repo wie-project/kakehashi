@@ -6,8 +6,8 @@
 //! 2. **`KAKEHASHI_LIBSYSTEM`**
 //! 3. Paths next to the running `kh` binary (release layout:
 //!    `lib/kakehashi/libSystem.B.dylib`, …)
-//! 4. Workspace / dev trees: `dist/guest/`, Cargo `target/…`, and the
-//!    vendored crate resource `crates/kh-runtime/resources/libSystem.B.dylib`
+//! 4. Workspace / dev trees: Cargo `target/…` and the vendored crate resource
+//!    `crates/kh-runtime/resources/libSystem.B.dylib`
 //! 5. **Embedded bytes** shipped inside `kh-runtime` (`resources/libSystem.B.dylib`
 //!    on crates.io) — so `cargo install kakehashi` works with only
 //!    `kh bottle ensure` and no separate dylib download
@@ -15,7 +15,7 @@
 //! Build / refresh the freestanding dylib (macOS or cross target):
 //! ```text
 //! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-//! ./scripts/stage-libsystem.sh   # → dist/guest + resources/ (crates.io embed)
+//! ./scripts/stage-libsystem.sh   # → crates/kh-runtime/resources/ (crates.io embed)
 //! ```
 
 use std::fs;
@@ -47,7 +47,7 @@ pub enum LibsystemOrigin {
     Env,
     /// Next to the `kh` binary (release layout or `target/debug/kh`).
     Adjacent,
-    /// Workspace `target/` / `dist/guest` / crate `resources/` under cwd.
+    /// Workspace `target/` / crate `resources/` under cwd.
     DevTarget,
     /// Bytes compiled into `kh-runtime` (crates.io / `cargo install` path).
     Embedded,
@@ -207,16 +207,15 @@ fn discover_dev_target() -> Option<PathBuf> {
 /// Candidate relative paths under a Cargo / release workspace root.
 fn discover_under_workspace(base: &Path) -> Option<PathBuf> {
     let names = ["libSystem.B.dylib", "libkh_libsystem.dylib"];
+    // Prefer a just-built product, then the staged crates.io embed path.
     let dirs = [
-        // Staged guest install name (`scripts/stage-libsystem.sh`).
-        "dist/guest",
+        "target/aarch64-apple-darwin/release",
+        "target/aarch64-apple-darwin/debug",
+        "target/release",
+        "target/debug",
         // Vendored crates.io embed (same bytes as `include_bytes!` in manage).
         "crates/kh-runtime/resources",
         "resources",
-        "target/release",
-        "target/debug",
-        "target/aarch64-apple-darwin/release",
-        "target/aarch64-apple-darwin/debug",
     ];
     let mut candidates = Vec::new();
     for d in dirs {

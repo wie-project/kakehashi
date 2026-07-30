@@ -157,7 +157,7 @@ fn print_create_result(
         println!(
             "    rebuild:  cargo build -p kh-libsystem --release --target aarch64-apple-darwin"
         );
-        println!("    stage:    ./scripts/stage-libsystem.sh  # → resources/ + dist/guest/");
+        println!("    stage:    ./scripts/stage-libsystem.sh  # → crates/kh-runtime/resources/");
         println!("    or:       kh bottle ensure --libsystem /path/to/libSystem.B.dylib");
         println!(
             "    or:       place libSystem.B.dylib next to `kh` / set {env}",

@@ -11,14 +11,14 @@
 //! the active slot, or use the wrappers under [`test_lock`].
 
 use std::cell::Cell;
-use std::sync::RwLock;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::host;
 
 use super::map::{MappedRegion, VM_PROT_READ, VM_PROT_WRITE};
 
 /// Per-thread last hit for [`check_range`] (archive I/O is highly sequential).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RangeCache {
     guest_addr: u64,
     len: usize,
@@ -48,6 +48,14 @@ impl RangeCache {
             self.prot & VM_PROT_WRITE != 0
         } else {
             self.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0
+        }
+    }
+
+    fn from_region(region: &RegRegion) -> Self {
+        Self {
+            guest_addr: region.guest_addr,
+            len: region.len,
+            prot: region.prot,
         }
     }
 }
@@ -101,9 +109,20 @@ impl RegRegion {
 ///
 /// Independent of the active trap slot: build and test locally, then
 /// [`install_active`] before jumping to guest code.
-#[derive(Debug, Default)]
+///
+/// [`check_snap`] is an immutable Arc rebuilt on mutations so concurrent
+/// [`check_range`] can walk regions without holding the active `RwLock`.
+#[derive(Debug)]
 pub struct AddressSpace {
     regions: Vec<RegRegion>,
+    /// Copy-only meta for the I/O hot path (shared across threads).
+    check_snap: Arc<Vec<RangeCache>>,
+}
+
+impl Default for AddressSpace {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // SAFETY: regions are only mutated under the active write lock; concurrent
@@ -114,10 +133,16 @@ unsafe impl Sync for AddressSpace {}
 impl AddressSpace {
     /// Empty address space (no tracked regions).
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             regions: Vec::new(),
+            check_snap: Arc::new(Vec::new()),
         }
+    }
+
+    fn rebuild_snap(&mut self) {
+        let snap: Vec<RangeCache> = self.regions.iter().map(RangeCache::from_region).collect();
+        self.check_snap = Arc::new(snap);
     }
 
     /// True when at least one region is registered.
@@ -133,6 +158,7 @@ impl AddressSpace {
                 let _ = host::munmap(region.ptr, region.len);
             }
         }
+        self.rebuild_snap();
     }
 
     /// Registers a borrowed region (image / stack). Does not take ownership.
@@ -144,6 +170,7 @@ impl AddressSpace {
             prot: region.prot,
             owned: false,
         });
+        self.rebuild_snap();
     }
 
     /// Registers an owned mapping created by a guest `mmap`.
@@ -155,6 +182,7 @@ impl AddressSpace {
             prot,
             owned: true,
         });
+        self.rebuild_snap();
     }
 
     /// Validates that `[addr, addr+len)` lies in a registered region with the
@@ -206,6 +234,7 @@ impl AddressSpace {
         for region in &mut self.regions {
             if region.contains_range(addr, len) {
                 region.prot = prot;
+                self.rebuild_snap();
                 return true;
             }
         }
@@ -224,6 +253,7 @@ impl AddressSpace {
             return RemoveOutcome::NotFound;
         };
         let region = self.regions.remove(i);
+        self.rebuild_snap();
         if region.owned {
             if host::munmap(region.ptr, region.len) {
                 RemoveOutcome::Unmapped
@@ -239,6 +269,7 @@ impl AddressSpace {
     #[cfg(test)]
     fn push_raw(&mut self, region: RegRegion) {
         self.regions.push(region);
+        self.rebuild_snap();
     }
 }
 
@@ -252,13 +283,16 @@ impl Drop for AddressSpace {
 ///
 /// `RwLock`: concurrent `check_range` on the I/O hot path must not serialize
 /// all guest threads behind a single exclusive mutex.
-static ACTIVE: RwLock<AddressSpace> = RwLock::new(AddressSpace::new());
+fn active_space() -> &'static RwLock<AddressSpace> {
+    static ACTIVE: OnceLock<RwLock<AddressSpace>> = OnceLock::new();
+    ACTIVE.get_or_init(|| RwLock::new(AddressSpace::new()))
+}
 
 /// Installs `space` as the active trap-path address space.
 ///
 /// Returns the previous active space (caller may drop it to unmap owned regions).
 pub fn install_active(space: AddressSpace) -> AddressSpace {
-    match ACTIVE.write() {
+    match active_space().write() {
         Ok(mut guard) => std::mem::replace(&mut *guard, space),
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
@@ -275,7 +309,7 @@ pub fn take_active() -> AddressSpace {
 
 /// Runs `f` with exclusive access to the active address space.
 pub fn with_active_mut<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
-    match ACTIVE.write() {
+    match active_space().write() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => f(&mut poisoned.into_inner()),
     }
@@ -283,7 +317,7 @@ pub fn with_active_mut<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
 
 /// Runs `f` with shared access to the active address space.
 pub fn with_active<R>(f: impl FnOnce(&AddressSpace) -> R) -> R {
-    match ACTIVE.read() {
+    match active_space().read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => f(&poisoned.into_inner()),
     }
@@ -314,7 +348,8 @@ pub fn is_active() -> bool {
 /// Validates a range against the active address space.
 ///
 /// Hot path: thread-local last-hit cache (no `RwLock`) for sequential
-/// read/write into the same mapping.
+/// read/write into the same mapping. On miss, clones an [`Arc`] region
+/// snapshot under a short read lock, then walks **without** holding the lock.
 #[must_use]
 pub fn check_range(addr: u64, len: usize, need_write: bool) -> bool {
     if len == 0 {
@@ -329,32 +364,23 @@ pub fn check_range(addr: u64, len: usize, need_write: bool) -> bool {
     }) {
         return true;
     }
-    with_active(|space| {
-        if space.regions.is_empty() {
-            return true;
+    // Short lock: Arc clone only.
+    let snap = with_active(|space| Arc::clone(&space.check_snap));
+    if snap.is_empty() {
+        // Empty space → allow (unit tests without maps).
+        return true;
+    }
+    for region in snap.iter() {
+        if !region.contains(addr, len) {
+            continue;
         }
-        for region in &space.regions {
-            if !region.contains_range(addr, len) {
-                continue;
-            }
-            let ok = if need_write {
-                region.prot & VM_PROT_WRITE != 0
-            } else {
-                region.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0
-            };
-            if ok {
-                LAST_RANGE.with(|c| {
-                    c.set(Some(RangeCache {
-                        guest_addr: region.guest_addr,
-                        len: region.len,
-                        prot: region.prot,
-                    }));
-                });
-            }
-            return ok;
+        let ok = region.allows(need_write);
+        if ok {
+            LAST_RANGE.with(|c| c.set(Some(*region)));
         }
-        false
-    })
+        return ok;
+    }
+    false
 }
 
 /// Finds a covering region in the active address space.

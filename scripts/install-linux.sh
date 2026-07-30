@@ -26,9 +26,8 @@ install -m 755 target/release/kh "$BIN_DIR/kh"
 # the freestanding bytes embedded in kh-runtime (crates.io path).
 LIBARGS=()
 for cand in \
-  dist/guest/libSystem.B.dylib \
-  crates/kh-runtime/resources/libSystem.B.dylib \
-  target/aarch64-apple-darwin/release/libkh_libsystem.dylib
+  target/aarch64-apple-darwin/release/libkh_libsystem.dylib \
+  crates/kh-runtime/resources/libSystem.B.dylib
 do
   if [[ -f "$cand" ]]; then
     LIBARGS=(--libsystem "$ROOT/$cand")

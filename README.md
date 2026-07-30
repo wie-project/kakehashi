@@ -8,6 +8,9 @@ BSD syscalls, and run real guests (clang probes, **7-Zip `7zz`**, threads).
 Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).  
 `kh inspect` and `kh run --dry-load` work on any host (including macOS).
 
+**Design reference** (architecture, 1:1 threading, guest/host boundary, invariants):
+[`docs/`](docs/README.md).
+
 ## Crates (crates.io)
 
 | Crate        | Role |
@@ -95,7 +98,6 @@ cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
 # Guest libSystem (maintainers: refresh crates.io embed after API changes)
 cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 ./scripts/stage-libsystem.sh
-# → dist/guest/libSystem.B.dylib
 # → crates/kh-runtime/resources/libSystem.B.dylib  (commit before publish)
 ```
 
@@ -103,15 +105,15 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 
 ```bash
 kh bottle ensure                         # uses embedded dylib (crates.io path)
-# or override with a just-built tree:
-kh bottle ensure --libsystem dist/guest/libSystem.B.dylib
+# or override with a just-built / staged tree:
+kh bottle ensure --libsystem crates/kh-runtime/resources/libSystem.B.dylib
 kh bottle status
 kh bottle destroy --yes
 ```
 
 Discovery for `libSystem`: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next
-to `kh` → `dist/guest/` / `target/…` / crate `resources/` → **embedded** bytes
-in `kh-runtime`.
+to `kh` → Cargo `target/…` / crate `resources/` → **embedded** bytes in
+`kh-runtime`.
 
 ### Guest tools (`kh install`)
 
@@ -250,11 +252,14 @@ hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
 
 ### Performance knobs
 
-- Freestanding **hypercall** is on by default for the **main** guest thread
-  (no `SIGTRAP` on the I/O hot path). Opt out with `KAKEHASHI_HYPERCALL=0`.
-- Guest **worker** threads use `svc`→`brk` by default (7zz MT NEON compression
-  is green there). Experimental full-worker hypercall:
-  `KAKEHASHI_HYPERCALL_WORKERS=1` (still SEGV under `-mmt>1 -mx>0`).
+- Freestanding **hypercall** is on by default for **all** guest threads (main +
+  workers): host alt stack + `TPIDR_EL0` save/restore, no `SIGTRAP` on the I/O
+  path. Opt out with `KAKEHASHI_HYPERCALL=0` (falls back to `svc`→`brk`).
+- Per-thread guest TLS (`TPIDR_EL0`) backs `___error` / TSD; host glibc TLS is
+  restored on every syscall boundary.
+- Legacy `KAKEHASHI_HYPERCALL_WORKERS=0` can force the old main-only split in
+  the loader flag slot; freestanding libSystem ignores the gate when hypercall
+  is wired.
 - Worker `pthread_join` completion is published from the **host** stack after
   `bsdthread_terminate`.
 
@@ -264,7 +269,7 @@ hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
 
 | Script | Purpose |
 | ------ | ------- |
-| `scripts/stage-libsystem.sh` | Build product → `dist/guest/` **and** `crates/kh-runtime/resources/` (crates.io embed) |
+| `scripts/stage-libsystem.sh` | Build product → `crates/kh-runtime/resources/` (crates.io embed) |
 | `scripts/install-linux.sh` | Local `cargo build` + install `kh` + `bottle ensure` |
 | `scripts/docker-smoke.sh` | Reproducible smoke suite inside `Dockerfile` image |
 | `scripts/docker-7zz.sh` | Interactive/ad-hoc Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |

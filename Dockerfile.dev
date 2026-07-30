@@ -1,0 +1,18 @@
+# Dev image: Rust toolchain only. Repo is bind-mounted at /src at runtime.
+# Used by scripts/docker-7zz.sh and scripts/bench-fair-local.sh.
+FROM rust:1.97-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        curl \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add clippy rustfmt
+
+WORKDIR /src
+
+# Default: interactive shell for ad-hoc cargo / kh work.
+CMD ["bash"]

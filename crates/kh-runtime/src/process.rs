@@ -1,14 +1,17 @@
 //! Process-wide translator state for the single guest-process model.
 //!
-//! Consolidates guest FD table, bottle root, soft signal state, and syscall
-//! limits behind one active slot (same pattern as [`crate::mem::AddressSpace`]).
-//! Trap handlers and BSD syscalls access this via [`with_mut`] / [`with_ref`].
+//! Hot paths avoid the process [`RwLock`]:
+//! - FD map: lock-free atomics ([`fd_get`] / [`fd_alloc`] / [`fd_take`])
+//! - bottle root: narrow [`Arc`] slot ([`with_bottle_root`])
+//! - `bsdthread_register`: atomic pointer snapshot ([`bsdthread_reg`])
+//!
+//! Soft signals and directory streams still use [`with_mut`] / [`with_ref`].
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::host;
 
@@ -68,28 +71,18 @@ impl SoftSigAct {
     }
 }
 
-/// Thin handle so `ProcessState` can still expose `fds_mut()` for alloc/take.
+/// Marker so `ProcessState::reset_run` can clear the lock-free FD map.
 #[derive(Debug, Default)]
-pub(crate) struct FdTable;
+struct FdTable;
 
 impl FdTable {
     const fn new() -> Self {
         Self
     }
 
-    pub(crate) fn reset(&mut self) {
+    fn reset(&mut self) {
         let _ = self;
         reset_fd_map();
-    }
-
-    pub(crate) fn take(&mut self, gfd: i32) -> Option<RawFd> {
-        let _ = self;
-        fd_take(gfd)
-    }
-
-    pub(crate) fn alloc(&mut self, host_fd: RawFd) -> Option<i32> {
-        let _ = self;
-        fd_alloc(host_fd)
     }
 }
 
@@ -111,7 +104,10 @@ pub fn fd_get(gfd: i32) -> Option<RawFd> {
     if v < 0 { None } else { Some(v) }
 }
 
-fn fd_take(gfd: i32) -> Option<RawFd> {
+/// Removes a guest FD mapping and returns the host fd (lock-free).
+#[must_use]
+#[inline]
+pub fn fd_take(gfd: i32) -> Option<RawFd> {
     if gfd <= 2 {
         return None;
     }
@@ -123,7 +119,10 @@ fn fd_take(gfd: i32) -> Option<RawFd> {
     if v < 0 { None } else { Some(v) }
 }
 
-fn fd_alloc(host_fd: RawFd) -> Option<i32> {
+/// Allocates a guest FD slot for `host_fd` (lock-free CAS scan).
+#[must_use]
+#[inline]
+pub fn fd_alloc(host_fd: RawFd) -> Option<i32> {
     if host_fd < 0 {
         return None;
     }
@@ -145,6 +144,12 @@ fn fd_alloc(host_fd: RawFd) -> Option<i32> {
     None
 }
 
+/// Bottle root published for path translation (set once per run; rare updates).
+static BOTTLE_ROOT: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
+
+/// `bsdthread_register` snapshot (narrow lock; not the full process state).
+static BSDTHREAD_REG: RwLock<Option<BsdThreadReg>> = RwLock::new(None);
+
 fn try_claim_slot(idx: usize, host_fd: RawFd) -> bool {
     let Some(slot) = FD_HOST.get(idx) else {
         return false;
@@ -164,15 +169,16 @@ fn reset_fd_map() {
 }
 
 /// Owned process state for one guest (or unit-test isolation via reset).
+///
+/// Bottle root and `bsdthread_register` live in separate process-wide slots so
+/// open/create hot paths do not take this lock.
 #[derive(Debug)]
 pub struct ProcessState {
     fds: FdTable,
     /// Guest FD → directory stream (for `readdir` host helper).
     dir_streams: HashMap<i32, host::HostDir>,
-    bottle_root: Option<PathBuf>,
     sig_mask: u32,
     sigactions: [SoftSigAct; 32],
-    bsdthread: Option<BsdThreadReg>,
 }
 
 impl ProcessState {
@@ -182,10 +188,8 @@ impl ProcessState {
         Self {
             fds: FdTable::new(),
             dir_streams: HashMap::new(),
-            bottle_root: None,
             sig_mask: 0,
             sigactions: [SoftSigAct::zero(); 32],
-            bsdthread: None,
         }
     }
 
@@ -195,7 +199,7 @@ impl ProcessState {
         self.fds.reset();
         self.sig_mask = 0;
         self.sigactions = [SoftSigAct::zero(); 32];
-        self.bsdthread = None;
+        clear_bsdthread_reg();
         let max = u64::try_from(max_syscalls).unwrap_or(256);
         MAX_SYSCALLS.store(max, Ordering::Relaxed);
         SYSCALL_COUNT.store(0, Ordering::Relaxed);
@@ -228,28 +232,6 @@ impl ProcessState {
             return Err(9);
         };
         Ok(stream.read_next())
-    }
-
-    #[must_use]
-    pub(crate) fn bsdthread(&self) -> Option<BsdThreadReg> {
-        self.bsdthread
-    }
-
-    pub(crate) fn set_bsdthread(&mut self, reg: BsdThreadReg) {
-        self.bsdthread = Some(reg);
-    }
-
-    pub(crate) fn fds_mut(&mut self) -> &mut FdTable {
-        &mut self.fds
-    }
-
-    #[must_use]
-    pub fn bottle_root(&self) -> Option<&std::path::Path> {
-        self.bottle_root.as_deref()
-    }
-
-    pub fn set_bottle_root(&mut self, root: Option<PathBuf>) {
-        self.bottle_root = root;
     }
 
     #[must_use]
@@ -319,18 +301,63 @@ pub fn reset_run(max_syscalls: usize) {
 
 /// Configures the bottle root used by path-taking syscalls.
 pub fn set_bottle_root(root: Option<PathBuf>) {
-    with_mut(|p| p.set_bottle_root(root));
+    let next = root.map(Arc::new);
+    match BOTTLE_ROOT.write() {
+        Ok(mut guard) => {
+            *guard = next;
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = next;
+        }
+    }
 }
 
 /// Clone of the configured bottle root, if any.
 #[must_use]
 pub fn bottle_root() -> Option<PathBuf> {
-    with_ref(|p| p.bottle_root.clone())
+    with_bottle_root(|p| p.map(Path::to_path_buf))
 }
 
 /// Borrow the bottle root without cloning (hot path for path translation).
-pub fn with_bottle_root<R>(f: impl FnOnce(Option<&std::path::Path>) -> R) -> R {
-    with_ref(|p| f(p.bottle_root.as_deref()))
+///
+/// Uses a **narrow** bottle-root lock (not the full process state).
+pub fn with_bottle_root<R>(f: impl FnOnce(Option<&Path>) -> R) -> R {
+    match BOTTLE_ROOT.read() {
+        Ok(guard) => f(guard.as_ref().map(|a| a.as_path())),
+        Err(poisoned) => f(poisoned.into_inner().as_ref().map(|a| a.as_path())),
+    }
+}
+
+/// Stores `bsdthread_register` metadata for subsequent `bsdthread_create`.
+pub(crate) fn set_bsdthread_reg(reg: BsdThreadReg) {
+    match BSDTHREAD_REG.write() {
+        Ok(mut guard) => {
+            *guard = Some(reg);
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = Some(reg);
+        }
+    }
+}
+
+/// Snapshot of the last `bsdthread_register` (narrow lock, copy-out).
+#[must_use]
+pub(crate) fn bsdthread_reg() -> Option<BsdThreadReg> {
+    match BSDTHREAD_REG.read() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn clear_bsdthread_reg() {
+    match BSDTHREAD_REG.write() {
+        Ok(mut guard) => {
+            *guard = None;
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = None;
+        }
+    }
 }
 
 /// Serializes tests that mutate process-wide state (address space + process).

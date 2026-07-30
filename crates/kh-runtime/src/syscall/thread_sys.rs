@@ -1,7 +1,7 @@
 //! Darwin BSD thread syscalls: `bsdthread_*` / `thread_selfid`.
 
 use crate::process as proc_state;
-use crate::process::{BsdThreadReg, ProcessState};
+use crate::process::BsdThreadReg;
 use crate::thread::{self, GuestThreadStart};
 
 use super::common::{EINVAL, ENOSYS, SyscallArgs, SyscallResult, reg_as_i32};
@@ -26,7 +26,7 @@ pub(crate) fn handle_bsdthread_register(args: SyscallArgs) -> SyscallResult {
         dispatchqueue_offset: u32::try_from(args.x5 & 0xFFFF_FFFF).unwrap_or(0),
         tsd_offset: u32::try_from(args.x6 & 0xFFFF_FFFF).unwrap_or(0),
     };
-    proc_state::with_mut(|p: &mut ProcessState| p.set_bsdthread(reg));
+    proc_state::set_bsdthread_reg(reg);
     // Real XNU returns a feature bitmask; 0 is accepted by synthetic fixtures.
     SyscallResult::ok(name, 0)
 }
@@ -51,7 +51,7 @@ pub(crate) fn handle_bsdthread_create(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EINVAL);
     }
 
-    let Some(reg) = proc_state::with_ref(ProcessState::bsdthread) else {
+    let Some(reg) = proc_state::bsdthread_reg() else {
         // Must register before create (libpthread order).
         return SyscallResult::err(name, EINVAL);
     };

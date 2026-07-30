@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use kh_runtime::{
     AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack,
-    call_guest_args, clear_trampoline_cache, finish_with_exit_code, install_trap_handlers,
-    map_stack, patch_svc_to_brk, registry_install, registry_take, set_bottle_root,
+    call_guest_args, clear_trampoline_cache, finish_with_exit_code, install_main_guest_tls,
+    install_trap_handlers, map_stack, patch_svc_to_brk, registry_install, registry_take,
+    set_bottle_root,
 };
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use kh_runtime::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, mprotect_darwin, mprotect_rw};
@@ -158,6 +159,15 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     })
     .map_err(trap_to_load)?;
 
+    // Main-thread guest TLS (TPIDR_EL0) before constructors / LC_MAIN touch errno.
+    let main_tls = install_main_guest_tls();
+    if main_tls != 0 {
+        tracing::debug!(
+            main_tls = format_args!("{main_tls:#x}"),
+            "installed main guest TLS (TPIDR_EL0)"
+        );
+    }
+
     // dyld-order: constructors (dylibs bottom-up, then main) before LC_MAIN.
     let initializers_run = init::run_initializers(&session, sp)?;
 
@@ -167,6 +177,7 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         slide,
         patched_svc,
         hypercall_wired,
+        main_tls = format_args!("{main_tls:#x}"),
         initializers_run,
         images = session.images().len(),
         root = ?opts.root,
@@ -301,16 +312,19 @@ fn install_libsystem_hypercall_linux(session: &mut LoadSession) -> bool {
     wired_entry
 }
 
-/// `KAKEHASHI_HYPERCALL_WORKERS=1|true|yes|on` → freestanding workers use hypercall.
+/// Worker hypercall is **on by default** (unified boundary + TPIDR save/restore).
+///
+/// Opt out with `KAKEHASHI_HYPERCALL_WORKERS=0|false|off|no` (legacy dual-path;
+/// not recommended).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn hypercall_workers_enabled() -> bool {
     match std::env::var_os("KAKEHASHI_HYPERCALL_WORKERS") {
-        None => false,
+        None => true,
         Some(v) => {
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
         }
     }
 }
