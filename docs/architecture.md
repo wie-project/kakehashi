@@ -101,7 +101,7 @@ Guest `svc #0x80` is not used when hypercall is wired: freestanding
 | Mode | Mechanism | Use |
 | ---- | --------- | --- |
 | Hypercall (default) | Guest `bl` → `kh_hypercall_entry` → host alt stack → dispatch | Production, all threads |
-| SIGTRAP fallback | Guest `svc` patched to `brk`; host handler | Debug / `KAKEHASHI_HYPERCALL=0` |
+| Residual `svc`→`brk` | Patched leftovers + SIGTRAP handler | Fixtures / debug (`KAKEHASHI_HYPERCALL=0`) |
 
 See [Guest–host boundary](guest-host-boundary.md) for the full protocol.
 

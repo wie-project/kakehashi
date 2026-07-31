@@ -254,12 +254,9 @@ hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
 
 - Freestanding **hypercall** is on by default for **all** guest threads (main +
   workers): host alt stack + `TPIDR_EL0` save/restore, no `SIGTRAP` on the I/O
-  path. Opt out with `KAKEHASHI_HYPERCALL=0` (falls back to `svc`→`brk`).
-- Per-thread guest TLS (`TPIDR_EL0`) backs `___error` / TSD; host glibc TLS is
-  restored on every syscall boundary.
-- Legacy `KAKEHASHI_HYPERCALL_WORKERS=0` can force the old main-only split in
-  the loader flag slot; freestanding libSystem ignores the gate when hypercall
-  is wired.
+  path. Opt out with `KAKEHASHI_HYPERCALL=0` (residual `svc`→`brk`/SIGTRAP for
+  debug). Per-thread guest TLS (`TPIDR_EL0`) backs `___error` / TSD; host glibc
+  TLS is restored on every syscall boundary.
 - Worker `pthread_join` completion is published from the **host** stack after
   `bsdthread_terminate`.
 

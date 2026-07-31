@@ -106,15 +106,17 @@ Darwin `svc` preserves SIMD. Compression workers (7zz LZMA) keep live NEON
 across syscalls. The hypercall prolog MUST save/restore **all** Q0–Q31 and
 FPCR/FPSR. Partial save is a correctness bug under `-mmt>1`.
 
-## SIGTRAP path
+## Residual `svc` / SIGTRAP path
 
-When hypercall is off or an `svc` site is patched to `brk`:
+Leftover Darwin `svc` sites (fixtures, unpatched stubs, or
+`KAKEHASHI_HYPERCALL=0`) are rewritten to `brk #IMM`:
 
 1. Kernel delivers `SIGTRAP` with full `ucontext` (register restore on return).
 2. Handler restores host TLS, translates syscall, updates `ucontext`.
 3. `bsdthread_terminate` redirects PC/SP/`x29` to the host worker-exit trampoline.
 
-Use for debug and fallback. Production multi-thread path is hypercall.
+Production multi-thread path is freestanding hypercall only. The experimental
+`svc`→veneer rewrite (`KAKEHASHI_TRAMPOLINE`) was removed.
 
 ## Fault handling
 
@@ -133,10 +135,9 @@ not of a random guest bug.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall pointer |
-| `KAKEHASHI_HYPERCALL=0` | — | Force SIGTRAP/svc path |
+| `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall pointer (production) |
+| `KAKEHASHI_HYPERCALL=0` | — | Debug: leave hypercall unwired; residual `svc`→`brk`/SIGTRAP |
 | `KAKEHASHI_FUTEX_STATS` | **off** | Print guest `KH_HELPER_PARK`/`WAKE` counters at exit |
-| `KAKEHASHI_TRAMPOLINE` | off | Experimental svc→veneer rewrite (separate from freestanding hypercall) |
 
 ### B1 bottle dirfd (path walk)
 

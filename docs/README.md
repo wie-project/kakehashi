@@ -22,7 +22,7 @@ code that claims to implement the model.
 | Location | Role |
 | -------- | ---- |
 | `crates/kh-runtime/src/thread.rs` | Host worker spawn / exit |
-| `crates/kh-runtime/src/trap.rs` | `kh_hypercall_entry`, trampoline |
+| `crates/kh-runtime/src/trap.rs` | `kh_hypercall_entry`, NEON tramp, residual `svc`→`brk` |
 | `crates/kh-runtime/src/tls.rs`, `host_slot.rs` | TLS boundary; A1 guest mirror + A2 gettid fallback |
 | `crates/kh-libsystem/src/pthread.rs`, `sys.rs` | Guest pthread + hypercall thin |
 | `crates/kh-loader/src/execute.rs` | Wire hypercall into freestanding dylib |

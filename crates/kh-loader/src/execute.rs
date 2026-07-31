@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 
 use kh_runtime::{
     AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack,
-    call_guest_args, clear_trampoline_cache, finish_with_exit_code, install_main_guest_tls,
-    install_trap_handlers, map_stack, patch_svc_to_brk, registry_install, registry_take,
-    set_bottle_root,
+    call_guest_args, finish_with_exit_code, install_main_guest_tls, install_trap_handlers,
+    map_stack, patch_svc_to_brk, registry_install, registry_take, set_bottle_root,
 };
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use kh_runtime::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, mprotect_darwin, mprotect_rw};
@@ -83,8 +82,6 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     set_bottle_root(opts.root.clone());
     // Drop any previous active address space (unmaps owned guest mmaps).
     drop(registry_take());
-    // Owned trampoline pages went with the space — never reuse stale VAs.
-    clear_trampoline_cache();
 
     let mut session = LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)?;
     let _ = session.map_process()?;
@@ -124,9 +121,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))?;
 
     // Build process address space, then install for trap-path checks / mmap bookkeeping.
-    // Must install *before* `patch_svc_to_brk`: the Linux trampoline path maps an RX
-    // page and `register_owned`s it. Installing a fresh AddressSpace drops the previous
-    // one and would munmap that trampoline → SIGSEGV on the first `bl`.
+    // Hypercall NEON tramp is mapped separately (once, process-local); residual `svc`→`brk`
+    // needs the registry only for later mmap bookkeeping and SIGTRAP translation.
     let mut address_space = AddressSpace::new();
     for img in session.images() {
         if let Some(memory) = img.memory.as_ref() {
@@ -138,15 +134,14 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     address_space.register_borrowed(&stack);
     drop(registry_install(address_space));
 
-    // Wire freestanding libSystem → host BSD dispatch (no SIGTRAP).
-    // Default ON; opt out with `KAKEHASHI_HYPERCALL=0|false|off|no`.
+    // Wire freestanding libSystem → `kh_hypercall_entry` (production path).
+    // Opt out with `KAKEHASHI_HYPERCALL=0|false|off|no` (debug: residual svc→brk).
     let hypercall_wired = if hypercall_enabled() {
         install_libsystem_hypercall(&mut session)
     } else {
         false
     };
-    // Rewrite residual Darwin `svc` (binaries not using freestanding hypercall).
-    // After the active registry is live so optional trampoline pages stick.
+    // Rewrite any leftover Darwin `svc` so Linux never executes them as host syscalls.
     let mut patched_svc = 0usize;
     for memory in session.mapped_memories_mut() {
         patched_svc = patched_svc
@@ -268,65 +263,28 @@ fn install_libsystem_hypercall_linux(session: &mut LoadSession) -> bool {
         return false;
     }
 
-    let workers = hypercall_workers_enabled();
     let mut wired_entry = false;
-    let mut wired_workers = false;
-
     for img in session.images_mut() {
         let slide = img.slide();
         let exports: Vec<_> = img.exports.clone();
         for exp in exports {
             let slot = exp.name.as_str();
-            let is_entry = slot == "_kh_bsd_hypercall" || slot == "kh_bsd_hypercall";
-            let is_workers = slot == "_kh_hypercall_workers" || slot == "kh_hypercall_workers";
-            if !is_entry && !is_workers {
+            if slot != "_kh_bsd_hypercall" && slot != "kh_bsd_hypercall" {
                 continue;
             }
             let va = exp.value.saturating_add(slide);
-            let value = if is_entry {
-                entry_u64
-            } else {
-                u64::from(u32::from(workers))
-            };
-            if !write_libsystem_u64(img, va, value) {
+            if !write_libsystem_u64(img, va, entry_u64) {
                 continue;
             }
-            if is_entry {
-                wired_entry = true;
-                tracing::info!(
-                    va = format_args!("{va:#x}"),
-                    entry = format_args!("{entry_u64:#x}"),
-                    "wired libSystem BSD hypercall"
-                );
-            } else {
-                wired_workers = true;
-                tracing::info!(
-                    va = format_args!("{va:#x}"),
-                    workers,
-                    "wired libSystem hypercall-workers flag"
-                );
-            }
+            wired_entry = true;
+            tracing::info!(
+                va = format_args!("{va:#x}"),
+                entry = format_args!("{entry_u64:#x}"),
+                "wired libSystem BSD hypercall"
+            );
         }
     }
-    let _ = wired_workers;
     wired_entry
-}
-
-/// Worker hypercall is **on by default** (unified boundary + TPIDR save/restore).
-///
-/// Opt out with `KAKEHASHI_HYPERCALL_WORKERS=0|false|off|no` (legacy dual-path;
-/// not recommended).
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn hypercall_workers_enabled() -> bool {
-    match std::env::var_os("KAKEHASHI_HYPERCALL_WORKERS") {
-        None => true,
-        Some(v) => {
-            !(v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off"))
-        }
-    }
 }
 
 /// Write 8 little-endian bytes at guest VA in an image mapping (mprotect if needed).

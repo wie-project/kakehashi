@@ -111,7 +111,6 @@ docker run --rm \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
   -e CARGO_TARGET_DIR=/src/target \
-  -e "KAKEHASHI_TRAMPOLINE=${KAKEHASHI_TRAMPOLINE:-}" \
   -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-}" \
   -e "KAKEHASHI_FUTEX_STATS=${KAKEHASHI_FUTEX_STATS:-}" \
   "${IMAGE}" \

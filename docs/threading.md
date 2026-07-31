@@ -195,12 +195,12 @@ KAKEHASHI_FUTEX_STATS=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 …
 
 | Variable | Effect |
 | -------- | ------ |
-| `KAKEHASHI_HYPERCALL=0` | Disable freestanding hypercall wire-up; workers use patched `brk`/SIGTRAP |
 | (default) | Hypercall ON for all threads when `_kh_bsd_hypercall` is patched |
+| `KAKEHASHI_HYPERCALL=0` | Debug: leave hypercall unwired; residual `svc`→`brk`/SIGTRAP |
 | `KAKEHASHI_FUTEX_STATS=1` | Print guest park/wake helper counters on process exit (stderr) |
 
-Hypercall is the production path for workers. Dual-path “workers only on
-SIGTRAP” is legacy; do not reintroduce it as the default.
+Hypercall is the only production boundary for freestanding libSystem (main and
+workers). Do not reintroduce a workers-only SIGTRAP dual path.
 
 ## Acceptance (multi-thread)
 

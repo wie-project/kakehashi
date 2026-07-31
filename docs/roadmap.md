@@ -200,6 +200,7 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | **2026-07** | **Post-F1c ceiling**                                                  | Wall ~**×3.4** native (~34s→~118s). Futex helpers fixed on archive create; `t` almost idle. Next: **measure** (native same tree + `perf`), not more micro-B. |
 | **2026-07** | **A3** light hypercall                                                | **Removed** — no wall win (pre/post F1c); optional LIGHT path deleted; full tramp only. |
 | **2026-07** | **Perf plateau (UTM)**                                                | Native **22.5s** / kh **~118s** (×5.2). F1c was the big win. B1/A3 flat. Pause radical boundary micro-opts. |
+| **2026-07** | **Cleanup: hypercall-only**                                           | Removed experimental `svc`→veneer (`KAKEHASHI_TRAMPOLINE`), legacy `KH_HYPERCALL_WORKERS` export/wiring, no-op `clear_trampoline_cache`. Residual `svc`→`brk` kept for fixtures/debug. |
 
 ---
 

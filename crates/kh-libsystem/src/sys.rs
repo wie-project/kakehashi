@@ -126,9 +126,8 @@ struct HyperRet {
 
 /// Optional direct hypercall into the host translator (identity-mapped).
 ///
-/// The runtime writes the address of `kh_trampoline_dispatch` here after
-/// mapping freestanding `libSystem`. When zero (real Darwin / unset), fall
-/// back to `svc #0x80`.
+/// The loader writes `kh_hypercall_entry` here after mapping freestanding
+/// `libSystem`. When zero (real Darwin / unset), fall back to `svc #0x80`.
 ///
 /// Exported as `_kh_bsd_hypercall` (Darwin nlist) for the loader to patch.
 ///
@@ -137,18 +136,11 @@ struct HyperRet {
 #[allow(dead_code)] // written by host loader via export name
 static mut KH_BSD_HYPERCALL: usize = 0;
 
-/// Legacy export kept for loader compatibility. New runtime always uses
-/// hypercall on every thread when [`KH_BSD_HYPERCALL`] is wired (TLS + host alt
-/// stack boundary). Value is ignored by freestanding code.
-#[unsafe(export_name = "kh_hypercall_workers")]
-#[allow(dead_code)] // written by host loader / runtime
-static mut KH_HYPERCALL_WORKERS: u32 = 1;
-
 /// Invokes a Darwin BSD syscall with up to seven arguments (`x0`–`x6`).
 ///
-/// When the host has wired [`KH_BSD_HYPERCALL`], **all** threads use the
+/// When the host has wired [`KH_BSD_HYPERCALL`], every thread uses the
 /// freestanding hypercall (host alt stack + TPIDR save/restore). Otherwise
-/// fall back to `svc #0x80` (real Darwin or unpatched path).
+/// fall back to `svc #0x80` (real Darwin or debug `KAKEHASHI_HYPERCALL=0`).
 ///
 /// Join completion is published from the host stack after `bsdthread_terminate`
 /// (see `kh-runtime::thread`).
