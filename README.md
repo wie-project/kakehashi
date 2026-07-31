@@ -5,25 +5,24 @@ Userspace **macOS ARM64 → Linux aarch64** translation layer (CLI-first, no JIT
 Load Darwin Mach-O on Linux aarch64, map a freestanding `libSystem`, translate
 BSD syscalls, and run real guests (clang probes, **7-Zip `7zz`**, threads).
 
-Live execution needs **Linux aarch64** (bare metal, VM, or Colima/Docker).  
-`kh inspect` and `kh run --dry-load` work on any host (including macOS).
+| | |
+| --- | --- |
+| Live execution | **Linux aarch64** (bare metal, VM, Colima/Docker) |
+| Dry-load / inspect | Any host (including macOS) |
+| Design reference | [`docs/`](docs/README.md) |
 
-**Design reference** (architecture, 1:1 threading, guest/host boundary, invariants):
-[`docs/`](docs/README.md).
+## Crates
 
-## Crates (crates.io)
-
-| Crate        | Role |
-| ------------ | ---- |
+| Crate | Role |
+| --- | --- |
 | **`kakehashi`** | Binary `kh` (install this) |
-| `kh-loader`  | Mach-O parse, map session, execute |
-| `kh-runtime` | Memory, traps, BSD syscalls, bottle; **embeds** freestanding `libSystem.B.dylib` |
-| `kh-libsystem` | Source for that dylib (build for `aarch64-apple-darwin`; not a Linux host crate) |
+| `kh-loader` | Mach-O parse, map, execute |
+| `kh-runtime` | Memory, traps, BSD syscalls, bottle; embeds freestanding `libSystem.B.dylib` |
+| `kh-libsystem` | Source for that dylib (`aarch64-apple-darwin` only; not a Linux host crate) |
 
-The freestanding guest dylib is vendored at
-`crates/kh-runtime/resources/libSystem.B.dylib` and compiled into the runtime
-with `include_bytes!`. Publishing `kh-runtime` to crates.io therefore ships the
-dylib; end users do not need a separate download.
+The guest dylib is vendored at `crates/kh-runtime/resources/libSystem.B.dylib`
+and compiled into the runtime with `include_bytes!`. Publishing `kh-runtime`
+ships the dylib; end users do not need a separate download.
 
 ## Requirements
 
@@ -32,248 +31,158 @@ dylib; end users do not need a separate download.
 - Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
 - Optional: `curl`/`wget` + `tar` for `kh install 7zip`
 
-## Install (global, updatable)
+## Install
 
 ```bash
-# crates.io:
 cargo install kakehashi
+# or from a checkout: cargo install --path crates/kh-cli
 
-# From a git checkout (dev):
-cargo install --path crates/kh-cli
-
-# Update later:
-cargo install kakehashi --force
-```
-
-Prepare a bottle (macOS-like root). Freestanding **libSystem is embedded** —
-no separate dylib path required:
-
-```bash
-kh bottle ensure
-# → installs embedded libSystem.B.dylib into the bottle
-
-# Optional: install Darwin 7-Zip into the bottle at a *real* macOS path
-kh install 7zip
-# → guest /usr/local/bin/7zz  =  {bottle}/usr/local/bin/7zz
-
+kh bottle ensure          # embeds libSystem into the bottle
+kh install 7zip           # optional: Darwin 7zz → guest /usr/local/bin/7zz
 kh run 7zz -- a /tmp/demo.7z ./README.md
-# same as:
-kh run /usr/local/bin/7zz -- a /tmp/demo.7z ./README.md
 ```
 
-Bottle layout mirrors macOS (`/usr/local/bin`, `/usr/lib`, `/Volumes/linux` → host `/`, …).
-Paths under the bottle are guest absolute paths after translation.
+### Bottle layout
 
-| Host (default) | Guest |
-| -------------- | ----- |
-| `~/.local/share/kakehashi/bottle/` | `/` |
-| `…/bottle/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
-| `…/bottle/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
-| `…/bottle/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
+Default root: `~/.local/share/kakehashi/bottle/` (override with
+`KAKEHASHI_DATA_DIR` / `KAKEHASHI_ROOT`).
 
-Override with `KAKEHASHI_DATA_DIR` / `KAKEHASHI_CONFIG_DIR` / `KAKEHASHI_ROOT`.
+| Host | Guest |
+| --- | --- |
+| `…/bottle/` | `/` |
+| `…/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
+| `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
+| `…/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
+
+## Performance (honest)
+
+Kakehashi runs guest code **natively** on the CPU. The tax is the **syscall
+boundary** (TLS switch, alt stack, NEON save/restore, Rust dispatch) × how
+chatty the guest is — not an instruction emulator.
+
+### Measured gap
+
+On Ubuntu aarch64 bare-metal (UTM), multi-file `7zz` archive
+(`-t7z -m0=lzma2 -mx=5 -mmt=4`, ~8k files / ~240 MiB tree):
+
+| | native Linux `7zz` | Darwin `7zz` under `kh` | ratio |
+| --- | ---: | ---: | ---: |
+| wall | ~22.5 s | ~118 s | **~×5.2** |
+
+On compression-heavy, few-file samples the gap is often much smaller
+(~×1.1–1.2). The large multi-file gap is dominated by **path walk + per-syscall
+boundary**, not “wrong LZMA”.
+
+Hypercall is on by default for all guest threads. Opt out with
+`KAKEHASHI_HYPERCALL=0` only for debug (residual `svc`→`brk` / SIGTRAP).
+
+### Why ~×5 is still useful in CI
+
+The product goal for CI is not “as fast as native macOS,” but **run Darwin
+CLI/tools on cheap Linux aarch64 runners** instead of scarce, expensive
+macOS capacity.
+
+**GitHub Actions hosted runners** (private-repo overage rates, USD per
+minute; see [Actions runner pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing)):
+
+| Runner | Per-minute rate |
+| --- | ---: |
+| Linux 2-core arm64 | **$0.005** |
+| Linux 2-core x64 | $0.006 |
+| macOS 3–4 core (M1/Intel) | **$0.062** |
+| macOS larger (e.g. 12-core / M2 Pro) | $0.077–$0.102 |
+
+macOS standard is roughly **×10–×12** the Linux arm64 minute rate before any
+wall-time difference. Even if a job runs **×5 slower** under `kh` on Linux
+arm64 than the same work on a macOS runner, billable cost can still be lower
+because the macOS minute is an order of magnitude more expensive
+(illustrative: 5 × $0.005 ≈ $0.025 vs 1 × $0.062). Public-repo free minutes
+and self-hosted Linux amplify that further; macOS hosted capacity also tends
+to queue longer and (on GitLab SaaS) is Premium/Ultimate / beta-gated.
+
+**When macOS runners still win:** GUI, codesign/notarization, Xcode UI tests,
+or any workload that is not a pure CLI Darwin binary under freestanding
+`libSystem`.
+
+**Gates, not benches:** CI correctness is `cargo test` / smoke / `7zz -mmt=4`,
+not “match native wall clock.” Perf work is tracked in
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Quick start (Docker / Colima on Apple Silicon)
 
 ```bash
-# Dev image + unit tests
 docker build -t kakehashi:dev -f Dockerfile.dev .
 docker run --rm -v "$PWD":/src -w /src kakehashi:dev \
   cargo test --workspace --exclude kh-libsystem
 
-# Full smoke image (build + clippy + test + micro run)
-docker build -t kakehashi:smoke -f Dockerfile .
-docker run --rm kakehashi:smoke
-# or: ./scripts/docker-smoke.sh
+# Full smoke (build + clippy + test + micro run)
+./scripts/docker-smoke.sh
 ```
 
 ## Build
 
 ```bash
-# Host CLI + runtime (on Linux aarch64, or inside the Docker image above)
 cargo build -p kakehashi --release
 cargo test --workspace --exclude kh-libsystem
 cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
 
-# Guest libSystem (maintainers: refresh crates.io embed after API changes)
+# Maintainers: refresh embed after freestanding ABI changes
 cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-./scripts/stage-libsystem.sh
-# → crates/kh-runtime/resources/libSystem.B.dylib  (commit before publish)
+./scripts/stage-libsystem.sh   # → crates/kh-runtime/resources/libSystem.B.dylib
 ```
 
-### Bottle (macOS-like root for the guest)
+`libSystem` discovery: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next to
+`kh` → crate `resources/` → **embedded** bytes in `kh-runtime`.
 
-```bash
-kh bottle ensure                         # uses embedded dylib (crates.io path)
-# or override with a just-built / staged tree:
-kh bottle ensure --libsystem crates/kh-runtime/resources/libSystem.B.dylib
-kh bottle status
-kh bottle destroy --yes
-```
+## Testing map
 
-Discovery for `libSystem`: `--libsystem` → `KAKEHASHI_LIBSYSTEM` → paths next
-to `kh` → Cargo `target/…` / crate `resources/` → **embedded** bytes in
-`kh-runtime`.
+| Goal | Command | Artifacts |
+| --- | --- | --- |
+| Unit tests | `cargo test --workspace --exclude kh-libsystem` | terminal |
+| Docker smoke | `./scripts/docker-smoke.sh` | ends with `smoke ok` |
+| Fixtures | `kh run --expect-code … tests/fixtures/…` | see `tests/fixtures/README.md` |
+| Clang probes | `kh run --root tests/fixtures/bottle tests/clang-probe/puts_hello` | stdout `hello` |
+| Real Darwin `7zz` | `./scripts/docker-7zz.sh …` | host `.tmp/kh-out/` |
+| Fair CPU bench | `./scripts/bench-fair-local.sh` | host `.tmp/kh-bench-fair/` |
 
-### Guest tools (`kh install`)
-
-Packages are installed **into the bottle** at conventional macOS locations
-(not into a random host cache). List: `kh install list`.
-
-```bash
-kh install 7zip          # → /usr/local/bin/7zz in the bottle
-kh run 7zz -- …          # PATH-style bare name under the bottle
-```
-
----
-
-## Testing map (what to run, where results land)
-
-| Goal | Command | Where to look |
-| ---- | ------- | ------------- |
-| Unit tests | `cargo test --workspace --exclude kh-libsystem` | terminal pass/fail |
-| Full Docker smoke | `./scripts/docker-smoke.sh` | terminal; ends with `smoke ok` |
-| Synthetic fixtures | `kh run --expect-code … tests/fixtures/…` | stdout + exit code (see `tests/fixtures/README.md`) |
-| Clang probes | `kh run --root tests/fixtures/bottle tests/clang-probe/puts_hello` | stdout `hello` (see `tests/clang-probe/README.md`) |
-| Real guest `7zz` | `./scripts/docker-7zz.sh …` | **host** `.tmp/kh-out/` (default) |
-| Fair CPU bench | `./scripts/bench-fair-local.sh` | **host** `.tmp/kh-bench-fair/` |
-
-All of `.tmp/`, `.kh/`, and `target/` are gitignored. Nothing important is
-hidden only inside a throwaway container without a copy-out step.
+`.tmp/`, `.kh/`, and `target/` are gitignored.
 
 ### Guest path ↔ host path (Docker helpers)
 
-When `kh` runs in Docker, the bottle bridges the Linux filesystem as
-`/Volumes/linux/…`:
+Bottle bridges the Linux FS as `/Volumes/linux/…`:
 
-| You pass to the guest | Actually on the host |
-| --------------------- | -------------------- |
-| `/Volumes/linux/src/README.md` | `<repo>/README.md` (repo bind-mount) |
-| `/Volumes/linux/out/demo.7z` | `<repo>/.tmp/kh-out/demo.7z` (**durable**, default for `docker-7zz.sh`) |
-| `/Volumes/linux/src/.tmp/foo.7z` | `<repo>/.tmp/foo.7z` (also durable) |
-| `/Volumes/linux/tmp/….7z` | container `/tmp/…` — **gone** after `docker run --rm` |
-
----
-
-## Try it
+| Guest path | Host |
+| --- | --- |
+| `/Volumes/linux/src/README.md` | `<repo>/README.md` |
+| `/Volumes/linux/out/demo.7z` | `<repo>/.tmp/kh-out/demo.7z` (durable; default for `docker-7zz.sh`) |
+| `/Volumes/linux/tmp/…` | container `/tmp/…` — **gone** after `docker run --rm` |
 
 ```bash
-# Any host — map only
-./target/release/kh run --dry-load tests/fixtures/minimal_arm64_execute.macho
-
-# Linux aarch64 live (fixtures + clang probes)
-./target/release/kh run --expect-code 0 tests/fixtures/minimal_arm64_execute.macho
-./target/release/kh run --expect-code 42 tests/fixtures/call_dylib.macho
-./target/release/kh run --expect-code 0 tests/fixtures/bsdthread_create_join.macho
-./target/release/kh run --expect-code 0 --root tests/fixtures/bottle \
-  tests/clang-probe/puts_hello
-```
-
-### Example guest: 7-Zip
-
-7-Zip is only an **optional** installed tool (first real-world target), not the
-product focus.
-
-```bash
-kh bottle ensure
-kh install 7zip
-kh run 7zz -- a /tmp/demo.7z ./README.md
-```
-
-**Docker helper** (dev loop; uses embedded libSystem unless you staged a rebuild):
-
-```bash
-./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z \
-  /Volumes/linux/src/README.md
+./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z /Volumes/linux/src/README.md
 ls -lh .tmp/kh-out/demo.7z
 ```
 
-Regenerate synthetic fixtures:
+Multi-thread correctness gate (Linux aarch64 / Docker):
 
 ```bash
-cargo run -p kh-loader --example write_fixture
+KAKEHASHI_HYPERCALL=1 ./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
+  /Volumes/linux/out/mt.7z /Volumes/linux/src/README.md
+./scripts/docker-7zz.sh t /Volumes/linux/out/mt.7z
 ```
-
----
-
-## Fair bench (native Linux 7zz vs kh + Darwin 7zz)
-
-One random blob on **container-local** `/tmp` (not Virtio-FS), then both
-compressors write archives that are **copied to the host** so you can inspect
-them.
-
-```bash
-./scripts/bench-fair-local.sh                 # 200 MiB, mx=5, mmt=2
-SIZE_MB=64 MMT=1 ./scripts/bench-fair-local.sh
-KAKEHASHI_HYPERCALL=0 ./scripts/bench-fair-local.sh
-```
-
-### Where the files are (host)
-
-```
-.tmp/kh-bench-fair/                 ← override with KH_BENCH_OUT=
-  README.txt                        how to re-check without re-running
-  summary.txt                       timings, ratio, archive=ok lines
-  native.log  kh.log                compressor stdout
-  bin/7zz                           Linux aarch64 7zz (downloaded once)
-  artifacts/
-    native.7z                       from host Linux 7zz
-    kh.7z                           from Darwin 7zz under kh
-    *.sha256  sizes.txt             checksums + byte sizes
-    verify-native.txt  verify-kh.txt  full `7zz t` output
-    run-meta.txt                    size / mx / mmt / hypercall / nproc
-```
-
-### Re-verify yourself
-
-```bash
-cat .tmp/kh-bench-fair/summary.txt
-ls -lh .tmp/kh-bench-fair/artifacts/*.7z
-
-cd .tmp/kh-bench-fair/artifacts
-shasum -a 256 -c native.7z.sha256 kh.7z.sha256   # works on macOS too
-```
-
-Test archive integrity with any 7-Zip:
-
-```bash
-# macOS: brew install sevenzip   →  7zz
-7zz t .tmp/kh-bench-fair/artifacts/native.7z
-7zz t .tmp/kh-bench-fair/artifacts/kh.7z
-
-# or reuse the Linux binary the bench downloaded (Linux aarch64 host / same Docker image):
-docker run --rm -v "$PWD/.tmp/kh-bench-fair:/r" -w /r kakehashi:dev \
-  /r/bin/7zz t /r/artifacts/kh.7z
-```
-
-Guest Darwin `7zz` and Linux `7zz` are **different binaries** — compare
-hypercall vs `KAKEHASHI_HYPERCALL=0` for path overhead, not absolute
-“native × N” across product versions.
-
-### Performance knobs
-
-- Freestanding **hypercall** is on by default for **all** guest threads (main +
-  workers): host alt stack + `TPIDR_EL0` save/restore, no `SIGTRAP` on the I/O
-  path. Opt out with `KAKEHASHI_HYPERCALL=0` (residual `svc`→`brk`/SIGTRAP for
-  debug). Per-thread guest TLS (`TPIDR_EL0`) backs `___error` / TSD; host glibc
-  TLS is restored on every syscall boundary.
-- Worker `pthread_join` completion is published from the **host** stack after
-  `bsdthread_terminate`.
-
----
 
 ## Scripts
 
 | Script | Purpose |
-| ------ | ------- |
-| `scripts/stage-libsystem.sh` | Build product → `crates/kh-runtime/resources/` (crates.io embed) |
-| `scripts/install-linux.sh` | Local `cargo build` + install `kh` + `bottle ensure` |
-| `scripts/docker-smoke.sh` | Reproducible smoke suite inside `Dockerfile` image |
-| `scripts/docker-7zz.sh` | Interactive/ad-hoc Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
-| `scripts/bench-fair-local.sh` | Timed native vs kh compress; artifacts → `.tmp/kh-bench-fair` |
+| --- | --- |
+| `scripts/stage-libsystem.sh` | Build product → `crates/kh-runtime/resources/` |
+| `scripts/install-linux.sh` | Local build + install `kh` + `bottle ensure` |
+| `scripts/docker-smoke.sh` | Smoke suite inside `Dockerfile` image |
+| `scripts/docker-7zz.sh` | Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
+| `scripts/bench-fair-local.sh` | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`) |
 
 ## License
 
 LGPL-3.0-only. See `LICENSE.txt` and `NOTICE`.
 
-This project is **not** derived from Darling. Do not vendor proprietary Apple SDKs or blobs.
+This project is **not** derived from Darling. Do not vendor proprietary Apple
+SDKs or blobs.

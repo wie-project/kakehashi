@@ -3,22 +3,21 @@
 ## Overview
 
 Kakehashi is a **userspace** translator that runs **Darwin Mach-O arm64** guests
-on **Linux aarch64**. Guest code executes **natively** on the CPU (no JIT, no
-instruction emulator). The runtime intervenes only at defined boundaries:
-syscalls, helpers, thread create/terminate, and faults.
+on **Linux aarch64**. Guest code executes **natively** (no JIT, no instruction
+emulator). The runtime intervenes only at defined boundaries: syscalls, helpers,
+thread create/terminate, and faults.
 
-Primary product surface is the CLI binary `kh` (`kakehashi` crate). Live
-execution requires Linux aarch64 (bare metal, VM, or Colima/Docker). Parse and
-dry-load work on other hosts.
+Primary surface: CLI binary `kh` (`kakehashi` crate). Live execution requires
+Linux aarch64. Parse and dry-load work on other hosts.
 
 ## Design goals
 
 | Goal | Implication |
-| ---- | ----------- |
-| Native execution | Guest ARM64 runs as ordinary user code in the host process address space |
+| --- | --- |
+| Native execution | Guest ARM64 runs as ordinary user code in the host address space |
 | CLI-first | Blocking I/O and process-attached main thread are acceptable |
-| 1:1 threads | One guest pthread maps to one host OS thread |
-| Freestanding libSystem | Bottle ships a clean-room dylib, not Apple’s proprietary libraries |
+| 1:1 threads | One guest pthread → one host OS thread |
+| Freestanding libSystem | Bottle ships a clean-room dylib, not Apple’s libraries |
 | No Darling GPL | Spec from public Darwin interfaces; no GPL-3.0 Darling code |
 
 ## Crate graph
@@ -36,11 +35,11 @@ kh-libsystem           Freestanding Darwin-facing C ABI (build: aarch64-apple-da
 ```
 
 | Crate | Responsibility |
-| ----- | ---------------- |
+| --- | --- |
 | `kakehashi` / `kh-cli` | User commands; process lifecycle |
 | `kh-loader` | Image load, fixups, symbol bind, execute session |
-| `kh-runtime` | Guest memory registry, trap/hypercall, syscall table, bottle FS, threads/TLS |
-| `kh-libsystem` | Guest-visible `libSystem.B.dylib` sources (pthread, errno, heap, thin syscalls) |
+| `kh-runtime` | Memory registry, trap/hypercall, syscall table, bottle FS, threads/TLS |
+| `kh-libsystem` | Guest-visible `libSystem.B.dylib` (pthread, errno, heap, thin syscalls) |
 
 **Dependency rule:** `kh-runtime` MUST NOT depend on `kh-loader` or `kh-cli`.
 
@@ -48,25 +47,25 @@ kh-libsystem           Freestanding Darwin-facing C ABI (build: aarch64-apple-da
 
 ```
 kh run <program> [-- args…]
-  1. Resolve bottle root; ensure freestanding libSystem in bottle
-  2. Load Mach-O + dependent dylibs into identity-mapped guest VA space
+  1. Resolve bottle; ensure freestanding libSystem
+  2. Load Mach-O + dylibs (identity-mapped guest VA)
   3. Bind symbols; wire `_kh_bsd_hypercall` → `kh_hypercall_entry` (default)
   4. Install SIGTRAP / fault handlers (fallback / diagnostics)
   5. Prepare main-thread HostMeta + guest TLS (`TPIDR_EL0`)
-  6. jump_to_guest(LC_MAIN)   // noreturn on success
-       ⇄ hypercall / trap  →  BSD syscall handlers  →  return to guest
-       → bsdthread_create    →  N host workers (same boundary)
+  6. jump_to_guest(LC_MAIN)
+       ⇄ hypercall / trap → BSD handlers → return to guest
+       → bsdthread_create → N host workers
        → exit / terminate
-  7. Teardown maps; process exit code from guest `exit` or fault
+  7. Teardown; process exit code from guest `exit` or fault
 ```
 
 ## Address space
 
-Guest virtual addresses are **identity-mapped** to host pointers: a guest
-buffer pointer is a valid host `*mut u8` after range checks.
+Guest virtual addresses are **identity-mapped** to host pointers: a guest buffer
+pointer is a valid host `*mut u8` after range checks.
 
 | Component | Role |
-| --------- | ---- |
+| --- | --- |
 | `mem::registry` | Process-wide region set; TLS last-hit cache for `check_range` |
 | `mem::map` | Host `mmap` / `mprotect` with Darwin prot bits translated |
 | Bottle paths | Guest absolute paths under bottle; `/Volumes/linux` → host FS |
@@ -83,34 +82,30 @@ Source: `crates/kh-libsystem`. Product artifact:
 crates/kh-runtime/resources/libSystem.B.dylib
 ```
 
-Staged by `./scripts/stage-libsystem.sh` after:
-
 ```bash
 cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+./scripts/stage-libsystem.sh
 ```
 
-The dylib is **embedded** into `kh-runtime` (`include_bytes!`) for crates.io.
-There is no production dependency on a `dist/guest` tree; bottle ensure copies
-from embed / resources / optional override.
+Embedded into `kh-runtime` (`include_bytes!`) for crates.io. Bottle ensure
+copies from embed / resources / optional override.
 
-Guest `svc #0x80` is not used when hypercall is wired: freestanding
-`syscall7` calls `kh_bsd_hypercall` (thin AAPCS call into host entry).
+When hypercall is wired, freestanding `syscall7` calls `kh_bsd_hypercall`
+(thin AAPCS call into host entry), not `svc #0x80`.
 
-## Syscall path (summary)
+## Syscall path
 
 | Mode | Mechanism | Use |
-| ---- | --------- | --- |
+| --- | --- | --- |
 | Hypercall (default) | Guest `bl` → `kh_hypercall_entry` → host alt stack → dispatch | Production, all threads |
-| Residual `svc`→`brk` | Patched leftovers + SIGTRAP handler | Fixtures / debug (`KAKEHASHI_HYPERCALL=0`) |
+| Residual `svc`→`brk` | Patched leftovers + SIGTRAP | Fixtures / debug (`KAKEHASHI_HYPERCALL=0`) |
 
-See [Guest–host boundary](guest-host-boundary.md) for the full protocol.
+See [Guest–host boundary](guest-host-boundary.md).
 
 ## Bottle layout
 
-A bottle is a macOS-like root on the host filesystem.
-
 | Host (default) | Guest |
-| -------------- | ----- |
+| --- | --- |
 | `~/.local/share/kakehashi/bottle/` | `/` |
 | `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
 | `…/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
@@ -124,16 +119,16 @@ Workspace lint: `unsafe` denied by default. Allowed only in scoped
 `kh-runtime` modules (`cpu`, `host`, `host_slot`, `mem/*`, `trap`, `entry`,
 `thread`, `tls`, …). Every block requires a `// SAFETY:` invariant comment.
 
-Register and stack discipline is documented in [Invariants](invariants.md).
+Register and stack discipline: [Invariants](invariants.md).
 
 ## Testing map
 
-| Gate | Command / note |
-| ---- | -------------- |
+| Gate | Command |
+| --- | --- |
 | Unit + clippy | `cargo test/clippy --workspace --exclude kh-libsystem` |
-| libSystem | Rebuild + `stage-libsystem.sh` after ABI changes |
+| libSystem ABI change | Rebuild + `stage-libsystem.sh` |
 | Docker smoke | `./scripts/docker-smoke.sh` |
-| 7zz multi-thread | `./scripts/docker-7zz.sh` with `-mmt>1` (see [Threading](threading.md)) |
+| Multi-thread | `./scripts/docker-7zz.sh` with `-mmt=4 -mx=5` (see [Threading](threading.md)) |
 
-Bench and durable guest output should land under host `.tmp/` (or
-`KH_OUT` → guest `/Volumes/linux/out`), not ephemeral container `/tmp`.
+Durable guest output: host `.tmp/` or `KH_OUT` → guest `/Volumes/linux/out`,
+not ephemeral container `/tmp`.
