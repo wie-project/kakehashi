@@ -76,7 +76,7 @@ head -c 80 .tmp/kh-out/body; echo
 # HTTP to stdout
 kh run curl -- -sS http://example.com/ | head -c 80; echo
 
-# HTTPS GET (G4) — OpenSSL + bottle Mozilla CA bundle
+# HTTPS GET (G4) — OpenSSL + bottle CA (from host or curl.se download)
 kh run curl -- -sS -o .tmp/kh-out/https-body https://example.com/
 wc -c .tmp/kh-out/https-body
 
@@ -161,7 +161,7 @@ Default root: `~/.local/share/kakehashi/bottle/` (override with
 | `…/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
 | `…/usr/local/bin/curl` | `/usr/local/bin/curl` |
 | `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
-| `…/private/etc/ssl/cert.pem` | `/etc/ssl/cert.pem` (CA bundle) |
+| `…/private/etc/ssl/cert.pem` | `/etc/ssl/cert.pem` (host CA or downloaded Mozilla) |
 | `…/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
 
 ## Performance (honest)

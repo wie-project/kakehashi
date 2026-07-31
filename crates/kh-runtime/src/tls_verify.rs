@@ -4,7 +4,7 @@
 //! `SecTrustEvaluateWithError` (no real Security.framework in the bottle).
 //!
 //! Implementation: host `openssl` CLI (chain trust + hostname SAN/CN check).
-//! The CA file is the bottle Mozilla/system bundle under `private/etc/ssl/cert.pem`.
+//! The CA file is the bottle system/downloaded bundle under `private/etc/ssl/cert.pem`.
 
 use std::fs;
 use std::io::Write;

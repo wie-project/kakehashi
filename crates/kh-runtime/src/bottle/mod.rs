@@ -17,7 +17,8 @@ mod path;
 mod registry;
 
 pub use ca_bundle::{
-    GUEST_CA_DIR_REL, GUEST_CA_FILE_REL, active_ca_pem_path, ensure_ca_bundle,
+    ENV_CA_BUNDLE, GUEST_CA_DIR_REL, GUEST_CA_FILE_REL, MOZILLA_CACERT_URL, active_ca_pem_path,
+    ensure_ca_bundle,
 };
 pub use guest_tools::{
     DARWIN_7ZZ_URL, DARWIN_CURL_URL, DEFAULT_7ZZ_PATH, ENV_7ZZ, ENV_CURL, GUEST_7ZZ_REL,
