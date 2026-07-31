@@ -34,7 +34,7 @@ pub use manage::{
     destroy, ensure, status,
 };
 pub use path::{
-    PathError, bottle_root, read_c_string, set_bottle_root, translate_path,
+    PathError, bottle_openat_rel, bottle_root, read_c_string, set_bottle_root, translate_path,
     translate_path_with_root,
 };
 pub use registry::{

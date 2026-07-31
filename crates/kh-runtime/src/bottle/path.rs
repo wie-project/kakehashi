@@ -96,6 +96,20 @@ pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<Path
     }
 }
 
+/// Bottle-relative openat target for an absolute guest path (B1).
+///
+/// When `Some((dirfd, rel))`, callers should `openat`/`fstatat` with `rel`
+/// (`"."` when the guest path is `/`) instead of allocating `{root}/{rel}`.
+#[must_use]
+pub fn bottle_openat_rel(guest: &str) -> Option<(std::os::fd::RawFd, &str)> {
+    if !guest.starts_with('/') {
+        return None;
+    }
+    let dirfd = process::bottle_dirfd()?;
+    let rel = try_fast_relative(guest)?;
+    Some((dirfd, if rel.is_empty() { "." } else { rel }))
+}
+
 /// Returns stripped relative guest path when it has no `..` (and no empty segs).
 ///
 /// `None` means fall back to the full component walker.
@@ -251,5 +265,23 @@ mod tests {
         let root = Path::new("/b");
         let host = translate_path_with_root(Some(root), "/foo..bar").expect("dots in name");
         assert_eq!(host, PathBuf::from("/b/foo..bar"));
+    }
+
+    #[test]
+    fn bottle_openat_rel_uses_dirfd_when_configured() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kh-b1-openat-{}",
+            std::process::id()
+        ));
+        drop(std::fs::remove_dir_all(&tmp));
+        std::fs::create_dir_all(tmp.join("usr/lib")).expect("mkdir");
+        set_bottle_root(Some(tmp.clone()));
+        let (fd, rel) = bottle_openat_rel("/usr/lib/libSystem.B.dylib").expect("openat parts");
+        assert!(fd >= 0);
+        assert_eq!(rel, "usr/lib/libSystem.B.dylib");
+        assert!(bottle_openat_rel("relative").is_none());
+        set_bottle_root(None);
+        assert!(bottle_openat_rel("/usr/lib/x").is_none());
+        drop(std::fs::remove_dir_all(&tmp));
     }
 }

@@ -26,6 +26,16 @@ pub(crate) fn handle_access(args: SyscallArgs) -> SyscallResult {
     let Some(path) = bottle::read_c_string(args.x0, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
+    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(&path) {
+        let Ok(c_rel) = std::ffi::CString::new(rel) else {
+            return SyscallResult::err(name, EFAULT);
+        };
+        return if host::faccessat_ok(dirfd, &c_rel) {
+            SyscallResult::ok(name, 0)
+        } else {
+            SyscallResult::err(name, ENOENT)
+        };
+    }
     let Ok(host_path) = translate_path(&path) else {
         return SyscallResult::err(name, ENOENT);
     };
@@ -56,6 +66,16 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
     let Some(path) = bottle::read_c_string(args.x0, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
+    // B1: fstatat(bottle_dirfd, rel) avoids PathBuf + full absolute walk.
+    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(&path) {
+        let Ok(c_rel) = std::ffi::CString::new(rel) else {
+            return SyscallResult::err(name, EFAULT);
+        };
+        let Some(st) = host::fstatat(dirfd, &c_rel, no_follow) else {
+            return SyscallResult::err(name, ENOENT);
+        };
+        return write_darwin_stat64_from_libc(args.x1, &st, name);
+    }
     let Ok(host_path) = translate_path(&path) else {
         return SyscallResult::err(name, ENOENT);
     };
@@ -105,33 +125,43 @@ pub(crate) fn handle_fstatat(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     };
 
-    let host_path = if dirfd == AT_FDCWD || path.starts_with('/') {
-        match translate_path(&path) {
-            Ok(p) => p,
-            Err(_) => return SyscallResult::err(name, ENOENT),
-        }
-    } else {
-        let Some(host_dir) = guest_to_host_fd(args.x0) else {
-            return SyscallResult::err(name, EBADF);
-        };
-        // Resolve relative to dirfd via /proc/self/fd on Linux.
-        let dir_link = format!("/proc/self/fd/{host_dir}");
-        let Ok(dir_path) = std::fs::read_link(&dir_link) else {
-            return SyscallResult::err(name, EBADF);
-        };
-        dir_path.join(path)
-    };
-
     let no_follow = flag & AT_SYMLINK_NOFOLLOW != 0;
-    let meta = if no_follow {
-        std::fs::symlink_metadata(&host_path)
-    } else {
-        std::fs::metadata(&host_path)
+
+    if dirfd == AT_FDCWD || path.starts_with('/') {
+        if let Some((bdfd, rel)) = bottle::bottle_openat_rel(&path) {
+            let Ok(c_rel) = std::ffi::CString::new(rel) else {
+                return SyscallResult::err(name, EFAULT);
+            };
+            let Some(st) = host::fstatat(bdfd, &c_rel, no_follow) else {
+                return SyscallResult::err(name, ENOENT);
+            };
+            return write_darwin_stat64_from_libc(args.x2, &st, name);
+        }
+        let Ok(host_path) = translate_path(&path) else {
+            return SyscallResult::err(name, ENOENT);
+        };
+        let meta = if no_follow {
+            std::fs::symlink_metadata(&host_path)
+        } else {
+            std::fs::metadata(&host_path)
+        };
+        let Ok(meta) = meta else {
+            return SyscallResult::err(name, ENOENT);
+        };
+        return write_darwin_stat64(args.x2, &meta, name);
+    }
+
+    let Some(host_dir) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
     };
-    let Ok(meta) = meta else {
+    let Ok(c_rel) = std::ffi::CString::new(path.as_str()) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    // Relative to guest dirfd: fstatat directly (no /proc/self/fd string walk).
+    let Some(st) = host::fstatat(host_dir, &c_rel, no_follow) else {
         return SyscallResult::err(name, ENOENT);
     };
-    write_darwin_stat64(args.x2, &meta, name)
+    write_darwin_stat64_from_libc(args.x2, &st, name)
 }
 
 /// `unlink` — path `x0`.

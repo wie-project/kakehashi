@@ -105,6 +105,15 @@ pub fn open_path(path: &std::ffi::CStr, flags: libc::c_int, mode: libc::c_uint) 
     if rc < 0 { None } else { Some(rc) }
 }
 
+/// Open a directory as `O_RDONLY|O_DIRECTORY|O_CLOEXEC` (bottle root dirfd, B1).
+pub fn open_directory(path: &std::ffi::CStr) -> Option<RawFd> {
+    open_path(
+        path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+}
+
 /// `openat(dirfd, path, flags, mode)`.
 pub fn openat(
     dirfd: RawFd,
@@ -115,6 +124,30 @@ pub fn openat(
     // SAFETY: dirfd live; path is a valid C string for the duration of the call.
     let rc = unsafe { libc::openat(dirfd, path.as_ptr(), flags, mode) };
     if rc < 0 { None } else { Some(rc) }
+}
+
+/// `fstatat(dirfd, path, …)` — used by B1 bottle-relative `stat`/`lstat`.
+pub fn fstatat(
+    dirfd: RawFd,
+    path: &std::ffi::CStr,
+    no_follow: bool,
+) -> Option<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = if no_follow {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    // SAFETY: dirfd live; path valid C string; stack `stat` buffer.
+    let rc = unsafe { libc::fstatat(dirfd, path.as_ptr(), std::ptr::addr_of_mut!(st), flags) };
+    if rc == 0 { Some(st) } else { None }
+}
+
+/// `faccessat(dirfd, path, F_OK, 0)` — existence check without full path build.
+pub fn faccessat_ok(dirfd: RawFd, path: &std::ffi::CStr) -> bool {
+    // SAFETY: dirfd live; path valid C string.
+    let rc = unsafe { libc::faccessat(dirfd, path.as_ptr(), libc::F_OK, 0) };
+    rc == 0
 }
 
 /// Write bytes to a host fd (`write(2)`).

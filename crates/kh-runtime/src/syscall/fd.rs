@@ -104,11 +104,23 @@ fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
 }
 
 fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult {
+    let host_flags = darwin_to_host_open_flags(flags);
+    let mode = 0o666_u32;
+
+    // B1: bottle dirfd + relative path — no PathBuf join, shorter kernel walk.
+    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
+        let Ok(c_rel) = std::ffi::CString::new(rel) else {
+            return SyscallResult::err(name, EFAULT);
+        };
+        let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) else {
+            return SyscallResult::err(name, ENOENT);
+        };
+        return finish_open(name, rc);
+    }
+
     let Ok(host_path) = translate_path(path) else {
         return SyscallResult::err(name, ENOENT);
     };
-    let host_flags = darwin_to_host_open_flags(flags);
-    let mode = 0o666_u32;
     let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
         return SyscallResult::err(name, EFAULT);
     };

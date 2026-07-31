@@ -146,6 +146,13 @@ not of a random guest bug.
 | `KAKEHASHI_HYPERCALL=0` | — | Force SIGTRAP/svc path |
 | `KAKEHASHI_HYPERCALL_LIGHT` | **off** | A3: skip second NEON save on freestanding hypercall (`1`/`true`/`yes`/`on`). Kill-switch = unset. UTM 8k bench: **no wall win**; keep opt-in only. |
 | `KAKEHASHI_FUTEX_STATS` | **off** | Print guest `KH_HELPER_PARK`/`WAKE` counters at exit (park expected buckets → F1 vs pre-F1 vs cond). |
+
+### B1 bottle dirfd (path walk)
+
+When a bottle root is set, the host keeps an `O_DIRECTORY` fd and absolute guest
+paths use `openat`/`fstatat`/`faccessat` with a **relative** suffix (no
+`PathBuf` join of `{root}/{rel}` on the hot path). Fallback remains full
+`translate_path` + `open` for relative paths, slow-path `..`, or missing dirfd.
 | `KAKEHASHI_TRAMPOLINE` | off | Experimental svc→veneer rewrite (separate from freestanding hypercall) |
 
 ## Related documents

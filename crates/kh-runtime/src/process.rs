@@ -147,6 +147,12 @@ pub fn fd_alloc(host_fd: RawFd) -> Option<i32> {
 /// Bottle root published for path translation (set once per run; rare updates).
 static BOTTLE_ROOT: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
 
+/// Open `O_DIRECTORY` fd for the bottle root (`-1` = none).
+///
+/// Hot path: absolute guest paths use `openat`/`fstatat` against this fd
+/// instead of building `{root}/{rel}` PathBuf + `open` from `/` each call (B1).
+static BOTTLE_DIRFD: AtomicI32 = AtomicI32::new(-1);
+
 /// `bsdthread_register` snapshot (narrow lock; not the full process state).
 static BSDTHREAD_REG: RwLock<Option<BsdThreadReg>> = RwLock::new(None);
 
@@ -300,7 +306,15 @@ pub fn reset_run(max_syscalls: usize) {
 }
 
 /// Configures the bottle root used by path-taking syscalls.
+///
+/// Also opens/replaces the process-wide bottle directory fd for B1 `openat`.
 pub fn set_bottle_root(root: Option<PathBuf>) {
+    let new_fd = root.as_ref().map_or(-1, |p| open_bottle_dirfd(p).unwrap_or(-1));
+    let old_fd = BOTTLE_DIRFD.swap(new_fd, Ordering::AcqRel);
+    if old_fd >= 0 {
+        host::close_fd(old_fd);
+    }
+
     let next = root.map(Arc::new);
     match BOTTLE_ROOT.write() {
         Ok(mut guard) => {
@@ -326,6 +340,21 @@ pub fn with_bottle_root<R>(f: impl FnOnce(Option<&Path>) -> R) -> R {
         Ok(guard) => f(guard.as_ref().map(|a| a.as_path())),
         Err(poisoned) => f(poisoned.into_inner().as_ref().map(|a| a.as_path())),
     }
+}
+
+/// Process-wide bottle root directory fd for `openat`/`fstatat` (B1).
+///
+/// `None` when no bottle is configured or the directory could not be opened.
+#[must_use]
+pub fn bottle_dirfd() -> Option<RawFd> {
+    let fd = BOTTLE_DIRFD.load(Ordering::Acquire);
+    if fd >= 0 { Some(fd) } else { None }
+}
+
+/// Open `root` as `O_RDONLY|O_DIRECTORY|O_CLOEXEC` for hot-path `openat`.
+fn open_bottle_dirfd(root: &Path) -> Option<RawFd> {
+    let c = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).ok()?;
+    host::open_directory(&c)
 }
 
 /// Stores `bsdthread_register` metadata for subsequent `bsdthread_create`.

@@ -16,10 +16,13 @@ to try, in what order, what is allowed, and what has already failed.
 
 ### Observed gap (Ubuntu aarch64, ~240 MiB / ~8k files, `mx=5 mmt=4`)
 
-|      | native `7zz` | `kh` hypercall |    ratio |
-| ---- | -----------: | -------------: | -------: |
-| real |        ~34 s |         ~161 s | **×4.7** |
-| user |        ~73 s |         ~186 s |     ×2.6 |
+|      | native `7zz` | `kh` (pre A/F) | `kh` post-F1c |    ratio vs native |
+| ---- | -----------: | -------------: | ------------: | -----------------: |
+| real |        ~34 s |         ~161 s |      **~117 s** |           **×3.4** |
+| user |        ~73 s |         ~186 s |      **~163 s** |               ×2.2 |
+
+Post-F1c futex: `wake` ~21k (was ~46k), `woken0` ~132 (was ~25k). Residual parks
+are real cond waits (`other` ~21k). Next lever: **B1** path/`openat` tax.
 
 On compression-heavy, fewer-file samples the gap shrinks (often ~×1.1–1.2). The
 large gap is dominated by **path walk + per-syscall boundary tax**, not “wrong
@@ -69,7 +72,7 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 
 | ID     | Idea                                                                                                          | Why                                                       |
 | ------ | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| **B1** | Faster `translate_path` (no PathBuf churn; intern bottle root)                                                | Every `open`/`stat`                                       |
+| **B1** | **Bottle dirfd + `openat`/`fstatat`** (no PathBuf join on absolute paths)                                     | Every `open`/`stat`/`access` under bottle — **Done (code)** |
 | **B2** | Hot `read`/`write`/`lseek`/`fstat` with minimal registry work (range cache already exists — extend carefully) | Archive I/O                                               |
 | **B3** | Avoid global locks on FD map / process state (already lock-free-ish for FD — keep it)                         | MT scaling                                                |
 | **B4** | Optional: no alt-stack switch for pure ST / documented fallback only                                          | Micro-cost; **MUST NOT** become MT default on guest stack |
@@ -188,7 +191,8 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — enter returns alt top; one gettid on slow path. **v1/v2** failed (host TLS cache). UTM after A2: gettid ~631k (was ~942k), futex still ~82% time. |
 | **2026-07** | **A1** guest-TLS host/alt mirror                                      | **Done** — different from “cookie→map”: store `host_tpidr@24` + `alt_top@32` in freestanding guest TLS (host-written at prepare / `enter_guest_tls` / alt map). Hot enter: `mrs` + magic check + load mirrors → `msr` host — **no gettid, no Mutex, no thread_local!**. Leave: asm parks guest VA at prolog+80; `kh_tls_leave_host(guest)` restores without gettid. Slow path keeps A2 gettid map. Freestanding `GuestTls` extended (stage dylib). **UTM bare-metal 8k-file gate (post-A1):** gettid **1026** (was **631k** after A2 / **~942k** baseline), total syscalls **322k** (was **949k**), strace time **~28s** (was **~91s**). Futex calls still ~257k / ~95% time — guest park/wake, not map Mutex. |
 | **2026-07** | **F1** contended-bit guest mutex                                      | **Done** + **UTM validated** — `exp1`~35 / `exp2`~59 (mutex not the storm). Residual: **`other(cond)`~21430** park, **`n=broad`~46239** wake, **`woken0`~24716**. |
-| **2026-07** | **F1c** cond signal/broadcast                                         | **Done** (code) — `pthread_cond`: word0=gen, word1=nwaiters; always `gen++`; `FUTEX_WAKE` only if nwaiters>0; **signal wakes 1**, broadcast wakes all (was signal≡broadcast always-wake). Stage dylib required. |
+| **2026-07** | **F1c** cond signal/broadcast                                         | **Done** + **UTM win** — wake 46k→22k, `woken0` 25k→132; wall **~3:38→~1:57** on 8k-file `mmt=4`. Parks still ~21k real cond. |
+| **2026-07** | **B1** bottle dirfd `openat`/`fstatat`                                | **Done** (code) — `set_bottle_root` opens `O_DIRECTORY` fd; absolute guest paths use `openat`/`fstatat`/`faccessat` with relative suffix (no `{root}/{rel}` PathBuf). Fallback: old `translate_path` + `open`. |
 | **2026-07** | **A3** UTM wall measurement                                           | **No wall win** on 8k-file `mmt=4` (LIGHT=1). Expected: light only skips *second* NEON; prolog+TLS+dispatch remain; wall dominated by futex off-CPU. Keep opt-in; no default-on. |
 | **2026-07** | **A3** light hypercall dispatch                                       | **Done (opt-in)** — `kh_neon_tramp_entry` checks `KH_HYPERCALL_LIGHT`; when set, `mov x7,x16; b kh_trampoline_dispatch` (no second Q* save). Prolog 640 B NEON save/restore **unchanged**. Freestanding clobber list **unchanged**. Full `TRAMP_BYTES` still mapped (veneer + kill-switch). Env `KAKEHASHI_HYPERCALL_LIGHT=1` only; default full tramp. Past failure was light without prolog invariants — re-validated under MT gate. Default-on deferred. |
 | —          | A3 default-on                                                         | Open after ≥3 green MT + UTM        |
