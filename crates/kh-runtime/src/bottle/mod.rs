@@ -8,6 +8,7 @@
 //!   dylib (`resources/libSystem.B.dylib`, published on crates.io).
 //! * **Guest tools** — host path discovery for integration binaries (`7zz`, `curl`).
 
+mod ca_bundle;
 mod guest_tools;
 mod layout;
 mod libsystem;
@@ -15,6 +16,9 @@ mod manage;
 mod path;
 mod registry;
 
+pub use ca_bundle::{
+    GUEST_CA_DIR_REL, GUEST_CA_FILE_REL, active_ca_pem_path, ensure_ca_bundle,
+};
 pub use guest_tools::{
     DARWIN_7ZZ_URL, DARWIN_CURL_URL, DEFAULT_7ZZ_PATH, ENV_7ZZ, ENV_CURL, GUEST_7ZZ_REL,
     GUEST_CURL_REL, GUEST_PATH_DIRS, InstallPackage, InstallReport, ToolError, discover_7zz,

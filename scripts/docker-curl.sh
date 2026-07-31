@@ -142,6 +142,22 @@ else
 fi
 
 "$KH" bottle ensure
+# c-ares (static curl) reads guest /etc/resolv.conf → bottle private/etc.
+if [[ -f /etc/resolv.conf ]]; then
+  mkdir -p "${KAKEHASHI_DATA_DIR}/bottle/private/etc"
+  cp /etc/resolv.conf "${KAKEHASHI_DATA_DIR}/bottle/private/etc/resolv.conf" || true
+fi
+# OpenSSL CAfile default + SecTrust host helper (also seeded by bottle ensure).
+if [[ ! -s "${KAKEHASHI_DATA_DIR}/bottle/private/etc/ssl/cert.pem" ]]; then
+  mkdir -p "${KAKEHASHI_DATA_DIR}/bottle/private/etc/ssl/certs"
+  if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+    cp /etc/ssl/certs/ca-certificates.crt "${KAKEHASHI_DATA_DIR}/bottle/private/etc/ssl/cert.pem" || true
+  elif [[ -f /etc/ssl/cert.pem ]]; then
+    cp /etc/ssl/cert.pem "${KAKEHASHI_DATA_DIR}/bottle/private/etc/ssl/cert.pem" || true
+  elif [[ -f /src/crates/kh-runtime/resources/ssl/cert.pem ]]; then
+    cp /src/crates/kh-runtime/resources/ssl/cert.pem "${KAKEHASHI_DATA_DIR}/bottle/private/etc/ssl/cert.pem" || true
+  fi
+fi
 "$KH" bottle status
 "$KH" install curl
 

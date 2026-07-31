@@ -6,8 +6,8 @@ use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID,
-    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT,
-    SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
+    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN,
+    SYS_OPENAT, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
     SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
@@ -618,6 +618,42 @@ pub(crate) unsafe extern "C" fn ioctl(_fd: c_int, _request: u64, _arg: *mut c_vo
     -1
 }
 
+/// C `usleep` → nlist `_usleep` (yield-based soft sleep for curl G3 cleanup).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn usleep(usec: u32) -> c_int {
+    // Soft: yield a few times proportional to usec (not wall-accurate).
+    let spins = usec.saturating_div(1000).clamp(1, 50);
+    for _ in 0..spins {
+        let _ = unsafe { sys::helper0(crate::KH_HELPER_YIELD) };
+    }
+    0
+}
+
+/// C `nanosleep` → nlist `_nanosleep` (soft; advances *rem = 0).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn nanosleep(req: *const c_void, rem: *mut c_void) -> c_int {
+    if req.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // timespec: sec i64 + nsec i64
+    let p = req.cast::<i64>();
+    let sec = unsafe { p.read() };
+    let nsec = unsafe { p.add(1).read() };
+    let usec = sec
+        .saturating_mul(1_000_000)
+        .saturating_add(nsec.saturating_div(1000))
+        .clamp(0, 50_000);
+    let _ = unsafe { usleep(u32::try_from(usec).unwrap_or(1)) };
+    if !rem.is_null() {
+        unsafe {
+            rem.cast::<i64>().write(0);
+            rem.cast::<i64>().add(1).write(0);
+        }
+    }
+    0
+}
+
 /// C `sysconf` → nlist `_sysconf`.
 ///
 /// Darwin name numbers (from `<unistd.h>` / XNU): `_SC_ARG_MAX=1`,
@@ -884,7 +920,11 @@ pub(crate) unsafe extern "C" fn bsearch(
     while lo < hi {
         let mid = lo.saturating_add(hi.saturating_sub(lo).wrapping_shr(1));
         // SAFETY: base is nel*width; mid < nel.
-        let elem = unsafe { base.cast::<u8>().add(mid.saturating_mul(width)).cast::<c_void>() };
+        let elem = unsafe {
+            base.cast::<u8>()
+                .add(mid.saturating_mul(width))
+                .cast::<c_void>()
+        };
         // SAFETY: guest compar for key vs elem.
         let ord = unsafe { cmp(key, elem) };
         if ord == 0 {

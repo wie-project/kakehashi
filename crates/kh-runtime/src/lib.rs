@@ -18,6 +18,7 @@ pub mod stack;
 pub mod syscall;
 pub mod thread;
 pub mod tls;
+pub mod tls_verify;
 pub mod trap;
 
 pub use bottle::{

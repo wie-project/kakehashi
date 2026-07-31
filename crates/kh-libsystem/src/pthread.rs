@@ -427,6 +427,67 @@ pub(crate) unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut c_void) -> c_i
     0
 }
 
+/// C `pthread_mutexattr_init` → nlist `_pthread_mutexattr_init` (curl G3).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_mutexattr_init(attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    // Opaque attr: zero first word (default type).
+    unsafe {
+        attr.cast::<u32>().write(0);
+    }
+    0
+}
+
+/// C `pthread_mutexattr_destroy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_mutexattr_destroy(attr: *mut c_void) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    0
+}
+
+/// C `pthread_mutexattr_settype` (PTHREAD_MUTEX_NORMAL=0, ERRORCHECK=1, RECURSIVE=2).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_mutexattr_settype(
+    attr: *mut c_void,
+    type_: c_int,
+) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    // Soft-accept; freestanding mutex is non-recursive. Store for debugging.
+    unsafe {
+        attr.cast::<u32>().write(type_.cast_unsigned());
+    }
+    0
+}
+
+/// C `pthread_mutex_trylock`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> c_int {
+    if mutex.is_null() {
+        return EINVAL;
+    }
+    let w = unsafe { &*mutex_word(mutex) };
+    if w
+        .compare_exchange(
+            MUTEX_UNLOCKED,
+            MUTEX_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        0
+    } else {
+        // Darwin EBUSY
+        16
+    }
+}
+
 /// C `pthread_mutex_lock` → nlist `_pthread_mutex_lock`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int {
@@ -573,6 +634,84 @@ pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut
     waiters.fetch_sub(1, Ordering::AcqRel);
     let _ = unsafe { pthread_mutex_lock(mutex) };
     0
+}
+
+fn timespec_now_ns() -> Option<i64> {
+    // Darwin timeval via gettimeofday: sec i64 + usec i32 + pad.
+    let mut tv = [0_u8; 16];
+    let ret = unsafe {
+        sys::syscall2(
+            crate::sys::SYS_GETTIMEOFDAY,
+            u64::try_from(tv.as_mut_ptr().addr()).unwrap_or(0),
+            0,
+        )
+    };
+    if ret < 0 {
+        return None;
+    }
+    let sec = i64::from_le_bytes([
+        tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7],
+    ]);
+    let usec = i32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]);
+    Some(
+        sec.saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(usec).saturating_mul(1000)),
+    )
+}
+
+fn abstime_ns(abstime: *const c_void) -> Option<i64> {
+    if abstime.is_null() {
+        return None;
+    }
+    // Darwin timespec: tv_sec i64 + tv_nsec i64 on arm64.
+    let p = abstime.cast::<i64>();
+    let sec = unsafe { p.read() };
+    let nsec = unsafe { p.add(1).read() };
+    Some(sec.saturating_mul(1_000_000_000).saturating_add(nsec))
+}
+
+/// C `pthread_cond_timedwait` (absolute `timespec`; curl G3).
+///
+/// Host park has no timeout, so we unlock, yield-poll generation until signal
+/// or deadline, then re-lock. Returns Darwin `ETIMEDOUT` (60) on timeout.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_cond_timedwait(
+    cond: *mut c_void,
+    mutex: *mut c_void,
+    abstime: *const c_void,
+) -> c_int {
+    if cond.is_null() || mutex.is_null() || abstime.is_null() {
+        return EINVAL;
+    }
+    let Some(deadline) = abstime_ns(abstime) else {
+        return EINVAL;
+    };
+    let generation = unsafe { &*cond_gen(cond) };
+    let waiters = unsafe { &*cond_waiters(cond) };
+    waiters.fetch_add(1, Ordering::AcqRel);
+    let snapshot = generation.load(Ordering::Acquire);
+    let _ = unsafe { pthread_mutex_unlock(mutex) };
+
+    let mut timed_out = false;
+    while generation.load(Ordering::Acquire) == snapshot {
+        if let Some(now) = timespec_now_ns()
+            && now >= deadline
+        {
+            timed_out = true;
+            break;
+        }
+        // Brief yield so multi-thread notify can run; avoid infinite park.
+        let _ = unsafe { sys::helper0(crate::KH_HELPER_YIELD) };
+        core::hint::spin_loop();
+    }
+
+    waiters.fetch_sub(1, Ordering::AcqRel);
+    let _ = unsafe { pthread_mutex_lock(mutex) };
+    if timed_out && generation.load(Ordering::Acquire) == snapshot {
+        60 // ETIMEDOUT
+    } else {
+        0
+    }
 }
 
 /// Bump generation and always futex-wake (wake_n waiters).

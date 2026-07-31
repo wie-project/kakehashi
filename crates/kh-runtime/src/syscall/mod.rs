@@ -15,6 +15,7 @@
 //! - [`time_sys`] — gettimeofday/clock_gettime
 //! - [`sysctl`] — sysctl/sysctlbyname
 //! - [`signal`] — sigprocmask/sigaction (soft)
+//! - [`net`] — pipe/socket/connect/poll/select (curl G3)
 
 mod common;
 mod fd;
@@ -22,6 +23,7 @@ mod fs;
 mod helpers;
 mod io;
 mod mem_sys;
+mod net;
 mod process;
 mod signal;
 mod sysctl;
@@ -114,6 +116,21 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::BsdthreadTerminate) => thread_sys::handle_bsdthread_terminate(args),
         Some(BsdSyscall::BsdthreadRegister) => thread_sys::handle_bsdthread_register(args),
         Some(BsdSyscall::ThreadSelfid) => thread_sys::handle_thread_selfid(),
+        Some(BsdSyscall::Pipe) => net::handle_pipe(args),
+        Some(BsdSyscall::Socket) => net::handle_socket(args),
+        Some(BsdSyscall::Connect) => net::handle_connect(args),
+        Some(BsdSyscall::Bind) => net::handle_bind(args),
+        Some(BsdSyscall::Listen) => net::handle_listen(args),
+        Some(BsdSyscall::Accept) => net::handle_accept(args),
+        Some(BsdSyscall::Setsockopt) => net::handle_setsockopt(args),
+        Some(BsdSyscall::Getsockopt) => net::handle_getsockopt(args),
+        Some(BsdSyscall::Shutdown) => net::handle_shutdown(args),
+        Some(BsdSyscall::Sendto | BsdSyscall::Send) => net::handle_sendto(args),
+        Some(BsdSyscall::Recvfrom | BsdSyscall::Recv) => net::handle_recvfrom(args),
+        Some(BsdSyscall::Poll) => net::handle_poll(args),
+        Some(BsdSyscall::Select) => net::handle_select(args),
+        Some(BsdSyscall::Getsockname) => net::handle_getsockname(args),
+        Some(BsdSyscall::Getpeername) => net::handle_getpeername(args),
         None => {
             // Rate-limited diagnostic so hangs (e.g. 7zz archive) show the
             // missing Darwin number without flooding when guests spin.
@@ -207,7 +224,10 @@ mod tests {
         assert_eq!(name_of(1), Some("exit"));
         assert_eq!(name_of(4), Some("write"));
         assert_eq!(name_of(339), Some("fstat"));
-        assert_eq!(name_of(42), None);
+        assert_eq!(name_of(42), Some("pipe"));
+        assert_eq!(name_of(97), Some("socket"));
+        assert_eq!(name_of(98), Some("connect"));
+        assert_eq!(name_of(9999), None);
     }
 
     #[test]

@@ -76,7 +76,7 @@ Do **not** pre-land a full speculative socket table without a probe log.
 | G1 | Load / `--version` produces a useful failure or success log |
 | G2 | Stable list of missing syscalls / symbols |
 | G3 | HTTP GET under `kh` (product network gate) |
-| G4 | HTTPS (deferred; may need different binary or TLS strategy) |
+| G4 | HTTPS GET under `kh` (TLS + product body) |
 | G5 | UTM confirm |
 
 ## Note on the default download
@@ -95,7 +95,8 @@ system binaries or cross-compile in-tree.
 | `docker-curl.sh` (like `docker-7zz.sh`) | done |
 | `docker-curl-probe.sh` (G1/G2 capture) | done |
 | G1 first probe (`--version`) | **pass** (banner + exit 0) |
-| Syscall handlers from G2 log | next: real HTTP (G3), trace-first |
+| G3 HTTP GET | **pass** (body + clean exit 0) |
+| G4 HTTPS GET | **pass** (OpenSSL TLS + soft AppleSecTrust; body + exit 0) |
 
 ### G1 log (Docker probe iteration)
 
@@ -121,9 +122,30 @@ system binaries or cross-compile in-tree.
 5. Call-order surface for G1: `_fcntl` → `pthread_once` / rwlock / TSD / self →
    `fopen`/`fclose` → `bsearch` (+ freestanding `*printf` in `printf_fmt.c`).
 6. **G1 pass:** `curl --version` prints the stunnel static-curl banner, exit 0.
+7. **G3 pass (product body + clean exit):** HTTP GET writes Example Domain HTML to
+   `/Volumes/linux/out/body` (≈559 B) and the guest **exits 0**. Surface added
+   trace-first: `pipe` (O_NONBLOCK), socket/connect/poll/sendto/recvfrom/getsockname,
+   `getaddrinfo` host helper, `inet_pton`/`ntop`, soft `dlopen`/`arc4random_buf`/
+   `gethostname`, pthread mutexattr + `cond_timedwait`, bottle `private/etc/resolv.conf`
+   for c-ares.
+8. **Clean-exit fix:** host `socket`/`accept` force `O_NONBLOCK` (same idea as pipes).
+   Without it, after a keep-alive HTTP body curl did a blocking `recv` and hung forever.
+   With non-blocking sockets, post-body `recv` returns `EAGAIN` and multi finishes.
 
-No `unknown BSD syscall` on `--version` (no network yet). Default download still
-lists Apple frameworks (TLS); HTTP/HTTPS is G3/G4 — implement only from probe logs.
+```bash
+./scripts/docker-curl.sh -sS -o /Volumes/linux/out/body http://example.com/
+# host: .tmp/kh-out/body  should contain "Example Domain"; exit code 0
+```
 
-**Next:** `./scripts/docker-curl-probe.sh -sS -o /Volumes/linux/out/body http://example.com/`
-and fill socket/DNS surface from the first missing / unknown-BSD lines only.
+9. **G4 pass (HTTPS):** `https://example.com/` writes Example Domain (≈559 B) and
+   exits 0. Crypto is real OpenSSL from stunnel static-curl. Cert path uses soft
+   CF/Security stubs (`SecTrustEvaluateWithError` always succeeds) because
+   Apple frameworks are not in the bottle — note printed once:
+   `soft SecTrust: always-succeed`. Not a real macOS trust store.
+
+```bash
+./scripts/docker-curl.sh -sS -o /Volumes/linux/out/https-body https://example.com/
+# host: .tmp/kh-out/https-body  should contain "Example Domain"; exit code 0
+```
+
+**Next:** G5 UTM confirm (optional polish: host-backed trust / real CA bundle).

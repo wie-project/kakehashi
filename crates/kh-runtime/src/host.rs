@@ -76,6 +76,320 @@ pub fn dup_fd(fd: RawFd) -> Option<RawFd> {
     if rc < 0 { None } else { Some(rc) }
 }
 
+fn last_errno() -> i32 {
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn socklen_of(len: usize) -> Option<libc::socklen_t> {
+    libc::socklen_t::try_from(len).ok()
+}
+
+/// `pipe(2)` — returns `(read_fd, write_fd)` or `None` on failure.
+///
+/// Both ends are set `O_NONBLOCK|O_CLOEXEC`. Darwin guests (curl/c-ares) often
+/// assume they can `poll` then `read` the wakeup pipe; a blocking `read` after
+/// `poll` timeout=0 deadlocks the freestanding guest when no peer writes.
+#[must_use]
+pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
+    let mut fds = [0_i32; 2];
+    // Prefer pipe2 when available (Linux).
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: stack buffer of two ints for the kernel to fill.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if rc != 0 {
+            return None;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: stack buffer of two ints for the kernel to fill.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        for fd in fds {
+            // SAFETY: freshly created pipe ends.
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                if fl >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
+                let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+    }
+    match (fds.first().copied(), fds.get(1).copied()) {
+        (Some(r), Some(w)) => Some((r, w)),
+        _ => None,
+    }
+}
+
+/// Mark a host fd non-blocking (best-effort).
+fn set_nonblock(fd: RawFd) {
+    // SAFETY: live fd from socket/accept/pipe.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// `socket(domain, type, protocol)` — host libc. Returns host fd or `None`.
+///
+/// Sockets are forced `O_NONBLOCK`. Curl/c-ares (and the multi interface)
+/// expect non-blocking I/O; a blocking `recv` on a keep-alive TCP socket after
+/// the response body is complete hangs the guest forever (clean-exit G3).
+#[must_use]
+pub fn socket(domain: libc::c_int, ty: libc::c_int, protocol: libc::c_int) -> Option<RawFd> {
+    // SAFETY: standard socket(2). Strip Darwin-only type flags if any sneak in;
+    // Linux SOCK_NONBLOCK/CLOEXEC bits differ and are applied via fcntl below.
+    let ty_plain = ty & 0xf;
+    let rc = unsafe { libc::socket(domain, ty_plain, protocol) };
+    if rc < 0 {
+        return None;
+    }
+    set_nonblock(rc);
+    // SAFETY: freshly created socket.
+    unsafe {
+        let _ = libc::fcntl(rc, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Some(rc)
+}
+
+/// `connect(fd, sockaddr_bytes)`.
+pub fn connect(fd: RawFd, addr: &[u8]) -> Result<(), i32> {
+    let Some(len) = socklen_of(addr.len()) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: `addr` is a valid host buffer for `len` bytes.
+    let rc = unsafe { libc::connect(fd, addr.as_ptr().cast(), len) };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// `bind(fd, sockaddr_bytes)`.
+pub fn bind(fd: RawFd, addr: &[u8]) -> Result<(), i32> {
+    let Some(len) = socklen_of(addr.len()) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: `addr` is a valid host buffer for `len` bytes.
+    let rc = unsafe { libc::bind(fd, addr.as_ptr().cast(), len) };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// `listen(fd, backlog)`.
+pub fn listen(fd: RawFd, backlog: libc::c_int) -> Result<(), i32> {
+    // SAFETY: live socket fd.
+    let rc = unsafe { libc::listen(fd, backlog) };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// `accept(fd)` — peer address discarded (curl client path rarely needs it).
+pub fn accept(fd: RawFd) -> Result<RawFd, i32> {
+    // SAFETY: live listening socket; null addr is allowed by accept(2).
+    let rc = unsafe { libc::accept(fd, ptr::null_mut(), ptr::null_mut()) };
+    if rc < 0 {
+        Err(last_errno())
+    } else {
+        set_nonblock(rc);
+        Ok(rc)
+    }
+}
+
+/// `accept` with peer sockaddr written into `addr_out` (truncated to buffer len).
+///
+/// Returns `(new_fd, bytes_written_into_addr_out)`.
+pub fn accept_addr(fd: RawFd, addr_out: &mut [u8]) -> Result<(RawFd, usize), i32> {
+    let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
+    // SAFETY: live socket; `addr_out` is writable for `alen` bytes.
+    let rc = unsafe {
+        libc::accept(
+            fd,
+            addr_out.as_mut_ptr().cast(),
+            ptr::addr_of_mut!(alen),
+        )
+    };
+    if rc < 0 {
+        return Err(last_errno());
+    }
+    set_nonblock(rc);
+    let n = usize::try_from(alen).unwrap_or(0).min(addr_out.len());
+    Ok((rc, n))
+}
+
+/// `setsockopt(fd, level, optname, value_bytes)`.
+pub fn setsockopt(
+    fd: RawFd,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: &[u8],
+) -> Result<(), i32> {
+    let Some(len) = socklen_of(value.len()) else {
+        return Err(libc::EINVAL);
+    };
+    // SAFETY: live socket; value buffer valid for `len` bytes.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            value.as_ptr().cast(),
+            len,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// `getsockopt` — writes into `value`, returns updated length.
+pub fn getsockopt(
+    fd: RawFd,
+    level: libc::c_int,
+    optname: libc::c_int,
+    value: &mut [u8],
+) -> Result<usize, i32> {
+    let mut len = socklen_of(value.len()).unwrap_or(0);
+    // SAFETY: live socket; value buffer writable.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            optname,
+            value.as_mut_ptr().cast(),
+            ptr::addr_of_mut!(len),
+        )
+    };
+    if rc == 0 {
+        Ok(usize::try_from(len).unwrap_or(0).min(value.len()))
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// `shutdown(fd, how)`.
+pub fn shutdown(fd: RawFd, how: libc::c_int) -> Result<(), i32> {
+    // SAFETY: live socket fd.
+    let rc = unsafe { libc::shutdown(fd, how) };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// `sendto` / `send` — optional peer address bytes.
+pub fn sendto(
+    fd: RawFd,
+    buf: &[u8],
+    flags: libc::c_int,
+    addr: Option<&[u8]>,
+) -> Result<usize, i32> {
+    let (ap, alen) = if let Some(a) = addr {
+        let Some(len) = socklen_of(a.len()) else {
+            return Err(libc::EINVAL);
+        };
+        (a.as_ptr().cast(), len)
+    } else {
+        (ptr::null(), 0)
+    };
+    // SAFETY: live fd; buffer valid; optional sockaddr.
+    let n = unsafe { libc::sendto(fd, buf.as_ptr().cast(), buf.len(), flags, ap, alen) };
+    if n < 0 {
+        Err(last_errno())
+    } else {
+        usize::try_from(n).map_err(|_| libc::EIO)
+    }
+}
+
+/// `recvfrom` / `recv` — optional peer address out-buffer.
+///
+/// Returns `(bytes_read, peer_addr_len)` when `addr_out` is `Some`.
+pub fn recvfrom(
+    fd: RawFd,
+    buf: &mut [u8],
+    flags: libc::c_int,
+    addr_out: Option<&mut [u8]>,
+) -> Result<(usize, usize), i32> {
+    let (n, peer_len) = if let Some(a) = addr_out {
+        let mut alen = socklen_of(a.len()).unwrap_or(0);
+        // SAFETY: live fd; buffers valid.
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                flags,
+                a.as_mut_ptr().cast(),
+                ptr::addr_of_mut!(alen),
+            )
+        };
+        (n, usize::try_from(alen).unwrap_or(0).min(a.len()))
+    } else {
+        // SAFETY: live fd; buffer valid; null peer.
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                flags,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        (n, 0)
+    };
+    if n < 0 {
+        Err(last_errno())
+    } else {
+        let nr = usize::try_from(n).map_err(|_| libc::EIO)?;
+        Ok((nr, peer_len))
+    }
+}
+
+/// `getsockname(fd, addr_out)`.
+pub fn getsockname(fd: RawFd, addr_out: &mut [u8]) -> Result<usize, i32> {
+    let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
+    // SAFETY: live socket; buffer writable for `alen` bytes.
+    let rc = unsafe {
+        libc::getsockname(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen))
+    };
+    if rc == 0 {
+        Ok(usize::try_from(alen).unwrap_or(0).min(addr_out.len()))
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// `getpeername(fd, addr_out)`.
+pub fn getpeername(fd: RawFd, addr_out: &mut [u8]) -> Result<usize, i32> {
+    let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
+    // SAFETY: live socket; buffer writable for `alen` bytes.
+    let rc = unsafe {
+        libc::getpeername(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen))
+    };
+    if rc == 0 {
+        Ok(usize::try_from(alen).unwrap_or(0).min(addr_out.len()))
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// `poll(fds, timeout_ms)` — empty slice sleeps / checks timeout only.
+pub fn poll(fds: &mut [libc::pollfd], timeout: libc::c_int) -> Result<i32, i32> {
+    let nfds = libc::nfds_t::try_from(fds.len()).unwrap_or(0);
+    // SAFETY: `fds` is a valid pollfd array of `nfds` entries (or empty).
+    let rc = unsafe {
+        libc::poll(
+            if fds.is_empty() {
+                ptr::null_mut()
+            } else {
+                fds.as_mut_ptr()
+            },
+            nfds,
+            timeout,
+        )
+    };
+    if rc < 0 { Err(last_errno()) } else { Ok(rc) }
+}
+
 /// `lseek` on a host fd.
 pub fn lseek_fd(fd: RawFd, offset: i64, whence: libc::c_int) -> Option<i64> {
     // SAFETY: live fd; whence is a SEEK_* constant.
@@ -127,11 +441,7 @@ pub fn openat(
 }
 
 /// `fstatat(dirfd, path, …)` — used by B1 bottle-relative `stat`/`lstat`.
-pub fn fstatat(
-    dirfd: RawFd,
-    path: &std::ffi::CStr,
-    no_follow: bool,
-) -> Option<libc::stat> {
+pub fn fstatat(dirfd: RawFd, path: &std::ffi::CStr, no_follow: bool) -> Option<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let flags = if no_follow {
         libc::AT_SYMLINK_NOFOLLOW
@@ -206,7 +516,9 @@ pub fn readlink_path(path: &std::ffi::CStr, buf: &mut [u8]) -> Result<usize, i32
     // SAFETY: path is a valid C string; buffer is writable for `buf.len()`.
     let n = unsafe { libc::readlink(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
-        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        return Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
     }
     usize::try_from(n).map_err(|_| libc::EIO)
 }
@@ -218,7 +530,9 @@ pub fn symlink_path(target: &std::ffi::CStr, linkpath: &std::ffi::CStr) -> Resul
     if rc == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
     }
 }
 
@@ -229,7 +543,9 @@ pub fn link_path(existing: &std::ffi::CStr, newpath: &std::ffi::CStr) -> Result<
     if rc == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
     }
 }
 

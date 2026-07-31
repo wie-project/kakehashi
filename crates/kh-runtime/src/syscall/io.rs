@@ -7,9 +7,26 @@ use super::common::{
 };
 use super::fd::{guest_to_host_fd, read_host_fd, write_host_fd};
 
+fn io_note(msg: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 96 {
+        return;
+    }
+    let line = format!("kh: io {msg}\n");
+    drop(std::io::Write::write_all(
+        &mut std::io::stderr(),
+        line.as_bytes(),
+    ));
+}
+
 /// `write`.
 pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     let name = "write";
+    let gfd = super::common::reg_as_i32(args.x0);
+    if gfd > 2 {
+        io_note(&format!("write gfd={gfd} len={}", args.x2));
+    }
     let Some(host_fd) = guest_to_host_fd(args.x0) else {
         log_io_fail("write", "EBADF", args.x0, args.x1, args.x2);
         return SyscallResult::err(name, EBADF);
@@ -52,6 +69,10 @@ fn log_io_fail(op: &str, why: &str, x0: u64, x1: u64, x2: u64) {
 /// `read`.
 pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     let name = "read";
+    let gfd = super::common::reg_as_i32(args.x0);
+    if gfd > 2 {
+        io_note(&format!("read gfd={gfd} len={} (may block)", args.x2));
+    }
     let Some(host_fd) = guest_to_host_fd(args.x0) else {
         return SyscallResult::err(name, EBADF);
     };
@@ -69,7 +90,25 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
     let buf = guest_slice_mut(args.x1, len);
     match read_host_fd(host_fd, buf) {
-        Ok(nread) => SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0)),
-        Err(_) => SyscallResult::err(name, EPERM),
+        Ok(nread) => {
+            if gfd > 2 {
+                io_note(&format!("read gfd={gfd} -> {nread}"));
+            }
+            SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0))
+        }
+        Err(e) => {
+            let os = e.raw_os_error().unwrap_or(0);
+            // Map Linux EAGAIN/EWOULDBLOCK → Darwin EAGAIN (35).
+            if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
+                if gfd > 2 {
+                    io_note(&format!("read gfd={gfd} EAGAIN"));
+                }
+                return SyscallResult::err(name, 35);
+            }
+            if gfd > 2 {
+                io_note(&format!("read gfd={gfd} err={os}"));
+            }
+            SyscallResult::err(name, EPERM)
+        }
     }
 }

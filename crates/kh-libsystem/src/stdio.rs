@@ -471,6 +471,53 @@ pub(crate) unsafe extern "C" fn fgetc(stream: *mut c_void) -> c_int {
     c_int::from(byte[0])
 }
 
+/// C `fgets` → nlist `_fgets` (OpenSSL PEM reader for bottle CA bundle).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fgets(
+    s: *mut c_char,
+    size: c_int,
+    stream: *mut c_void,
+) -> *mut c_char {
+    if s.is_null() || stream.is_null() || size <= 0 {
+        return core::ptr::null_mut();
+    }
+    let max = usize::try_from(size).unwrap_or(0);
+    if max == 0 {
+        return core::ptr::null_mut();
+    }
+    // Leave room for NUL; POSIX: store at most size-1 chars + NUL.
+    let limit = max.saturating_sub(1);
+    if limit == 0 {
+        unsafe {
+            s.write(0);
+        }
+        return s;
+    }
+    let mut i = 0_usize;
+    while i < limit {
+        let ch = unsafe { fgetc(stream) };
+        if ch < 0 {
+            // EOF: return NULL if nothing read, else partial line.
+            if i == 0 {
+                return core::ptr::null_mut();
+            }
+            break;
+        }
+        let b = u8::try_from(ch).unwrap_or(0);
+        unsafe {
+            s.add(i).write(b.cast_signed());
+        }
+        i = i.saturating_add(1);
+        if b == b'\n' {
+            break;
+        }
+    }
+    unsafe {
+        s.add(i).write(0);
+    }
+    s
+}
+
 /// C `fread` → nlist `_fread` (curl G1 follow-up after `_DefaultRuneLocale`).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fread(

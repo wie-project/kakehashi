@@ -15,7 +15,7 @@ use crate::mem::registry_check_range;
 use crate::process as proc_state;
 
 use super::common::{
-    EBADF, EFAULT, EINVAL, ENOSYS, SyscallArgs, SyscallResult, guest_write, reg_as_i32,
+    EBADF, EFAULT, EINVAL, ENOSYS, SyscallArgs, SyscallResult, guest_slice, guest_write, reg_as_i32,
 };
 
 // ── Opt-in park/wake stats (`KAKEHASHI_FUTEX_STATS=1`) ───────────────────────
@@ -179,8 +179,35 @@ pub(super) const KH_HELPER_PARK: u32 = KH_HELPER_BASE | 6;
 /// `x0` = guest VA of aligned `u32`, `x1` = max waiters to wake (`0` → all).
 pub(super) const KH_HELPER_WAKE: u32 = KH_HELPER_BASE | 7;
 
+/// `getaddrinfo` packed into a guest buffer (curl G3).
+///
+/// `x0` = node C string (nullable), `x1` = service C string (nullable),
+/// `x2` = Darwin `AF_*` preference, `x3` = out buffer VA, `x4` = capacity,
+/// `x5` = preferred socktype (0 → any).
+///
+/// Buffer layout: `u32 count` then up to N records of 40 bytes:
+/// `family_darwin:u32, socktype:u32, protocol:u32, addrlen:u32, addr[24]`.
+/// Addr bytes are **Darwin** sockaddr layout (sa_len + sa_family + …).
+pub(super) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
+
+/// TLS cert chain verify against the bottle CA bundle (SecTrust soft path).
+///
+/// Packed buffer at `x0` (`x1` = byte length):
+/// ```text
+/// u32 hostname_len; hostname bytes (no NUL required)
+/// u32 n_certs;
+/// for each cert: u32 der_len; der bytes
+/// ```
+/// Leaf is certs[0], intermediates follow. Returns `0` on success, `1` on
+/// soft verify failure (maps to SecTrust false), other negative as errno-ish.
+pub(super) const KH_HELPER_VERIFY_CERT: u32 = KH_HELPER_BASE | 9;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
+const GAI_REC: usize = 40;
+const GAI_MAX: usize = 16;
+const VERIFY_MAX_BUF: usize = 1 << 20;
+const VERIFY_MAX_CERTS: usize = 16;
 
 /// True when `number` is a synthetic bottle helper (not Darwin BSD).
 #[must_use]
@@ -198,8 +225,243 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_NCPU => handle_ncpu(),
         KH_HELPER_PARK => handle_park(args),
         KH_HELPER_WAKE => handle_wake(args),
+        KH_HELPER_GETADDRINFO => handle_getaddrinfo(args),
+        KH_HELPER_VERIFY_CERT => handle_verify_cert(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
+}
+
+fn handle_verify_cert(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_verify_cert";
+    let ptr = args.x0;
+    let Ok(len) = usize::try_from(args.x1) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if ptr == 0 || len == 0 || len > VERIFY_MAX_BUF || !registry_check_range(ptr, len, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let buf = guest_slice(ptr, len);
+
+    let Some(ca) = crate::bottle::active_ca_pem_path().or_else(|| {
+        // Fresh ensure may have just written it relative to bottle_root TLS.
+        crate::bottle::bottle_root().and_then(|r| {
+            let p = r.join(crate::bottle::GUEST_CA_FILE_REL);
+            p.is_file().then_some(p)
+        })
+    }) else {
+        drop(io::stderr().write_all(b"kh: tls verify: no bottle CA bundle\n"));
+        return SyscallResult::ok(name, 1);
+    };
+
+    let mut off = 0_usize;
+    let Some(host_len) = read_u32(buf, &mut off) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let host_len = usize::try_from(host_len).unwrap_or(0);
+    if host_len > 255 || off.saturating_add(host_len) > buf.len() {
+        return SyscallResult::err(name, EINVAL);
+    }
+    let hostname = match buf.get(off..off.saturating_add(host_len)) {
+        Some(s) => match std::str::from_utf8(s) {
+            Ok(h) => h,
+            Err(_) => return SyscallResult::err(name, EINVAL),
+        },
+        None => return SyscallResult::err(name, EINVAL),
+    };
+    off = off.saturating_add(host_len);
+
+    let Some(n_certs) = read_u32(buf, &mut off) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let n_certs = usize::try_from(n_certs).unwrap_or(0);
+    if n_certs == 0 || n_certs > VERIFY_MAX_CERTS {
+        return SyscallResult::err(name, EINVAL);
+    }
+
+    let mut ders: Vec<Vec<u8>> = Vec::with_capacity(n_certs);
+    for _ in 0..n_certs {
+        let Some(der_len) = read_u32(buf, &mut off) else {
+            return SyscallResult::err(name, EINVAL);
+        };
+        let der_len = usize::try_from(der_len).unwrap_or(0);
+        if der_len == 0 || der_len > (1 << 18) || off.saturating_add(der_len) > buf.len() {
+            return SyscallResult::err(name, EINVAL);
+        }
+        let Some(slice) = buf.get(off..off.saturating_add(der_len)) else {
+            return SyscallResult::err(name, EINVAL);
+        };
+        ders.push(slice.to_vec());
+        off = off.saturating_add(der_len);
+    }
+
+    let Some(leaf) = ders.first() else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let inters: Vec<&[u8]> = ders.iter().skip(1).map(Vec::as_slice).collect();
+    match crate::tls_verify::verify_der_chain(&ca, hostname, leaf, &inters) {
+        Ok(()) => SyscallResult::ok(name, 0),
+        Err(msg) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let line = format!("kh: tls verify fail: {msg}\n");
+                drop(io::stderr().write_all(line.as_bytes()));
+            }
+            SyscallResult::ok(name, 1)
+        }
+    }
+}
+
+fn read_u32(buf: &[u8], off: &mut usize) -> Option<u32> {
+    let start = *off;
+    let end = start.checked_add(4)?;
+    let bytes = buf.get(start..end)?;
+    *off = end;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn gai_put_u32(rec: &mut [u8], off: usize, v: u32) {
+    if let Some(dst) = rec.get_mut(off..off.saturating_add(4))
+        && dst.len() == 4
+    {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn gai_put_bytes(rec: &mut [u8], off: usize, src: &[u8]) {
+    if let Some(dst) = rec.get_mut(off..off.saturating_add(src.len()))
+        && dst.len() == src.len()
+    {
+        dst.copy_from_slice(src);
+    }
+}
+
+fn gai_put_u8(rec: &mut [u8], off: usize, v: u8) {
+    if let Some(slot) = rec.get_mut(off) {
+        *slot = v;
+    }
+}
+
+fn handle_getaddrinfo(args: SyscallArgs) -> SyscallResult {
+    use std::net::{SocketAddr, ToSocketAddrs};
+
+    let name = "kh_getaddrinfo";
+    let node = if args.x0 == 0 {
+        None
+    } else {
+        match bottle::read_c_string(args.x0, CSTR_MAX) {
+            Some(s) => Some(s),
+            None => return SyscallResult::err(name, EFAULT),
+        }
+    };
+    let service = if args.x1 == 0 {
+        None
+    } else {
+        match bottle::read_c_string(args.x1, CSTR_MAX) {
+            Some(s) => Some(s),
+            None => return SyscallResult::err(name, EFAULT),
+        }
+    };
+    {
+        let msg = format!(
+            "kh: getaddrinfo node={:?} service={:?} family={}\n",
+            node.as_deref(),
+            service.as_deref(),
+            reg_as_i32(args.x2)
+        );
+        drop(io::stderr().write_all(msg.as_bytes()));
+    }
+    let family = reg_as_i32(args.x2);
+    let out = args.x3;
+    let Ok(cap) = usize::try_from(args.x4) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let socktype = reg_as_i32(args.x5);
+    let min_cap = 4_usize.saturating_add(GAI_REC);
+    if out == 0 || cap < min_cap || !registry_check_range(out, cap, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+
+    // EAI_NONAME = 8 on Darwin when nothing to resolve.
+    let host_s = node.as_deref().unwrap_or("localhost");
+    let port_s = service.as_deref().unwrap_or("0");
+    let target = format!("{host_s}:{port_s}");
+
+    let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(_) => {
+            if let (Some(h), Some(p)) = (node.as_deref(), service.as_deref()) {
+                if let Ok(port) = p.parse::<u16>() {
+                    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                        vec![SocketAddr::new(ip, port)]
+                    } else {
+                        return SyscallResult::err(name, 8);
+                    }
+                } else {
+                    return SyscallResult::err(name, 8);
+                }
+            } else {
+                return SyscallResult::err(name, 8);
+            }
+        }
+    };
+
+    let want_v4 = family == 0 || family == 2;
+    let want_v6 = family == 0 || family == 30;
+    let st: i32 = if socktype == 0 { 1 } else { socktype };
+    let proto: i32 = if st == 1 { 6 } else { 0 };
+    let st_u = st.cast_unsigned();
+    let proto_u = proto.cast_unsigned();
+
+    let mut records: Vec<[u8; GAI_REC]> = Vec::new();
+    for addr in addrs {
+        if records.len() >= GAI_MAX {
+            break;
+        }
+        match addr {
+            SocketAddr::V4(v4) if want_v4 => {
+                let mut rec = [0_u8; GAI_REC];
+                gai_put_u32(&mut rec, 0, 2); // AF_INET
+                gai_put_u32(&mut rec, 4, st_u);
+                gai_put_u32(&mut rec, 8, proto_u);
+                gai_put_u32(&mut rec, 12, 16);
+                gai_put_u8(&mut rec, 16, 16); // sa_len
+                gai_put_u8(&mut rec, 17, 2); // AF_INET
+                gai_put_bytes(&mut rec, 18, &v4.port().to_be_bytes());
+                gai_put_bytes(&mut rec, 20, &v4.ip().octets());
+                records.push(rec);
+            }
+            SocketAddr::V6(v6) if want_v6 => {
+                let mut rec = [0_u8; GAI_REC];
+                gai_put_u32(&mut rec, 0, 30); // AF_INET6
+                gai_put_u32(&mut rec, 4, st_u);
+                gai_put_u32(&mut rec, 8, proto_u);
+                gai_put_u32(&mut rec, 12, 28);
+                gai_put_u8(&mut rec, 16, 28);
+                gai_put_u8(&mut rec, 17, 30);
+                gai_put_bytes(&mut rec, 18, &v6.port().to_be_bytes());
+                // flowinfo stays zero at 20..24
+                gai_put_bytes(&mut rec, 24, &v6.ip().octets());
+                records.push(rec);
+            }
+            _ => {}
+        }
+    }
+
+    if records.is_empty() {
+        return SyscallResult::err(name, 8);
+    }
+
+    let need = 4_usize.saturating_add(records.len().saturating_mul(GAI_REC));
+    if need > cap {
+        return SyscallResult::err(name, 12);
+    }
+    let count = u32::try_from(records.len()).unwrap_or(0);
+    guest_write(out, &count.to_le_bytes());
+    for (i, rec) in records.iter().enumerate() {
+        let off = 4_usize.saturating_add(i.saturating_mul(GAI_REC));
+        guest_write(out.wrapping_add(u64::try_from(off).unwrap_or(0)), rec);
+    }
+    SyscallResult::ok(name, u64::from(count))
 }
 
 fn handle_puts(args: SyscallArgs) -> SyscallResult {
@@ -389,6 +651,7 @@ mod tests {
         assert!(is_helper(KH_HELPER_NCPU));
         assert!(is_helper(KH_HELPER_PARK));
         assert!(is_helper(KH_HELPER_WAKE));
+        assert!(is_helper(KH_HELPER_VERIFY_CERT));
         assert!(!is_helper(4)); // write
         assert!(!is_helper(1)); // exit
     }

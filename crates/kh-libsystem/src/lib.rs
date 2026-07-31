@@ -38,6 +38,7 @@ mod cxxabi;
 mod errno;
 mod heap;
 mod locale;
+mod net;
 mod posix;
 mod process;
 mod pthread;
@@ -69,6 +70,10 @@ pub const KH_HELPER_NCPU: u32 = 0x4B48_0005;
 pub const KH_HELPER_PARK: u32 = 0x4B48_0006;
 /// Host-helper id: wake park waiters on a `u32` address.
 pub const KH_HELPER_WAKE: u32 = 0x4B48_0007;
+/// Host-helper id: `getaddrinfo` → packed sockaddr list in guest buffer.
+pub const KH_HELPER_GETADDRINFO: u32 = 0x4B48_0008;
+/// Host-helper id: TLS cert chain verify against bottle CA bundle.
+pub const KH_HELPER_VERIFY_CERT: u32 = 0x4B48_0009;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

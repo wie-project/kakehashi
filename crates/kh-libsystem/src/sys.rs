@@ -62,6 +62,36 @@ pub(crate) const SYS_BSDTHREAD_REGISTER: u32 = 366;
 pub(crate) const SYS_FSTATAT: u32 = 470;
 /// BSD `openat`.
 pub(crate) const SYS_OPENAT: u32 = 463;
+/// BSD `pipe`.
+pub(crate) const SYS_PIPE: u32 = 42;
+/// BSD `socket`.
+pub(crate) const SYS_SOCKET: u32 = 97;
+/// BSD `connect`.
+pub(crate) const SYS_CONNECT: u32 = 98;
+/// BSD `bind`.
+pub(crate) const SYS_BIND: u32 = 104;
+/// BSD `setsockopt`.
+pub(crate) const SYS_SETSOCKOPT: u32 = 105;
+/// BSD `listen`.
+pub(crate) const SYS_LISTEN: u32 = 106;
+/// BSD `getsockopt`.
+pub(crate) const SYS_GETSOCKOPT: u32 = 118;
+/// BSD `sendto`.
+pub(crate) const SYS_SENDTO: u32 = 133;
+/// BSD `shutdown`.
+pub(crate) const SYS_SHUTDOWN: u32 = 134;
+/// BSD `recvfrom`.
+pub(crate) const SYS_RECVFROM: u32 = 29;
+/// BSD `accept`.
+pub(crate) const SYS_ACCEPT: u32 = 30;
+/// BSD `select`.
+pub(crate) const SYS_SELECT: u32 = 93;
+/// BSD `poll`.
+pub(crate) const SYS_POLL: u32 = 230;
+/// BSD `getpeername`.
+pub(crate) const SYS_GETPEERNAME: u32 = 31;
+/// BSD `getsockname`.
+pub(crate) const SYS_GETSOCKNAME: u32 = 32;
 
 /// Invokes a Darwin BSD syscall with zero arguments.
 ///

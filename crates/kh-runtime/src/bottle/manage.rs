@@ -148,6 +148,10 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
         }
     };
 
+    if let Err(e) = super::ca_bundle::ensure_ca_bundle(&target) {
+        tracing::warn!(error = %e, "failed to seed bottle CA bundle");
+    }
+
     registry::write_active(&target)?;
     Ok(CreateResult {
         path: target,
@@ -281,6 +285,10 @@ pub fn ensure(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
 fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
     layout::ensure_libcxx_symlink(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
+    // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
+    if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {
+        tracing::warn!(error = %e, "failed to seed bottle CA bundle");
+    }
     registry::write_active(path)?;
     Ok(CreateResult {
         path: path.to_path_buf(),

@@ -83,6 +83,40 @@ pub enum BsdSyscall {
     BsdthreadRegister,
     /// `thread_selfid`.
     ThreadSelfid,
+    /// `pipe`.
+    Pipe,
+    /// `socket`.
+    Socket,
+    /// `connect`.
+    Connect,
+    /// `bind`.
+    Bind,
+    /// `listen`.
+    Listen,
+    /// `accept`.
+    Accept,
+    /// `setsockopt`.
+    Setsockopt,
+    /// `getsockopt`.
+    Getsockopt,
+    /// `shutdown`.
+    Shutdown,
+    /// `sendto`.
+    Sendto,
+    /// `recvfrom`.
+    Recvfrom,
+    /// `send` (often libc → sendto).
+    Send,
+    /// `recv`.
+    Recv,
+    /// `poll`.
+    Poll,
+    /// `select`.
+    Select,
+    /// `getsockname`.
+    Getsockname,
+    /// `getpeername`.
+    Getpeername,
 }
 
 impl BsdSyscall {
@@ -130,6 +164,23 @@ impl BsdSyscall {
             Self::BsdthreadTerminate => "bsdthread_terminate",
             Self::BsdthreadRegister => "bsdthread_register",
             Self::ThreadSelfid => "thread_selfid",
+            Self::Pipe => "pipe",
+            Self::Socket => "socket",
+            Self::Connect => "connect",
+            Self::Bind => "bind",
+            Self::Listen => "listen",
+            Self::Accept => "accept",
+            Self::Setsockopt => "setsockopt",
+            Self::Getsockopt => "getsockopt",
+            Self::Shutdown => "shutdown",
+            Self::Sendto => "sendto",
+            Self::Recvfrom => "recvfrom",
+            Self::Send => "send",
+            Self::Recv => "recv",
+            Self::Poll => "poll",
+            Self::Select => "select",
+            Self::Getsockname => "getsockname",
+            Self::Getpeername => "getpeername",
         }
     }
 
@@ -178,6 +229,21 @@ impl BsdSyscall {
             Self::ThreadSelfid => 372,
             Self::Openat => 463,
             Self::Fstatat => 470,
+            Self::Pipe => 42,
+            Self::Accept => 30,
+            Self::Recvfrom | Self::Recv => 29,
+            Self::Socket => 97,
+            Self::Connect => 98,
+            Self::Bind => 104,
+            Self::Setsockopt => 105,
+            Self::Listen => 106,
+            Self::Getsockopt => 118,
+            Self::Sendto | Self::Send => 133,
+            Self::Shutdown => 134,
+            Self::Select => 93,
+            Self::Poll => 230,
+            Self::Getpeername => 31,
+            Self::Getsockname => 32,
         }
     }
 }
@@ -196,7 +262,12 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         20 => Some(BsdSyscall::Getpid),
         33 => Some(BsdSyscall::Access),
         39 => Some(BsdSyscall::Getppid),
+        29 | 403 => Some(BsdSyscall::Recvfrom), // recvfrom / nocancel
+        30 | 404 => Some(BsdSyscall::Accept),   // accept / nocancel
+        31 => Some(BsdSyscall::Getpeername),
+        32 => Some(BsdSyscall::Getsockname),
         41 => Some(BsdSyscall::Dup),
+        42 | 405 => Some(BsdSyscall::Pipe), // pipe / nocancel-ish
         46 => Some(BsdSyscall::Sigaction),
         48 => Some(BsdSyscall::Sigprocmask),
         57 => Some(BsdSyscall::Symlink),
@@ -205,9 +276,18 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         73 => Some(BsdSyscall::Munmap),
         74 => Some(BsdSyscall::Mprotect),
         92 => Some(BsdSyscall::Fcntl),
+        93 | 394 => Some(BsdSyscall::Select), // select / select_nocancel
         95 | 406 => Some(BsdSyscall::Fsync),
+        97 => Some(BsdSyscall::Socket),
+        98 => Some(BsdSyscall::Connect),
+        104 => Some(BsdSyscall::Bind),
+        105 => Some(BsdSyscall::Setsockopt),
+        106 => Some(BsdSyscall::Listen),
         116 => Some(BsdSyscall::Gettimeofday),
+        118 => Some(BsdSyscall::Getsockopt),
         128 => Some(BsdSyscall::Rename),
+        133 | 407 => Some(BsdSyscall::Sendto), // sendto / nocancel
+        134 => Some(BsdSyscall::Shutdown),
         136 => Some(BsdSyscall::Mkdir),
         137 => Some(BsdSyscall::Rmdir),
         188 | 338 => Some(BsdSyscall::Stat),  // stat / stat64
@@ -217,6 +297,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         199 => Some(BsdSyscall::Lseek),
         201 => Some(BsdSyscall::Ftruncate),
         202 => Some(BsdSyscall::Sysctl),
+        230 => Some(BsdSyscall::Poll),
         266 => Some(BsdSyscall::ClockGettime),
         274 => Some(BsdSyscall::Sysctlbyname),
         327 => Some(BsdSyscall::Issetugid),
@@ -284,6 +365,21 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (366, "bsdthread_register"),
         (372, "thread_selfid"),
         (463, "openat"),
+        (42, "pipe"),
+        (97, "socket"),
+        (98, "connect"),
+        (104, "bind"),
+        (105, "setsockopt"),
+        (106, "listen"),
+        (118, "getsockopt"),
+        (133, "sendto"),
+        (134, "shutdown"),
+        (29, "recvfrom"),
+        (30, "accept"),
+        (93, "select"),
+        (230, "poll"),
+        (31, "getpeername"),
+        (32, "getsockname"),
     ]
 }
 
