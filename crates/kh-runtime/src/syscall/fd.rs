@@ -106,29 +106,90 @@ fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
 fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult {
     let host_flags = darwin_to_host_open_flags(flags);
     let mode = 0o666_u32;
+    let creat = host_flags & libc::O_CREAT != 0;
 
     // B1: bottle dirfd + relative path — no PathBuf join, shorter kernel walk.
     if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
         let Ok(c_rel) = std::ffi::CString::new(rel) else {
             return SyscallResult::err(name, EFAULT);
         };
-        let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) else {
-            return SyscallResult::err(name, ENOENT);
-        };
-        return finish_open(name, rc);
+        if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
+            return finish_open(name, rc);
+        }
+        // curl `-o nested/file`: parent may not exist yet. With O_CREAT, make
+        // parents under the bottle (openat relative) and retry once.
+        if creat {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                if !parent.as_os_str().is_empty() && parent != std::path::Path::new(".") {
+                    drop(mkdirat_p(dirfd, parent));
+                    if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
+                        return finish_open(name, rc);
+                    }
+                }
+            }
+        }
+        log_open_fail(path, "ENOENT(openat)");
+        return SyscallResult::err(name, ENOENT);
     }
 
     let Ok(host_path) = translate_path(path) else {
+        log_open_fail(path, "ENOENT(translate)");
         return SyscallResult::err(name, ENOENT);
     };
     let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
         return SyscallResult::err(name, EFAULT);
     };
     // libc open: works for directories (opendir path) and files alike.
-    let Some(rc) = host::open_path(&c_path, host_flags, mode) else {
-        return SyscallResult::err(name, ENOENT);
-    };
-    finish_open(name, rc)
+    if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
+        return finish_open(name, rc);
+    }
+    // Relative `-o .tmp/out/body` (host CWD) or absolute under bottle: create
+    // missing parents when the guest asked for O_CREAT (fopen "w" / curl -o).
+    if creat {
+        if let Some(parent) = host_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                drop(std::fs::create_dir_all(parent));
+                if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
+                    return finish_open(name, rc);
+                }
+            }
+        }
+    }
+    log_open_fail(path, "ENOENT");
+    SyscallResult::err(name, ENOENT)
+}
+
+fn log_open_fail(path: &str, why: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    let msg = format!("kh: open fail {why} path={path}\n");
+    drop(std::io::Write::write_all(
+        &mut std::io::stderr(),
+        msg.as_bytes(),
+    ));
+}
+
+/// Create intermediate directories for a bottle-relative path (`a/b` → `mkdirat a`).
+fn mkdirat_p(dirfd: RawFd, rel: &std::path::Path) -> std::io::Result<()> {
+    let mut cur = std::path::PathBuf::new();
+    for comp in rel.components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(s) => {
+                cur.push(s);
+                let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) else {
+                    continue;
+                };
+                host::mkdirat(dirfd, &c, 0o755)?;
+            }
+            Component::CurDir => {}
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn finish_open(name: &'static str, host_fd: RawFd) -> SyscallResult {

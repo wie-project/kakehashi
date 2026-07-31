@@ -440,6 +440,21 @@ pub fn openat(
     if rc < 0 { None } else { Some(rc) }
 }
 
+/// `mkdirat(dirfd, path, mode)` — returns `Ok(())` on success or `EEXIST`.
+pub fn mkdirat(dirfd: RawFd, path: &std::ffi::CStr, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: dirfd live; path is a valid C string for the duration of the call.
+    let rc = unsafe { libc::mkdirat(dirfd, path.as_ptr(), mode) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// `fstatat(dirfd, path, …)` — used by B1 bottle-relative `stat`/`lstat`.
 pub fn fstatat(dirfd: RawFd, path: &std::ffi::CStr, no_follow: bool) -> Option<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
