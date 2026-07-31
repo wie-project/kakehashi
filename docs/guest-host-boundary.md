@@ -78,14 +78,24 @@ Normative sequence:
 2. `bl kh_tls_enter_host` — host TPIDR before any host allocation.
 3. `bl kh_host_alt_sp` — host private stack top.
 4. Switch `sp` to host alt; keep guest frame pointer on host stack.
-5. Reload args; `bl kh_neon_tramp_entry` → mapped trampoline →
-   `kh_trampoline_dispatch` (Rust syscall handlers).
+5. Reload args; `bl kh_neon_tramp_entry` → dispatch (see light vs full below).
 6. Preserve `TrampRet` across `kh_tls_leave_host`.
 7. Restore guest SP; restore NEON/FP from prolog; `ret` to guest.
 
-Mapped trampoline (`TRAMP_BYTES`) also saves GPRs/NEON around the Rust call and
-sets Darwin **carry** in NZCV from the error flag (belt-and-braces for paths
-that observe NZCV). Freestanding libSystem primarily uses `HyperRet.error`.
+### Full vs light dispatch (A3)
+
+| Mode | Env | What runs after prolog + host TLS + alt SP |
+| ---- | --- | ------------------------------------------ |
+| **Full** (default) | `KAKEHASHI_HYPERCALL_LIGHT` unset/`0` | Mapped `TRAMP_BYTES`: second full Q0–Q31 + FPCR/FPSR save, `blr` Rust, restore, NZCV carry |
+| **Light** (opt-in) | `KAKEHASHI_HYPERCALL_LIGHT=1` | `mov x7,x16; b kh_trampoline_dispatch` — **no** second NEON save |
+
+Light is valid **only** because the prolog (step 1) already snapshotted guest SIMD
+and step 7 restores it. Do **not** use light on svc veneer hubs (they embed full
+`TRAMP_BYTES` without this prolog). Freestanding `hypercall_thin` still lists all
+NEON as clobbered so guest LLVM never keeps live SIMD across `blr`.
+
+Full tramp still sets Darwin **carry** in NZCV from the error flag (veneer /
+belt-and-braces). Freestanding libSystem primarily uses `HyperRet.error`.
 
 ### Host alt stack
 
@@ -134,6 +144,7 @@ not of a random guest bug.
 | -------- | ------- | ------- |
 | `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall pointer |
 | `KAKEHASHI_HYPERCALL=0` | — | Force SIGTRAP/svc path |
+| `KAKEHASHI_HYPERCALL_LIGHT` | **off** | A3: skip second NEON save on freestanding hypercall (`1`/`true`/`yes`/`on`). Kill-switch = unset. Default stays full tramp until MT+UTM gates are green for default-on. |
 | `KAKEHASHI_TRAMPOLINE` | off | Experimental svc→veneer rewrite (separate from freestanding hypercall) |
 
 ## Related documents

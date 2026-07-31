@@ -113,6 +113,7 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/src/target \
   -e "KAKEHASHI_TRAMPOLINE=${KAKEHASHI_TRAMPOLINE:-}" \
   -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-}" \
+  -e "KAKEHASHI_HYPERCALL_LIGHT=${KAKEHASHI_HYPERCALL_LIGHT:-}" \
   "${IMAGE}" \
   bash -c '
 set -euo pipefail

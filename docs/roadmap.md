@@ -61,7 +61,7 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 | ------ | --------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | **A1** | **Guest-TLS host/alt mirror** (not map cookie)                        | ~~Kill hot-path `gettid`/map lock~~ **Done**                                | Probe only when `TPIDR` has `GUEST_TLS_MAGIC`; host writes mirrors; leave via parked guest VA                                     |
 | **A2** | **Merge enter + alt SP (one `gettid`)**                               | ~~Skip extra `gettid` on hypercall enter~~ **Done** (v3)                    | No `thread_local!` on boundary; leave still `gettid` (guest-safe)                                                                 |
-| **A3** | **Light hypercall for hot I/O/fs numbers**                            | Skip **second** full NEON save (`TRAMP_BYTES`) when prolog already saved Q* | Keep prolog NEON; freestanding must still treat call as full C clobber or host restore is not enough for LLVM; MT gate mandatory |
+| **A3** | **Light hypercall (skip second NEON tramp)**                          | ~~Skip second full NEON save~~ **Done (opt-in)** — `KAKEHASHI_HYPERCALL_LIGHT=1` | Prolog NEON always; freestanding clobber unchanged; default **off**; MT+UTM before default-on |
 | **A4** | **Kill `readlinkat` storm**                                           | ~~95% errors = pure waste~~ **Done** (cache `real_path`)                    | Was per-bind `canonicalize` on `libc++` alias, not path walk                                                                    |
 | **A5** | **Explain / remove excess `mprotect`**                                | ~~15k vs ~15 native~~ **Done** (batch + skip RW)                            | Was per-slot bind/rebase mprotect on already-writable DATA                                                                      |
 
@@ -146,8 +146,9 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 3. ~~**A2** merge enter+alt~~ **Done**
 4. ~~**A1** guest-TLS host/alt mirror~~ **Done**
 5. ~~**F1** contended-bit guest mutex~~ **Done** (code; UTM strace pending)
-6. **A3** light I/O entry (last among A — highest MT risk)
-7. F2/F3 only if futex still dominates after F1
+6. ~~**A3** light hypercall~~ **Done (opt-in)** — default still full tramp
+7. A3 default-on only after ≥3 green MT (docker+UTM) with `LIGHT=1`
+8. F2/F3 only if futex still dominates after F1
 
 ---
 
@@ -186,7 +187,8 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — enter returns alt top; one gettid on slow path. **v1/v2** failed (host TLS cache). UTM after A2: gettid ~631k (was ~942k), futex still ~82% time. |
 | **2026-07** | **A1** guest-TLS host/alt mirror                                      | **Done** — different from “cookie→map”: store `host_tpidr@24` + `alt_top@32` in freestanding guest TLS (host-written at prepare / `enter_guest_tls` / alt map). Hot enter: `mrs` + magic check + load mirrors → `msr` host — **no gettid, no Mutex, no thread_local!**. Leave: asm parks guest VA at prolog+80; `kh_tls_leave_host(guest)` restores without gettid. Slow path keeps A2 gettid map. Freestanding `GuestTls` extended (stage dylib). **UTM bare-metal 8k-file gate (post-A1):** gettid **1026** (was **631k** after A2 / **~942k** baseline), total syscalls **322k** (was **949k**), strace time **~28s** (was **~91s**). Futex calls still ~257k / ~95% time — guest park/wake, not map Mutex. |
 | **2026-07** | **F1** contended-bit guest mutex                                      | **Done** (code) — freestanding `pthread_mutex_*`: states 0/1/2; unlock wakes only if previous was CONTENDED(2). Uncontended unlock is release store only (no `KH_HELPER_WAKE`). Address histogram on UTM showed many guest VAs + always-wake pattern. Stage dylib required. Expect futex calls and WAKE≫WAIT imbalance to drop sharply; residual = real contention + cond/join. |
-| —          | A3 as above                                                           | Open                                |
+| **2026-07** | **A3** light hypercall dispatch                                       | **Done (opt-in)** — `kh_neon_tramp_entry` checks `KH_HYPERCALL_LIGHT`; when set, `mov x7,x16; b kh_trampoline_dispatch` (no second Q* save). Prolog 640 B NEON save/restore **unchanged**. Freestanding clobber list **unchanged**. Full `TRAMP_BYTES` still mapped (veneer + kill-switch). Env `KAKEHASHI_HYPERCALL_LIGHT=1` only; default full tramp. Past failure was light without prolog invariants — re-validated under MT gate. Default-on deferred. |
+| —          | A3 default-on                                                         | Open after ≥3 green MT + UTM        |
 
 ---
 
