@@ -155,32 +155,26 @@ pub fn leave_host_tls() {
 
 fn enter_host_tls_inner() {
     let cur = cpu::read_tpidr_el0();
-    // Existing slot only — no HashMap insert (safe under guest TPIDR).
-    let host = host_slot::with_tls_existing_mut(|m| {
-        if !m.active {
-            m.host_tpidr = cur;
-            m.active = true;
-            return m.host_tpidr;
-        }
-        if cur != m.host_tpidr {
-            m.guest_tpidr = cur;
-        }
-        m.host_tpidr
-    });
-    let Some(host) = host else {
+    // Under guest TPIDR: gettid + map only — never host `thread_local!` (A2).
+    let Some(prep) = host_slot::prepare_enter_under_guest(cur) else {
         return;
     };
-    if cur != host {
+    if cur != prep.host_tpidr {
         // SAFETY: restoring host glibc TLS pointer captured at prepare time.
         unsafe {
-            cpu::write_tpidr_el0(host);
+            cpu::write_tpidr_el0(prep.host_tpidr);
         }
     }
+    // Host TPIDR live: arm tid/slot cache for alt_sp + leave in this hypercall.
+    host_slot::arm_host_cache(prep);
 }
 
 fn leave_host_tls_inner() {
+    // Host cache is armed after enter — no second gettid / map lock (A2).
     let guest =
         host_slot::with_tls_existing_mut(|m| if m.active { m.guest_tpidr } else { 0 }).unwrap_or(0);
+    // Disarm *before* guest msr so any later guest-TPIDR path cannot read TLS.
+    host_slot::disarm_host_cache();
     if guest == 0 {
         return;
     }
@@ -196,6 +190,7 @@ pub fn clear_guest_tls_on_exit() {
     let _ = host_slot::with_tls_existing_mut(|m| {
         m.guest_tpidr = 0;
     });
+    // Stay on host for teardown; keep cache armed until clear_current/disarm.
 }
 
 /// Current host TPIDR snapshot (0 if unprepared).

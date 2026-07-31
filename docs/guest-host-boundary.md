@@ -37,9 +37,10 @@ static (MT data race).
 Storage is **`host_slot`** (gettid-keyed map), **not** `thread_local!`, because
 the first boundary instruction may already run under guest TPIDR.
 
-**Perf note:** hot archive workloads still pay per-hypercall `gettid`+`Mutex` and
-full NEON save/restore. Ideas, failed prototypes, and allow/forbid rules:
-[roadmap.md](roadmap.md).
+**Perf note:** under **guest** TPIDR the first lookup still uses `gettid`+map
+`Mutex`. After `kh_tls_enter_host` restores host TLS, a host-only cache (A2)
+covers same-hypercall `kh_host_alt_sp` / `kh_tls_leave_host` without extra
+`gettid`. Full NEON save/restore remains. Ideas / order: [roadmap.md](roadmap.md).
 
 Exported C entry points used from asm:
 

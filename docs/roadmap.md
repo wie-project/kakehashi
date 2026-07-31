@@ -11,7 +11,7 @@ to try, in what order, what is allowed, and what has already failed.
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | Production BSD entry | Freestanding `blr` → `kh_hypercall_entry` (main + workers)                               |
 | Per-call cost        | Guest prolog (full Q0–Q31) → host TPIDR → alt stack → NEON tramp → Rust dispatch → leave |
-| Slot map             | `host_slot` keyed by `gettid` + `Mutex` (no host `thread_local!` under guest TPIDR)      |
+| Slot map             | `host_slot` keyed by `gettid` + `Mutex`; **host-only** cache after enter (A2)            |
 | Correctness gate     | `KAKEHASHI_HYPERCALL=1` + `7zz a -mx=5 -mmt=4` + `t` (Docker / bare-metal)               |
 
 ### Observed gap (Ubuntu aarch64, ~240 MiB / ~8k files, `mx=5 mmt=4`)
@@ -60,7 +60,7 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 | ID     | Idea                                                                  | Why                                                                         | Hard parts                                                                                                                       |
 | ------ | --------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | **A1** | **Guest-TLS slot cookie** (offset reserved in freestanding TLS block) | Kill most `gettid` on enter under **guest** TPIDR                           | Must **never** probe cookie while TPIDR is **host** glibc TLS; validate magic + `slot.guest_tpidr == mrs`                        |
-| **A2** | **Host-only slot / tid cache after `kh_tls_enter_host`**              | Skip second/third `gettid` in same hypercall (`alt_sp`, leave)              | Cache only after host TPIDR restored; never read host `thread_local!` under guest TPIDR                                          |
+| **A2** | **Host-only slot / tid cache after `kh_tls_enter_host`**              | ~~Skip second/third `gettid`~~ **Done**                                     | Cache only after host TPIDR restored; never read host `thread_local!` under guest TPIDR                                          |
 | **A3** | **Light hypercall for hot I/O/fs numbers**                            | Skip **second** full NEON save (`TRAMP_BYTES`) when prolog already saved Q* | Keep prolog NEON; freestanding must still treat call as full C clobber or host restore is not enough for LLVM; MT gate mandatory |
 | **A4** | **Kill `readlinkat` storm**                                           | ~~95% errors = pure waste~~ **Done** (cache `real_path`)                    | Was per-bind `canonicalize` on `libc++` alias, not path walk                                                                    |
 | **A5** | **Explain / remove excess `mprotect`**                                | ~~15k vs ~15 native~~ **Done** (batch + skip RW)                            | Was per-slot bind/rebase mprotect on already-writable DATA                                                                      |
@@ -133,8 +133,8 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 
 1. **A4** `readlinkat` (usually pure win, low ABI risk)
 2. **A5** `mprotect` attribution
-3. **A2** host-only cache **after** enter (never under guest)
-4. **A1** guest cookie v2 (strict validation)
+3. ~~**A2** host-only cache after enter~~ **Done**
+4. **A1** guest cookie v2 (strict validation) — kills the remaining per-hypercall `gettid`
 5. **A3** light I/O entry (last among A — highest MT risk)
 
 ---
@@ -171,7 +171,8 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | 2026-07    | Cookie / light entry / freestanding NEON clobber experiments          | **Failed** under `-mmt>1`; reverted |
 | **2026-07** | **A4** `readlinkat` storm                                             | **Done** — root cause was per-bind `canonicalize` on bottle alias (`libc++`→`libSystem`). Cache `ProcessImage.real_path` once at insert; alias match uses the cache. (strace “errors” were mostly `EINVAL` from realpath probing non-symlinks, not ENOENT.) |
 | **2026-07** | **A5** excess `mprotect`                                              | **Done** — root cause was bind/rebase `write_slot_rw` doing RW↔restore **per slot** on already-writable `__DATA` (~15k identical `mprotect` on one region). Batch by region; skip mprotect when Darwin `prot` already has write. Also skip no-op mprotect after guest `mmap` when final prot is already RW. |
-| —          | A1–A3 as above                                                        | Open                                |
+| **2026-07** | **A2** host-only slot/tid cache                                       | **Done** — after `kh_tls_enter_host` restores host TPIDR, arm `thread_local!` with tid + stable `Box<ThreadSlot>` pointer. `kh_host_alt_sp` / `kh_tls_leave_host` (and other host-side slot accessors) skip `gettid`+map `Mutex`. Disarm before guest `msr` / `clear_current`. Under guest TPIDR enter still uses one `gettid`+lock (`prepare_enter_under_guest`). UTM 8k-file baseline before A2: `gettid` ~942k, `futex` ~252k (time-dominant). Expect ~⅓ residual `gettid` from boundary after A2; remaining need **A1**. |
+| —          | A1, A3 as above                                                       | Open                                |
 
 ---
 
