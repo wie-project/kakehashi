@@ -37,18 +37,18 @@ static (MT data race).
 Storage is **`host_slot`** (gettid-keyed map), **not** `thread_local!`, because
 the first boundary instruction may already run under guest TPIDR.
 
-**Perf note:** under **guest** TPIDR the first lookup still uses `gettid`+map
-`Mutex`. After `kh_tls_enter_host` restores host TLS, a host-only cache (A2)
-covers same-hypercall `kh_host_alt_sp` / `kh_tls_leave_host` without extra
-`gettid`. Full NEON save/restore remains. Ideas / order: [roadmap.md](roadmap.md).
+**Perf note:** hypercall enter uses one `gettid`+map lock for TLS switch **and**
+alt-stack top (`kh_tls_enter_host` returns alt SP; A2). Leave still `gettid`.
+No host `thread_local!` on the guest→host boundary. Full NEON save/restore
+remains. Ideas / order: [roadmap.md](roadmap.md).
 
 Exported C entry points used from asm:
 
 | Symbol | Role |
 | ------ | ---- |
-| `kh_tls_enter_host` | `mrs` guest; restore host TPIDR |
+| `kh_tls_enter_host` | restore host TPIDR; **return** alt stack top (`x0`) |
 | `kh_tls_leave_host` | restore guest TPIDR |
-| `kh_host_alt_sp` | return top of per-thread host alt stack |
+| `kh_host_alt_sp` | alt top only (cold paths / tests; hypercall uses enter return) |
 
 ## Hypercall ABI
 

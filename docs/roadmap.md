@@ -11,7 +11,7 @@ to try, in what order, what is allowed, and what has already failed.
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | Production BSD entry | Freestanding `blr` → `kh_hypercall_entry` (main + workers)                               |
 | Per-call cost        | Guest prolog (full Q0–Q31) → host TPIDR → alt stack → NEON tramp → Rust dispatch → leave |
-| Slot map             | `host_slot` keyed by `gettid` + `Mutex`; **host-only** cache after enter (A2)            |
+| Slot map             | `host_slot` keyed by `gettid` + `Mutex`; enter+alt merge (A2) — no host TLS on boundary  |
 | Correctness gate     | `KAKEHASHI_HYPERCALL=1` + `7zz a -mx=5 -mmt=4` + `t` (Docker / bare-metal)               |
 
 ### Observed gap (Ubuntu aarch64, ~240 MiB / ~8k files, `mx=5 mmt=4`)
@@ -60,7 +60,7 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 | ID     | Idea                                                                  | Why                                                                         | Hard parts                                                                                                                       |
 | ------ | --------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | **A1** | **Guest-TLS slot cookie** (offset reserved in freestanding TLS block) | Kill most `gettid` on enter under **guest** TPIDR                           | Must **never** probe cookie while TPIDR is **host** glibc TLS; validate magic + `slot.guest_tpidr == mrs`                        |
-| **A2** | **Host-only slot / tid cache after `kh_tls_enter_host`**              | ~~Skip second/third `gettid`~~ **Done**                                     | Cache only after host TPIDR restored; never read host `thread_local!` under guest TPIDR                                          |
+| **A2** | **Merge enter + alt SP (one `gettid`)**                               | ~~Skip extra `gettid` on hypercall enter~~ **Done** (v3)                    | No `thread_local!` on boundary; leave still `gettid` (guest-safe)                                                                 |
 | **A3** | **Light hypercall for hot I/O/fs numbers**                            | Skip **second** full NEON save (`TRAMP_BYTES`) when prolog already saved Q* | Keep prolog NEON; freestanding must still treat call as full C clobber or host restore is not enough for LLVM; MT gate mandatory |
 | **A4** | **Kill `readlinkat` storm**                                           | ~~95% errors = pure waste~~ **Done** (cache `real_path`)                    | Was per-bind `canonicalize` on `libc++` alias, not path walk                                                                    |
 | **A5** | **Explain / remove excess `mprotect`**                                | ~~15k vs ~15 native~~ **Done** (batch + skip RW)                            | Was per-slot bind/rebase mprotect on already-writable DATA                                                                      |
@@ -88,6 +88,8 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 | Freestanding `hypercall_thin` without full C/NEON clobber list            | Unstable MT / SEGV                                     | Guest LLVM must not keep live caller-saved SIMD across `blr` unless host contract is proven and tested |
 | Using host `thread_local!` for slot pointer **before** host TPIDR restore | Classic `si_addr≈0xa0` class faults                    | Under guest TPIDR, only `gettid` + map (or validated guest cookie)                                     |
 | Storing `Box<ThreadSlot>` raw pointers + aggressive cache                 | MT races / UAF risk if clear races                     | Prefer tid-keyed map until cookie design is airtight                                                   |
+| A2 v1: host `thread_local!` cache of `*mut ThreadSlot` + lock-free slot   | UTM SEGV mid 8k `7zz` (`si_addr≈0x2f…`, PC in host `kh`) | No raw slot pointers; no boundary `thread_local!`                                                          |
+| A2 v2: tid-only `thread_local!` after enter                               | Design risk: empty TLS probe under guest still SEGV    | Merge enter+alt in one gettid; leave stays gettid-only                                                     |
 
 ---
 
@@ -133,8 +135,8 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 
 1. **A4** `readlinkat` (usually pure win, low ABI risk)
 2. **A5** `mprotect` attribution
-3. ~~**A2** host-only cache after enter~~ **Done**
-4. **A1** guest cookie v2 (strict validation) — kills the remaining per-hypercall `gettid`
+3. ~~**A2** merge enter+alt (one gettid)~~ **Done**
+4. **A1** guest cookie v2 (strict validation) — kill enter/leave residual `gettid`
 5. **A3** light I/O entry (last among A — highest MT risk)
 
 ---
@@ -171,7 +173,7 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | 2026-07    | Cookie / light entry / freestanding NEON clobber experiments          | **Failed** under `-mmt>1`; reverted |
 | **2026-07** | **A4** `readlinkat` storm                                             | **Done** — root cause was per-bind `canonicalize` on bottle alias (`libc++`→`libSystem`). Cache `ProcessImage.real_path` once at insert; alias match uses the cache. (strace “errors” were mostly `EINVAL` from realpath probing non-symlinks, not ENOENT.) |
 | **2026-07** | **A5** excess `mprotect`                                              | **Done** — root cause was bind/rebase `write_slot_rw` doing RW↔restore **per slot** on already-writable `__DATA` (~15k identical `mprotect` on one region). Batch by region; skip mprotect when Darwin `prot` already has write. Also skip no-op mprotect after guest `mmap` when final prot is already RW. |
-| **2026-07** | **A2** host-only slot/tid cache                                       | **Done** — after `kh_tls_enter_host` restores host TPIDR, arm `thread_local!` with tid + stable `Box<ThreadSlot>` pointer. `kh_host_alt_sp` / `kh_tls_leave_host` (and other host-side slot accessors) skip `gettid`+map `Mutex`. Disarm before guest `msr` / `clear_current`. Under guest TPIDR enter still uses one `gettid`+lock (`prepare_enter_under_guest`). UTM 8k-file baseline before A2: `gettid` ~942k, `futex` ~252k (time-dominant). Expect ~⅓ residual `gettid` from boundary after A2; remaining need **A1**. |
+| **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — `kh_tls_enter_host` → `u64` alt top; one `gettid`+lock via `prepare_enter_under_guest` (TLS update + alt top). Asm drops separate `kh_host_alt_sp`. Leave still guest-safe `gettid`. **v1 failed** (lock-free `*mut ThreadSlot` + `thread_local!`): UTM SEGV mid 8k archive (`si_addr≈0x2f…`, PC in host `kh`). **v2 failed design**: any `thread_local!` probe under guest TPIDR is fatal even when empty. Expect ~2 boundary `gettid`/hypercall (enter+leave) vs ~3 before; **A1** for the rest. |
 | —          | A1, A3 as above                                                       | Open                                |
 
 ---

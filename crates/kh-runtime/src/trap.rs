@@ -675,16 +675,15 @@ kh_hypercall_entry:
     add x11, sp, #608
     stp x9, x10, [x11]
 
-    // Host glibc TLS *before* alt-stack lookup/alloc (mmap/mutex need host TPIDR).
+    // Host glibc TLS + alt SP in one call (A2: single gettid; x0 = alt top).
     bl kh_tls_enter_host
-    bl kh_host_alt_sp
     cbz x0, 1f
     mov x9, sp                 // guest prolog frame
     mov sp, x0                 // host alt stack
     ldr x30, [x9, #8]          // reload LR → freestanding thin caller
     // Host frame: [guest_frame, lr]
     stp x9, x30, [sp, #-16]!
-    // Reload guest frame ptr / args (enter_host + alt_sp clobbered temps).
+    // Reload guest frame ptr / args (enter_host clobbered temps).
     ldr x9, [sp]
     ldp x0, x1, [x9, #16]
     ldp x2, x3, [x9, #32]

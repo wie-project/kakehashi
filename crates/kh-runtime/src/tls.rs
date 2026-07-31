@@ -103,17 +103,20 @@ pub fn enter_guest_tls(guest_tpidr: u64) {
     }
 }
 
-/// Hypercall / trap entry: leave guest TLS, restore host glibc TLS.
+/// Hypercall entry: restore host glibc TLS; return alt-stack top in `x0`.
+///
+/// A2: one `gettid` covers TLS switch + alt lookup. Asm uses the return value
+/// instead of a separate `kh_host_alt_sp` call.
 ///
 /// # Safety
 ///
 /// Must be paired with [`kh_tls_leave_host`] (or process exit) before returning
 /// to guest code. Safe to call when already on host TLS (idempotent).
-/// Does **not** use Rust `thread_local!` (may run under guest `TPIDR_EL0`).
+/// Does **not** use Rust `thread_local!` until host TPIDR is restored.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn kh_tls_enter_host() {
-    enter_host_tls_inner();
+pub unsafe extern "C" fn kh_tls_enter_host() -> u64 {
+    enter_host_tls_inner()
 }
 
 /// Hypercall / trap leave: restore guest `TPIDR_EL0`.
@@ -129,10 +132,12 @@ pub unsafe extern "C" fn kh_tls_leave_host() {
 
 /// # Safety
 ///
-/// Stub on non-Linux aarch64; no-op.
+/// Stub on non-Linux aarch64; no-op, returns 0 alt SP.
 #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
 #[allow(dead_code)]
-pub unsafe extern "C" fn kh_tls_enter_host() {}
+pub unsafe extern "C" fn kh_tls_enter_host() -> u64 {
+    0
+}
 
 /// # Safety
 ///
@@ -141,10 +146,10 @@ pub unsafe extern "C" fn kh_tls_enter_host() {}
 #[allow(dead_code)]
 pub unsafe extern "C" fn kh_tls_leave_host() {}
 
-/// Safe wrapper used from Rust trap handlers.
+/// Safe wrapper used from Rust trap handlers (alt SP ignored).
 #[inline]
 pub fn enter_host_tls() {
-    enter_host_tls_inner();
+    let _ = enter_host_tls_inner();
 }
 
 /// Safe wrapper used from Rust trap handlers.
@@ -153,11 +158,14 @@ pub fn leave_host_tls() {
     leave_host_tls_inner();
 }
 
-fn enter_host_tls_inner() {
+/// Enter host TLS; return hypercall alt-stack top (0 if unmapped / no slot).
+///
+/// Guest-safe until host `msr`. One `gettid` covers TLS switch + alt lookup (A2).
+fn enter_host_tls_inner() -> u64 {
     let cur = cpu::read_tpidr_el0();
-    // Under guest TPIDR: gettid + map only — never host `thread_local!` (A2).
+    // Under guest TPIDR: gettid + map only — never host `thread_local!`.
     let Some(prep) = host_slot::prepare_enter_under_guest(cur) else {
-        return;
+        return 0;
     };
     if cur != prep.host_tpidr {
         // SAFETY: restoring host glibc TLS pointer captured at prepare time.
@@ -165,16 +173,17 @@ fn enter_host_tls_inner() {
             cpu::write_tpidr_el0(prep.host_tpidr);
         }
     }
-    // Host TPIDR live: arm tid/slot cache for alt_sp + leave in this hypercall.
-    host_slot::arm_host_cache(prep);
+    if prep.alt_top != 0 {
+        return prep.alt_top;
+    }
+    // Cold map only after host TPIDR; workers/main pre-map usually.
+    crate::thread::ensure_host_alt_stack()
 }
 
 fn leave_host_tls_inner() {
-    // Host cache is armed after enter — no second gettid / map lock (A2).
+    // Always gettid — correct under host or guest (failed enter no-op).
     let guest =
         host_slot::with_tls_existing_mut(|m| if m.active { m.guest_tpidr } else { 0 }).unwrap_or(0);
-    // Disarm *before* guest msr so any later guest-TPIDR path cannot read TLS.
-    host_slot::disarm_host_cache();
     if guest == 0 {
         return;
     }
@@ -186,11 +195,10 @@ fn leave_host_tls_inner() {
 
 /// Restores host TLS and clears the active guest snapshot (worker exit).
 pub fn clear_guest_tls_on_exit() {
-    enter_host_tls_inner();
+    let _ = enter_host_tls_inner();
     let _ = host_slot::with_tls_existing_mut(|m| {
         m.guest_tpidr = 0;
     });
-    // Stay on host for teardown; keep cache armed until clear_current/disarm.
 }
 
 /// Current host TPIDR snapshot (0 if unprepared).
