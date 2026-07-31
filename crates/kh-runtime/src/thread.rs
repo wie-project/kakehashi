@@ -51,19 +51,24 @@ pub unsafe extern "C" fn kh_host_alt_sp() -> u64 {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[must_use]
 pub fn ensure_host_alt_stack() -> u64 {
-    host_slot::with_alt_mut(|cell| {
+    let top = host_slot::with_alt_mut(|cell| {
         if let Some(s) = *cell {
             return s.top;
         }
         match map_host_alt_stack() {
             Some(s) => {
-                let top = s.top;
+                let t = s.top;
                 *cell = Some(s);
-                top
+                t
             }
             None => 0,
         }
-    })
+    });
+    // A1: keep guest-TLS alt_top mirror current for gettid-free enter.
+    if top != 0 {
+        crate::tls::publish_alt_top_to_current_guest(top);
+    }
+    top
 }
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]

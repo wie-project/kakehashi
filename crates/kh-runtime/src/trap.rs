@@ -675,10 +675,12 @@ kh_hypercall_entry:
     add x11, sp, #608
     stp x9, x10, [x11]
 
-    // Host glibc TLS + alt SP in one call (A2: single gettid; x0 = alt top).
+    // A1/A2: enter returns alt_top in x0, guest_tpidr in x1 (HyperEnterRet).
+    // Park guest_va at prolog+80 (hole before NEON) so leave needs no gettid.
     bl kh_tls_enter_host
-    cbz x0, 1f
     mov x9, sp                 // guest prolog frame
+    str x1, [x9, #80]          // guest_tpidr for leave
+    cbz x0, 1f
     mov sp, x0                 // host alt stack
     ldr x30, [x9, #8]          // reload LR → freestanding thin caller
     // Host frame: [guest_frame, lr]
@@ -693,6 +695,9 @@ kh_hypercall_entry:
     bl kh_neon_tramp_entry
     // Preserve TrampRet (x0/x1) across TLS restore.
     stp x0, x1, [sp, #-16]!
+    // guest_va at host_frame.guest_frame + 80; host_frame at sp+16.
+    ldr x9, [sp, #16]
+    ldr x0, [x9, #80]
     bl kh_tls_leave_host
     ldp x0, x1, [sp], #16
     ldp x9, x30, [sp], #16
@@ -723,7 +728,7 @@ kh_hypercall_entry:
     ret
 1:
     // No alt stack: dispatch on the guest stack (ST / fallback only).
-    // Already on host TLS from the enter above.
+    // Already on host TLS from the enter above; guest_va at [sp, #80].
     ldp x0, x1, [sp, #16]
     ldp x2, x3, [sp, #32]
     ldp x4, x5, [sp, #48]
@@ -733,6 +738,7 @@ kh_hypercall_entry:
     ldr x30, [sp, #8]
     bl kh_neon_tramp_entry
     stp x0, x1, [sp, #-16]!
+    ldr x0, [sp, #16+80]
     bl kh_tls_leave_host
     ldp x0, x1, [sp], #16
     // Restore guest NEON from prolog.

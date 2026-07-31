@@ -11,7 +11,7 @@ to try, in what order, what is allowed, and what has already failed.
 | -------------------- | ---------------------------------------------------------------------------------------- |
 | Production BSD entry | Freestanding `blr` → `kh_hypercall_entry` (main + workers)                               |
 | Per-call cost        | Guest prolog (full Q0–Q31) → host TPIDR → alt stack → NEON tramp → Rust dispatch → leave |
-| Slot map             | `host_slot` keyed by `gettid` + `Mutex`; enter+alt merge (A2) — no host TLS on boundary  |
+| Slot map             | `host_slot` gettid map (slow path); **A1** guest-TLS host/alt mirror (hot path)          |
 | Correctness gate     | `KAKEHASHI_HYPERCALL=1` + `7zz a -mx=5 -mmt=4` + `t` (Docker / bare-metal)               |
 
 ### Observed gap (Ubuntu aarch64, ~240 MiB / ~8k files, `mx=5 mmt=4`)
@@ -59,7 +59,7 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 
 | ID     | Idea                                                                  | Why                                                                         | Hard parts                                                                                                                       |
 | ------ | --------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| **A1** | **Guest-TLS slot cookie** (offset reserved in freestanding TLS block) | Kill most `gettid` on enter under **guest** TPIDR                           | Must **never** probe cookie while TPIDR is **host** glibc TLS; validate magic + `slot.guest_tpidr == mrs`                        |
+| **A1** | **Guest-TLS host/alt mirror** (not map cookie)                        | ~~Kill hot-path `gettid`/map lock~~ **Done**                                | Probe only when `TPIDR` has `GUEST_TLS_MAGIC`; host writes mirrors; leave via parked guest VA                                     |
 | **A2** | **Merge enter + alt SP (one `gettid`)**                               | ~~Skip extra `gettid` on hypercall enter~~ **Done** (v3)                    | No `thread_local!` on boundary; leave still `gettid` (guest-safe)                                                                 |
 | **A3** | **Light hypercall for hot I/O/fs numbers**                            | Skip **second** full NEON save (`TRAMP_BYTES`) when prolog already saved Q* | Keep prolog NEON; freestanding must still treat call as full C clobber or host restore is not enough for LLVM; MT gate mandatory |
 | **A4** | **Kill `readlinkat` storm**                                           | ~~95% errors = pure waste~~ **Done** (cache `real_path`)                    | Was per-bind `canonicalize` on `libc++` alias, not path walk                                                                    |
@@ -135,9 +135,10 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 
 1. **A4** `readlinkat` (usually pure win, low ABI risk)
 2. **A5** `mprotect` attribution
-3. ~~**A2** merge enter+alt (one gettid)~~ **Done**
-4. **A1** guest cookie v2 (strict validation) — kill enter/leave residual `gettid`
+3. ~~**A2** merge enter+alt~~ **Done**
+4. ~~**A1** guest-TLS host/alt mirror~~ **Done**
 5. **A3** light I/O entry (last among A — highest MT risk)
+6. Futex wall-time: mostly guest park/wake after A1 (not host_slot map)
 
 ---
 
@@ -173,8 +174,9 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | 2026-07    | Cookie / light entry / freestanding NEON clobber experiments          | **Failed** under `-mmt>1`; reverted |
 | **2026-07** | **A4** `readlinkat` storm                                             | **Done** — root cause was per-bind `canonicalize` on bottle alias (`libc++`→`libSystem`). Cache `ProcessImage.real_path` once at insert; alias match uses the cache. (strace “errors” were mostly `EINVAL` from realpath probing non-symlinks, not ENOENT.) |
 | **2026-07** | **A5** excess `mprotect`                                              | **Done** — root cause was bind/rebase `write_slot_rw` doing RW↔restore **per slot** on already-writable `__DATA` (~15k identical `mprotect` on one region). Batch by region; skip mprotect when Darwin `prot` already has write. Also skip no-op mprotect after guest `mmap` when final prot is already RW. |
-| **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — `kh_tls_enter_host` → `u64` alt top; one `gettid`+lock via `prepare_enter_under_guest` (TLS update + alt top). Asm drops separate `kh_host_alt_sp`. Leave still guest-safe `gettid`. **v1 failed** (lock-free `*mut ThreadSlot` + `thread_local!`): UTM SEGV mid 8k archive (`si_addr≈0x2f…`, PC in host `kh`). **v2 failed design**: any `thread_local!` probe under guest TPIDR is fatal even when empty. Expect ~2 boundary `gettid`/hypercall (enter+leave) vs ~3 before; **A1** for the rest. |
-| —          | A1, A3 as above                                                       | Open                                |
+| **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — enter returns alt top; one gettid on slow path. **v1/v2** failed (host TLS cache). UTM after A2: gettid ~631k (was ~942k), futex still ~82% time. |
+| **2026-07** | **A1** guest-TLS host/alt mirror                                      | **Done** — different from “cookie→map”: store `host_tpidr@24` + `alt_top@32` in freestanding guest TLS (host-written at prepare / `enter_guest_tls` / alt map). Hot enter: `mrs` + magic check + load mirrors → `msr` host — **no gettid, no Mutex, no thread_local!**. Leave: asm parks guest VA at prolog+80; `kh_tls_leave_host(guest)` restores without gettid. Slow path keeps A2 gettid map. Freestanding `GuestTls` extended (stage dylib). Expect boundary gettid ≈ noise; residual gettid from non-boundary; futex dominated by guest locks. |
+| —          | A3 as above                                                           | Open                                |
 
 ---
 

@@ -27,28 +27,33 @@ Freestanding block (ABI between `kh-libsystem` and `kh-runtime::tls`):
 | 0 | `magic` = `0x4B48_544C_5301` (`"KHTLS\x01"`) |
 | 8 | `errno: i32` (`___error` target) |
 | 16 | `pthread_self: u64` (optional guest `pthread_t` VA) |
+| 24 | `host_tpidr: u64` (**host-owned** A1 mirror) |
+| 32 | `alt_top: u64` (**host-owned** A1 mirror) |
 
 `___error` MUST return a **per-thread** cell via this block, never a process-global
-static (MT data race).
+static (MT data race). Host mirrors MUST only be written while host TPIDR is live
+(or with raw stores that do not use host TLS). Fast hypercall enter MUST validate
+`magic` before reading offsets 24/32 — never treat host glibc TLS as a guest block.
 
 ## Host meta and `host_slot`
 
 `prepare_host_meta` captures host `TPIDR_EL0` **before** any guest `msr`.
-Storage is **`host_slot`** (gettid-keyed map), **not** `thread_local!`, because
-the first boundary instruction may already run under guest TPIDR.
+Storage is **`host_slot`** (gettid-keyed map) for prepare / slow path, **plus**
+A1 mirrors in the guest TLS block for the hypercall hot path. **Not** host
+`thread_local!` under guest TPIDR.
 
-**Perf note:** hypercall enter uses one `gettid`+map lock for TLS switch **and**
-alt-stack top (`kh_tls_enter_host` returns alt SP; A2). Leave still `gettid`.
-No host `thread_local!` on the guest→host boundary. Full NEON save/restore
-remains. Ideas / order: [roadmap.md](roadmap.md).
+**Perf note:** hot enter reads guest-TLS mirrors (no gettid). Leave restores the
+parked guest VA from the hypercall frame (no gettid). Slow path (no mirror /
+bad magic) uses gettid+map (A2). Full NEON save/restore remains.
+Ideas / order: [roadmap.md](roadmap.md).
 
 Exported C entry points used from asm:
 
 | Symbol | Role |
 | ------ | ---- |
-| `kh_tls_enter_host` | restore host TPIDR; **return** alt stack top (`x0`) |
-| `kh_tls_leave_host` | restore guest TPIDR |
-| `kh_host_alt_sp` | alt top only (cold paths / tests; hypercall uses enter return) |
+| `kh_tls_enter_host` | restore host TPIDR; return `{alt_top:x0, guest_tpidr:x1}` |
+| `kh_tls_leave_host` | `x0` = guest TPIDR to restore (`0` → map fallback) |
+| `kh_host_alt_sp` | alt top only (cold paths / tests) |
 
 ## Hypercall ABI
 

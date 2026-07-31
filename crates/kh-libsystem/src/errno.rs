@@ -7,6 +7,7 @@
 //! Layout (must match `kh-runtime::tls`):
 //! ```text
 //! TPIDR_EL0 → magic u64 | errno i32 | pad | pthread_self u64
+//!             | host_tpidr u64 | alt_top u64   (host-owned A1 mirrors)
 //! ```
 //! When TPIDR is unset or magic mismatches (early boot / real Darwin), fall
 //! back to a process-global cell so single-thread scaffolds still work.

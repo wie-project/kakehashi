@@ -44,13 +44,19 @@ static REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Per-thread guest TLS block pointed to by `TPIDR_EL0`.
 ///
 /// Layout ABI with `kh-runtime::tls` / `errno`:
-/// `magic @ 0`, `errno @ 8`, `pthread_self @ 16`.
+/// `magic @ 0`, `errno @ 8`, `pthread_self @ 16`,
+/// `host_tpidr @ 24` / `alt_top @ 32` (host-owned A1 mirrors; guest must not
+/// treat them as ABI for freestanding logic).
 #[repr(C, align(16))]
 struct GuestTls {
     magic: u64,
     errno: i32,
     pad: u32,
     pthread_self: u64,
+    /// Host-written; zero until `kh-runtime` publishes boundary.
+    host_tpidr: u64,
+    /// Host-written hypercall alt stack top.
+    alt_top: u64,
 }
 
 /// Control block pointed to by guest `pthread_t`.
@@ -426,6 +432,8 @@ pub(crate) unsafe extern "C" fn pthread_create(
         (*tsd).errno = 0;
         (*tsd).pad = 0;
         (*tsd).pthread_self = pthread_va;
+        (*tsd).host_tpidr = 0;
+        (*tsd).alt_top = 0;
 
         (*t).magic = MAGIC;
         (*t).done = AtomicU32::new(0);
