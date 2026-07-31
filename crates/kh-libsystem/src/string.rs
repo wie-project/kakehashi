@@ -130,28 +130,77 @@ pub(crate) unsafe extern "C" fn strstr(
     core::ptr::null_mut()
 }
 
+/// Static English errno messages (shared by `strerror` / `strerror_r`).
+fn strerror_msg(errnum: c_int) -> &'static [u8] {
+    match errnum {
+        0 => b"Undefined error: 0\0",
+        1 => b"Operation not permitted\0",
+        2 => b"No such file or directory\0",
+        3 => b"No such process\0",
+        4 => b"Interrupted system call\0",
+        5 => b"Input/output error\0",
+        6 => b"Device not configured\0",
+        7 => b"Argument list too long\0",
+        8 => b"Exec format error\0",
+        9 => b"Bad file descriptor\0",
+        10 => b"No child processes\0",
+        // Darwin: EDEADLK=11; Linux EAGAIN=11 — either is fine as text.
+        11 => b"Resource deadlock avoided\0",
+        12 => b"Cannot allocate memory\0",
+        13 => b"Permission denied\0",
+        14 => b"Bad address\0",
+        17 => b"File exists\0",
+        20 => b"Not a directory\0",
+        21 => b"Is a directory\0",
+        22 => b"Invalid argument\0",
+        24 => b"Too many open files\0",
+        28 => b"No space left on device\0",
+        32 => b"Broken pipe\0",
+        // Darwin EAGAIN / EWOULDBLOCK
+        35 => b"Resource temporarily unavailable\0",
+        36 => b"Operation now in progress\0",
+        37 => b"Operation already in progress\0",
+        38 => b"Socket operation on non-socket\0",
+        39 => b"Destination address required\0",
+        40 => b"Message too long\0",
+        41 => b"Protocol wrong type for socket\0",
+        42 => b"Protocol not available\0",
+        43 => b"Protocol not supported\0",
+        44 => b"Socket type not supported\0",
+        45 => b"Operation not supported\0",
+        46 => b"Protocol family not supported\0",
+        47 => b"Address family not supported by protocol family\0",
+        48 => b"Address already in use\0",
+        49 => b"Can't assign requested address\0",
+        50 => b"Network is down\0",
+        51 => b"Network is unreachable\0",
+        52 => b"Network dropped connection on reset\0",
+        53 => b"Software caused connection abort\0",
+        54 => b"Connection reset by peer\0",
+        55 => b"No buffer space available\0",
+        56 => b"Socket is already connected\0",
+        57 => b"Socket is not connected\0",
+        58 => b"Can't send after socket shutdown\0",
+        60 => b"Operation timed out\0",
+        61 => b"Connection refused\0",
+        64 => b"Host is down\0",
+        65 => b"No route to host\0",
+        78 => b"Function not implemented\0",
+        _ => b"Unknown error\0",
+    }
+}
+
 /// C `strerror` → nlist `_strerror` (static English stubs).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strerror(errnum: c_int) -> *mut c_char {
     // Minimal static messages; not thread-safe by design of classic strerror.
-    static mut BUF: [u8; 32] = *b"Unknown error                  \0";
-    let msg: &[u8] = match errnum {
-        0 => b"Undefined error: 0\0",
-        1 => b"Operation not permitted\0",
-        2 => b"No such file or directory\0",
-        9 => b"Bad file descriptor\0",
-        12 => b"Cannot allocate memory\0",
-        13 => b"Permission denied\0",
-        14 => b"Bad address\0",
-        22 => b"Invalid argument\0",
-        78 => b"Function not implemented\0",
-        _ => b"Unknown error\0",
-    };
+    static mut BUF: [u8; 64] = [0; 64];
+    let msg = strerror_msg(errnum);
     // SAFETY: single static buffer for scaffold guests.
     unsafe {
         let dst = core::ptr::addr_of_mut!(BUF).cast::<u8>();
         let mut i = 0_usize;
-        while i < 31 {
+        while i < 63 {
             let b = msg.get(i).copied().unwrap_or(0);
             dst.add(i).write(b);
             if b == 0 {
@@ -159,9 +208,52 @@ pub(crate) unsafe extern "C" fn strerror(errnum: c_int) -> *mut c_char {
             }
             i = i.saturating_add(1);
         }
-        dst.add(31).write(0);
+        dst.add(63).write(0);
         dst.cast()
     }
+}
+
+/// POSIX/XSI `strerror_r` → nlist `_strerror_r` (Darwin; returns 0 / ERANGE).
+///
+/// curl calls this after a completed transfer when formatting diagnostics.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strerror_r(
+    errnum: c_int,
+    buf: *mut c_char,
+    buflen: usize,
+) -> c_int {
+    if buf.is_null() || buflen == 0 {
+        return 22; // EINVAL
+    }
+    let msg = strerror_msg(errnum);
+    // Message length excluding trailing NUL.
+    let mut msg_len = 0_usize;
+    while msg.get(msg_len).copied().unwrap_or(0) != 0 {
+        msg_len = msg_len.saturating_add(1);
+    }
+    if buflen <= msg_len {
+        // Truncate and NUL-terminate; report ERANGE (34 on Darwin).
+        unsafe {
+            let n = buflen.saturating_sub(1);
+            let mut i = 0_usize;
+            while i < n {
+                buf.add(i).write(msg.get(i).copied().unwrap_or(0).cast_signed());
+                i = i.saturating_add(1);
+            }
+            buf.add(n).write(0);
+        }
+        return 34; // ERANGE
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < msg_len {
+            buf.add(i)
+                .write(msg.get(i).copied().unwrap_or(0).cast_signed());
+            i = i.saturating_add(1);
+        }
+        buf.add(msg_len).write(0);
+    }
+    0
 }
 
 /// Darwin `memset_pattern16` → nlist `_memset_pattern16`.

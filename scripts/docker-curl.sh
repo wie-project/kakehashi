@@ -231,7 +231,7 @@ echo
 echo "==> probe artifacts under /probe"
 ls -lah /probe | sed "s/^/    /"
 exit "$run_rc"
-' -- "${GUEST_ARGS[@]}"
+' -- ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}
 rc=$?
 set -e
 
