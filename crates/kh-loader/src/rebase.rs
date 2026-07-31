@@ -15,9 +15,10 @@
 
 use goblin::mach::Mach;
 use goblin::mach::load_command::{CommandVariant, DyldInfoCommand};
-use kh_runtime::{GuestMemory, mprotect_darwin, mprotect_rw};
+use kh_runtime::GuestMemory;
 use scroll::Uleb128;
 
+use crate::bind;
 use crate::error::LoadError;
 use crate::image::MachOImage;
 use crate::parse::{read_thin_arm64, thin_arm64_bytes};
@@ -102,9 +103,7 @@ pub fn rebase_process(session: &mut LoadSession) -> Result<usize, LoadError> {
             let bytes = read_thin_arm64(&path)?;
             apply_classic_rebase_opcodes(img, &bytes)?
         };
-        total = total
-            .saturating_add(section_n)
-            .saturating_add(opcode_n);
+        total = total.saturating_add(section_n).saturating_add(opcode_n);
     }
     Ok(total)
 }
@@ -153,7 +152,7 @@ pub fn apply_classic_rebase_opcodes(
     }
     let seg_vms: Vec<u64> = image.segments.iter().map(|s| s.vmaddr).collect();
     let sites = collect_classic_rebase_sites(stream, &seg_vms)?;
-    let mut count = 0_usize;
+    let mut updates: Vec<(u64, u64)> = Vec::new();
     for preferred_slot in sites {
         let slot = preferred_slot.wrapping_add(slide);
         let preferred = memory.read_u64_le(slot).ok_or_else(|| {
@@ -166,9 +165,10 @@ pub fn apply_classic_rebase_opcodes(
         if actual == preferred {
             continue;
         }
-        write_slot_rw(memory, slot, actual)?;
-        count = count.saturating_add(1);
+        updates.push((slot, actual));
     }
+    let count = updates.len();
+    bind::write_slots_batched(memory, &updates)?;
     if count > 0 {
         tracing::debug!(
             path = %img.path.display(),
@@ -248,56 +248,28 @@ fn collect_classic_rebase_sites(stream: &[u8], seg_vms: &[u64]) -> Result<Vec<u6
             }
             REBASE_OPCODE_DO_REBASE_IMM_TIMES => {
                 for _ in 0..imm {
-                    push_rebase_site(
-                        &mut out,
-                        seg_vms,
-                        seg_index,
-                        seg_offset,
-                        rebase_type,
-                    )?;
+                    push_rebase_site(&mut out, seg_vms, seg_index, seg_offset, rebase_type)?;
                     seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
                 }
             }
             REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
                 let times = read_uleb(stream, &mut offset)?;
                 for _ in 0..times {
-                    push_rebase_site(
-                        &mut out,
-                        seg_vms,
-                        seg_index,
-                        seg_offset,
-                        rebase_type,
-                    )?;
+                    push_rebase_site(&mut out, seg_vms, seg_index, seg_offset, rebase_type)?;
                     seg_offset = seg_offset.wrapping_add(POINTER_SIZE);
                 }
             }
             REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
-                push_rebase_site(
-                    &mut out,
-                    seg_vms,
-                    seg_index,
-                    seg_offset,
-                    rebase_type,
-                )?;
+                push_rebase_site(&mut out, seg_vms, seg_index, seg_offset, rebase_type)?;
                 let add = read_uleb(stream, &mut offset)?;
-                seg_offset = seg_offset
-                    .wrapping_add(POINTER_SIZE)
-                    .wrapping_add(add);
+                seg_offset = seg_offset.wrapping_add(POINTER_SIZE).wrapping_add(add);
             }
             REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
                 let times = read_uleb(stream, &mut offset)?;
                 let skip = read_uleb(stream, &mut offset)?;
                 for _ in 0..times {
-                    push_rebase_site(
-                        &mut out,
-                        seg_vms,
-                        seg_index,
-                        seg_offset,
-                        rebase_type,
-                    )?;
-                    seg_offset = seg_offset
-                        .wrapping_add(POINTER_SIZE)
-                        .wrapping_add(skip);
+                    push_rebase_site(&mut out, seg_vms, seg_index, seg_offset, rebase_type)?;
+                    seg_offset = seg_offset.wrapping_add(POINTER_SIZE).wrapping_add(skip);
                 }
             }
             _ => {
@@ -344,8 +316,7 @@ pub fn rebase_memory(
         return Ok(0);
     }
 
-    let mut rewritten = 0_usize;
-    // Collect (slot_va, new_value) first so we batch mprotect per region.
+    // Collect (slot_va, new_value) then one mprotect pair per region (A5).
     let mut updates: Vec<(u64, u64)> = Vec::new();
 
     for seg in &image.segments {
@@ -385,47 +356,9 @@ pub fn rebase_memory(
         }
     }
 
-    for (slot, actual) in updates {
-        write_slot_rw(memory, slot, actual)?;
-        rewritten = rewritten.saturating_add(1);
-    }
+    let rewritten = updates.len();
+    bind::write_slots_batched(memory, &updates)?;
     Ok(rewritten)
-}
-
-fn write_slot_rw(memory: &mut GuestMemory, slot: u64, value: u64) -> Result<(), LoadError> {
-    let region_idx = memory
-        .regions()
-        .iter()
-        .position(|r| {
-            let start = r.guest_addr;
-            let end = start.saturating_add(r.vmsize);
-            slot >= start && slot < end
-        })
-        .ok_or_else(|| {
-            LoadError::Resolve(format!("rebase slot {slot:#x} outside mapped regions"))
-        })?;
-
-    let region = memory
-        .regions_mut()
-        .get_mut(region_idx)
-        .ok_or_else(|| LoadError::Resolve(format!("rebase region missing for {slot:#x}")))?;
-    let restore = region.prot;
-    mprotect_rw(region).map_err(LoadError::Map)?;
-
-    // Re-borrow after mprotect: region index still valid.
-    let wrote = memory.write_u64_le(slot, value);
-    let region = memory
-        .regions()
-        .get(region_idx)
-        .ok_or_else(|| LoadError::Resolve(format!("rebase region lost for {slot:#x}")))?;
-    mprotect_darwin(region, restore).map_err(LoadError::Map)?;
-
-    if wrote.is_none() {
-        return Err(LoadError::Resolve(format!(
-            "rebase write failed at {slot:#x}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -179,14 +179,8 @@ fn enter_host_tls_inner() {
 }
 
 fn leave_host_tls_inner() {
-    let guest = host_slot::with_tls_existing_mut(|m| {
-        if m.active {
-            m.guest_tpidr
-        } else {
-            0
-        }
-    })
-    .unwrap_or(0);
+    let guest =
+        host_slot::with_tls_existing_mut(|m| if m.active { m.guest_tpidr } else { 0 }).unwrap_or(0);
     if guest == 0 {
         return;
     }

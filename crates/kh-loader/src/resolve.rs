@@ -173,6 +173,9 @@ fn join_no_dotdot(base: &Path, rest: &str) -> Result<PathBuf, ResolveError> {
 }
 
 /// Map allowlist: under bottle root (when set) **or** under executable_dir.
+///
+/// Always resolves through canonicalize when the path exists so a bottle-local
+/// symlink that points outside the allowlist is rejected (see unit test).
 fn ensure_allowlisted(host: &Path, ctx: &ResolveContext<'_>) -> Result<(), ResolveError> {
     let check = path_for_allowlist_check(host);
 

@@ -244,7 +244,8 @@ fn allocate_arena(need: usize) -> *mut c_void {
         {
             // Arena base is 16-byte aligned; bump offsets are always multiples of ALIGN.
             let base_addr = ARENA.buf.get().addr();
-            let h = core::ptr::with_exposed_provenance_mut::<Hdr>(base_addr.saturating_add(cur_off));
+            let h =
+                core::ptr::with_exposed_provenance_mut::<Hdr>(base_addr.saturating_add(cur_off));
             unsafe {
                 (*h).magic = MAGIC_ARENA;
                 (*h).flags = 0;
@@ -304,9 +305,7 @@ unsafe fn free_inner(ptr: *mut c_void) {
             let total = align_up(HDR_SIZE.saturating_add(size), PAGE);
             let addr = u64::try_from(h.addr()).unwrap_or(0);
             // SAFETY: whole mapping from allocate_mmap.
-            let _ = unsafe {
-                sys::syscall2(SYS_MUNMAP, addr, u64::try_from(total).unwrap_or(0))
-            };
+            let _ = unsafe { sys::syscall2(SYS_MUNMAP, addr, u64::try_from(total).unwrap_or(0)) };
         }
         MAGIC_ARENA => {
             lock();

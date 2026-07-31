@@ -5,6 +5,8 @@
 //! When an image has no bind opcodes, falls back to nlist → `__got` for the
 //! main executable (Phase 6 fixtures / tools without dyld info).
 
+use std::collections::BTreeMap;
+
 use goblin::mach::Mach;
 use goblin::mach::bind_opcodes::{
     BIND_IMMEDIATE_MASK, BIND_OPCODE_ADD_ADDR_ULEB, BIND_OPCODE_DO_BIND,
@@ -17,7 +19,7 @@ use goblin::mach::bind_opcodes::{
     BIND_SPECIAL_DYLIB_SELF, BIND_SYMBOL_FLAGS_WEAK_IMPORT, BIND_TYPE_POINTER,
 };
 use goblin::mach::load_command::{CommandVariant, DyldInfoCommand};
-use kh_runtime::{GuestMemory, mprotect_darwin, mprotect_rw};
+use kh_runtime::{GuestMemory, VM_PROT_WRITE, mprotect_darwin, mprotect_rw};
 use scroll::{Sleb128, Uleb128};
 
 use crate::error::LoadError;
@@ -478,27 +480,22 @@ fn find_mapped_by_install_name<'a>(
     // Bottle alias: `libc++.1.dylib` → same real path as already-mapped
     // `libSystem.B.dylib` is recorded as `skipped:duplicate`. Reuse the mapped
     // image so two-level binds against the alias ordinal still resolve.
+    //
+    // Use the load-time cached `real_path` (no per-bind `canonicalize` /
+    // readlinkat storm — roadmap A4).
     let alias = images.iter().find(|img| {
         matches!(
             img.status,
             ImageLoadStatus::Skipped(crate::session::SkipReason::Duplicate)
         ) && img.install_name == install_name
     })?;
-    let alias_key = real_path_key(&alias.path)?;
-    images.iter().find(|img| {
-        matches!(img.status, ImageLoadStatus::Mapped)
-            && real_path_key(&img.path).as_ref() == Some(&alias_key)
-    })
-}
-
-fn real_path_key(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    path.canonicalize().ok().or_else(|| {
-        if path.as_os_str().is_empty() {
-            None
-        } else {
-            Some(path.to_path_buf())
-        }
-    })
+    let alias_key = &alias.real_path;
+    if alias_key.as_os_str().is_empty() {
+        return None;
+    }
+    images
+        .iter()
+        .find(|img| matches!(img.status, ImageLoadStatus::Mapped) && img.real_path == *alias_key)
 }
 
 fn lookup_in_image(img: Option<&ProcessImage>, name: &str, weak: bool) -> Result<u64, LoadError> {
@@ -544,7 +541,11 @@ fn lookup_flat(images: &[ProcessImage], name: &str, weak: bool) -> Result<u64, L
     }
 }
 
-/// Write absolute pointers into a mapped image (mprotect RW per slot).
+/// Write absolute pointers into a mapped image.
+///
+/// Batches by region and skips host `mprotect` when the region is already
+/// Darwin-writable (typical `__DATA` binds). Per-slot RW↔restore used to cost
+/// ~2×N `mprotect` syscalls on large guests (roadmap A5).
 pub(crate) fn write_pointer_slots(
     session: &mut LoadSession,
     image_idx: usize,
@@ -561,42 +562,65 @@ pub(crate) fn write_pointer_slots(
         .memory
         .as_mut()
         .ok_or(LoadError::NotImplemented("memory missing for bind write"))?;
-
-    for &(slot, value) in updates {
-        write_slot_rw(memory, slot, value)?;
-    }
-    Ok(())
+    write_slots_batched(memory, updates)
 }
 
-fn write_slot_rw(memory: &mut GuestMemory, slot: u64, value: u64) -> Result<(), LoadError> {
-    let region_idx = memory
-        .regions()
-        .iter()
-        .position(|r| {
-            let start = r.guest_addr;
-            let end = start.saturating_add(r.vmsize);
-            slot >= start && slot < end
-        })
-        .ok_or_else(|| LoadError::Resolve(format!("bind slot {slot:#x} outside mapped regions")))?;
+/// Apply `(slot_va, value)` writes with at most one mprotect pair per region.
+pub(crate) fn write_slots_batched(
+    memory: &mut GuestMemory,
+    updates: &[(u64, u64)],
+) -> Result<(), LoadError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
 
-    let region = memory
-        .regions_mut()
-        .get_mut(region_idx)
-        .ok_or_else(|| LoadError::Resolve(format!("bind region missing for {slot:#x}")))?;
-    let restore = region.prot;
-    mprotect_rw(region).map_err(LoadError::Map)?;
+    // Group slot → value by region index (stable order for deterministic errors).
+    let mut by_region: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+    for &(slot, value) in updates {
+        let region_idx = memory
+            .regions()
+            .iter()
+            .position(|r| {
+                let start = r.guest_addr;
+                let end = start.saturating_add(r.vmsize);
+                slot >= start && slot < end
+            })
+            .ok_or_else(|| {
+                LoadError::Resolve(format!("bind slot {slot:#x} outside mapped regions"))
+            })?;
+        by_region.entry(region_idx).or_default().push((slot, value));
+    }
 
-    let wrote = memory.write_u64_le(slot, value);
-    let region = memory
-        .regions()
-        .get(region_idx)
-        .ok_or_else(|| LoadError::Resolve(format!("bind region lost for {slot:#x}")))?;
-    mprotect_darwin(region, restore).map_err(LoadError::Map)?;
+    for (region_idx, slots) in by_region {
+        let restore = memory
+            .regions()
+            .get(region_idx)
+            .ok_or_else(|| LoadError::Resolve(format!("bind region missing idx {region_idx}")))?
+            .prot;
+        // DATA/BSS already RW after map: do not thrash mprotect (A5).
+        let need_flip = restore & VM_PROT_WRITE == 0;
+        if need_flip {
+            let region = memory.regions_mut().get_mut(region_idx).ok_or_else(|| {
+                LoadError::Resolve(format!("bind region missing idx {region_idx}"))
+            })?;
+            mprotect_rw(region).map_err(LoadError::Map)?;
+        }
 
-    if wrote.is_none() {
-        return Err(LoadError::Resolve(format!(
-            "bind write failed at {slot:#x}"
-        )));
+        for (slot, value) in slots {
+            if memory.write_u64_le(slot, value).is_none() {
+                return Err(LoadError::Resolve(format!(
+                    "bind write failed at {slot:#x}"
+                )));
+            }
+        }
+
+        if need_flip {
+            let region = memory
+                .regions()
+                .get(region_idx)
+                .ok_or_else(|| LoadError::Resolve(format!("bind region lost idx {region_idx}")))?;
+            mprotect_darwin(region, restore).map_err(LoadError::Map)?;
+        }
     }
     Ok(())
 }

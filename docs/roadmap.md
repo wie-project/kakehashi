@@ -62,8 +62,8 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 | **A1** | **Guest-TLS slot cookie** (offset reserved in freestanding TLS block) | Kill most `gettid` on enter under **guest** TPIDR                           | Must **never** probe cookie while TPIDR is **host** glibc TLS; validate magic + `slot.guest_tpidr == mrs`                        |
 | **A2** | **Host-only slot / tid cache after `kh_tls_enter_host`**              | Skip second/third `gettid` in same hypercall (`alt_sp`, leave)              | Cache only after host TPIDR restored; never read host `thread_local!` under guest TPIDR                                          |
 | **A3** | **Light hypercall for hot I/O/fs numbers**                            | Skip **second** full NEON save (`TRAMP_BYTES`) when prolog already saved Q* | Keep prolog NEON; freestanding must still treat call as full C clobber or host restore is not enough for LLVM; MT gate mandatory |
-| **A4** | **Kill `readlinkat` storm**                                           | 95% errors = pure waste                                                     | Find caller (`strace -e readlinkat -k`); fix path/canonicalize/bottle symlink walk                                               |
-| **A5** | **Explain / remove excess `mprotect`**                                | 15k vs ~15 native                                                           | `strace -e mprotect -k`; do not “batch” blindly                                                                                  |
+| **A4** | **Kill `readlinkat` storm**                                           | ~~95% errors = pure waste~~ **Done** (cache `real_path`)                    | Was per-bind `canonicalize` on `libc++` alias, not path walk                                                                    |
+| **A5** | **Explain / remove excess `mprotect`**                                | ~~15k vs ~15 native~~ **Done** (batch + skip RW)                            | Was per-slot bind/rebase mprotect on already-writable DATA                                                                      |
 
 ### B — Medium (after A is green)
 
@@ -165,11 +165,13 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 
 ## Done / deferred log
 
-| Date    | Item                                                                  | Outcome                             |
-| ------- | --------------------------------------------------------------------- | ----------------------------------- |
-| 2026-07 | Hypercall MT correct (SYS_exit, NEON, alt stack, TPIDR install defer) | Correctness baseline                |
-| 2026-07 | Cookie / light entry / freestanding NEON clobber experiments          | **Failed** under `-mmt>1`; reverted |
-| —       | A1–A5 as above                                                        | Open                                |
+| Date       | Item                                                                  | Outcome                             |
+| ---------- | --------------------------------------------------------------------- | ----------------------------------- |
+| 2026-07    | Hypercall MT correct (SYS_exit, NEON, alt stack, TPIDR install defer) | Correctness baseline                |
+| 2026-07    | Cookie / light entry / freestanding NEON clobber experiments          | **Failed** under `-mmt>1`; reverted |
+| **2026-07** | **A4** `readlinkat` storm                                             | **Done** — root cause was per-bind `canonicalize` on bottle alias (`libc++`→`libSystem`). Cache `ProcessImage.real_path` once at insert; alias match uses the cache. (strace “errors” were mostly `EINVAL` from realpath probing non-symlinks, not ENOENT.) |
+| **2026-07** | **A5** excess `mprotect`                                              | **Done** — root cause was bind/rebase `write_slot_rw` doing RW↔restore **per slot** on already-writable `__DATA` (~15k identical `mprotect` on one region). Batch by region; skip mprotect when Darwin `prot` already has write. Also skip no-op mprotect after guest `mmap` when final prot is already RW. |
+| —          | A1–A3 as above                                                        | Open                                |
 
 ---
 

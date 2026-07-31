@@ -139,8 +139,8 @@ pub fn discover_7zz(explicit: Option<&Path>) -> Option<PathBuf> {
 
 /// Install a named package into the active bottle (creating the bottle if needed).
 pub fn install_package(name: &str) -> Result<InstallReport, ToolError> {
-    let package = InstallPackage::parse(name)
-        .ok_or_else(|| ToolError::UnknownPackage(name.to_owned()))?;
+    let package =
+        InstallPackage::parse(name).ok_or_else(|| ToolError::UnknownPackage(name.to_owned()))?;
     match package {
         InstallPackage::SevenZip => install_sevenzip(),
     }
@@ -288,13 +288,7 @@ fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Default guest `PATH` components (macOS-like) used when resolving bare names.
-pub const GUEST_PATH_DIRS: &[&str] = &[
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-];
+pub const GUEST_PATH_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// Resolve a program path for `kh run`.
 ///
@@ -348,7 +342,10 @@ mod tests {
 
     #[test]
     fn parse_package_names() {
-        assert_eq!(InstallPackage::parse("7zip"), Some(InstallPackage::SevenZip));
+        assert_eq!(
+            InstallPackage::parse("7zip"),
+            Some(InstallPackage::SevenZip)
+        );
         assert_eq!(InstallPackage::parse("7ZZ"), Some(InstallPackage::SevenZip));
         assert!(InstallPackage::parse("foo").is_none());
     }

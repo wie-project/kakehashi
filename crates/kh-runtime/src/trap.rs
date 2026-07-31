@@ -47,7 +47,9 @@ const fn brk_encoding(imm16: u32) -> u32 {
     clippy::manual_range_contains
 )]
 fn branch_imm26(from: u64, to: u64) -> Option<u32> {
-    let delta = i64::try_from(to).ok()?.wrapping_sub(i64::try_from(from).ok()?);
+    let delta = i64::try_from(to)
+        .ok()?
+        .wrapping_sub(i64::try_from(from).ok()?);
     if delta & 3 != 0 {
         return None;
     }
@@ -173,10 +175,7 @@ pub fn patch_svc_to_brk(regions: &mut [MappedRegion]) -> Result<usize, TrapError
     }
 }
 
-#[cfg_attr(
-    all(target_arch = "aarch64", target_os = "linux"),
-    allow(dead_code)
-)]
+#[cfg_attr(all(target_arch = "aarch64", target_os = "linux"), allow(dead_code))]
 fn patch_svc_brk_only(regions: &mut [MappedRegion]) -> Result<usize, TrapError> {
     let mut patched = 0_usize;
     for region in regions.iter_mut() {
@@ -333,11 +332,7 @@ pub fn clear_trampoline_cache() {
 ///
 /// Returns the number of sites rewritten (`b veneer` or fallback `brk`).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn patch_region_with_veneers(
-    region: &mut MappedRegion,
-    guest_base: u64,
-    sites: &[usize],
-) -> usize {
+fn patch_region_with_veneers(region: &mut MappedRegion, guest_base: u64, sites: &[usize]) -> usize {
     let n_sites = sites.len();
     let Some(hub) = install_veneer_hub(guest_base, region.host_len(), n_sites) else {
         return patch_sites_brk(region, sites);
@@ -351,7 +346,9 @@ fn patch_region_with_veneers(
         let site_va = guest_base.saturating_add(u64::try_from(off).unwrap_or(0));
         let site_ret = site_va.saturating_add(4);
         let veneer_off = hub.veneer0.saturating_add(i.saturating_mul(VENEER_BYTES));
-        let veneer_va = hub.base_va.saturating_add(u64::try_from(veneer_off).unwrap_or(0));
+        let veneer_va = hub
+            .base_va
+            .saturating_add(u64::try_from(veneer_off).unwrap_or(0));
         let end = off.saturating_add(4);
 
         let ok = write_veneer(slice, veneer_off, veneer_va, hub.shared_va, site_ret)
@@ -462,8 +459,7 @@ fn install_veneer_hub(region_guest: u64, region_len: usize, n_sites: usize) -> O
             if b_encoding(site_lo, prefer).is_none() || b_encoding(site_hi, prefer).is_none() {
                 continue;
             }
-            if let Some(ptr) =
-                crate::host::mmap(Some(prefer), map_len, prot_rw, flags_fixed, -1, 0)
+            if let Some(ptr) = crate::host::mmap(Some(prefer), map_len, prot_rw, flags_fixed, -1, 0)
             {
                 return init_hub_slice(ptr, map_len, code, veneer0);
             }
@@ -526,7 +522,8 @@ fn write_veneer(
     let slot = slice.get_mut(veneer_off..end)?;
     for (i, w) in words.iter().enumerate() {
         let o = i.saturating_mul(4);
-        slot.get_mut(o..o.saturating_add(4))?.copy_from_slice(&w.to_le_bytes());
+        slot.get_mut(o..o.saturating_add(4))?
+            .copy_from_slice(&w.to_le_bytes());
     }
     Some(())
 }
@@ -599,7 +596,16 @@ pub unsafe extern "C" fn kh_trampoline_dispatch(
         x6,
     });
     if MAX_EVENTS.load(Ordering::Relaxed) != 0 {
-        maybe_push_event(0, sys_no, result.name, x0, x1, x2, result.retval, result.error);
+        maybe_push_event(
+            0,
+            sys_no,
+            result.name,
+            x0,
+            x1,
+            x2,
+            result.retval,
+            result.error,
+        );
     }
     match result.outcome {
         TrapOutcome::Exit { code } => finish_with_exit_code(code),
@@ -855,7 +861,10 @@ fn ensure_neon_tramp() {
         KH_NEON_TRAMP_VA = va;
     }
     ONCE.store(va, Ordering::Release);
-    tracing::info!(va = format_args!("{va:#x}"), "mapped NEON tramp for hypercall");
+    tracing::info!(
+        va = format_args!("{va:#x}"),
+        "mapped NEON tramp for hypercall"
+    );
 }
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
@@ -1170,7 +1179,16 @@ unsafe extern "C" fn trap_sigaction(
 
     // Zero-cost when max_events == 0 (plain `kh run`).
     if MAX_EVENTS.load(Ordering::Relaxed) != 0 {
-        maybe_push_event(pc, sys_no, result.name, x0, x1, x2, result.retval, result.error);
+        maybe_push_event(
+            pc,
+            sys_no,
+            result.name,
+            x0,
+            x1,
+            x2,
+            result.retval,
+            result.error,
+        );
     }
 
     if let Some(ret) = result.retval {

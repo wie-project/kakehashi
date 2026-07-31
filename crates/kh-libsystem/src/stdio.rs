@@ -328,9 +328,7 @@ pub(crate) unsafe extern "C" fn fgetc(stream: *mut c_void) -> c_int {
     let mut byte = [0_u8; 1];
     let fd = unsafe { (*f).fd };
     let fd_u = u64::from(fd.cast_unsigned());
-    let n = unsafe {
-        sys::syscall3(SYS_READ, fd_u, ptr_to_u64(byte.as_mut_ptr().cast()), 1)
-    };
+    let n = unsafe { sys::syscall3(SYS_READ, fd_u, ptr_to_u64(byte.as_mut_ptr().cast()), 1) };
     if n <= 0 {
         unsafe {
             (*f).flags |= FILE_EOF;

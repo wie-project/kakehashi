@@ -6,8 +6,8 @@ use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_CLOSE, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID, SYS_GETPPID,
-    SYS_GETTIMEOFDAY, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_RENAME,
-    SYS_RMDIR, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
+    SYS_GETTIMEOFDAY, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ,
+    SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -590,10 +590,10 @@ pub(crate) unsafe extern "C" fn sysconf(name: c_int) -> i64 {
         1 => 256 * 1024, // _SC_ARG_MAX
         2 => 256,        // _SC_CHILD_MAX
         3 => 100,        // _SC_CLK_TCK
-        5 => 1024,            // _SC_OPEN_MAX (must exceed guest FD numbers)
-        6 | 7 => 1,           // _SC_JOB_CONTROL / _SC_SAVED_IDS
-        8 => 200_809,         // _SC_VERSION
-        29 => 16_384,         // _SC_PAGE_SIZE (Darwin arm64 default guest page)
+        5 => 1024,       // _SC_OPEN_MAX (must exceed guest FD numbers)
+        6 | 7 => 1,      // _SC_JOB_CONTROL / _SC_SAVED_IDS
+        8 => 200_809,    // _SC_VERSION
+        29 => 16_384,    // _SC_PAGE_SIZE (Darwin arm64 default guest page)
         // Darwin: `_SC_NPROCESSORS_CONF=57`, `_SC_NPROCESSORS_ONLN=58`.
         // (84 is a non-Darwin alias some guests probe.)
         57 | 58 | 84 => {

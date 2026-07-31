@@ -38,9 +38,8 @@ fn errno_cell_ptr() -> *mut c_int {
             if base != 0 {
                 // SAFETY: identity-mapped guest TLS when magic matches; otherwise
                 // we only read the magic word and fall back.
-                let magic = unsafe {
-                    core::ptr::with_exposed_provenance::<u64>(base).read_volatile()
-                };
+                let magic =
+                    unsafe { core::ptr::with_exposed_provenance::<u64>(base).read_volatile() };
                 if magic == GUEST_TLS_MAGIC {
                     return core::ptr::with_exposed_provenance_mut::<c_int>(
                         base.saturating_add(GUEST_TLS_ERRNO_OFF),

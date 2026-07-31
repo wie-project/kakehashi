@@ -97,7 +97,10 @@ pub(crate) unsafe extern "C" fn strcmp(s1: *const c_char, s2: *const c_char) -> 
 
 /// C `strstr` → nlist `_strstr`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn strstr(haystack: *const c_char, needle: *const c_char) -> *mut c_char {
+pub(crate) unsafe extern "C" fn strstr(
+    haystack: *const c_char,
+    needle: *const c_char,
+) -> *mut c_char {
     if haystack.is_null() || needle.is_null() {
         return core::ptr::null_mut();
     }
@@ -163,7 +166,11 @@ pub(crate) unsafe extern "C" fn strerror(errnum: c_int) -> *mut c_char {
 
 /// Darwin `memset_pattern16` → nlist `_memset_pattern16`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn memset_pattern16(b: *mut c_void, pattern16: *const c_void, len: usize) {
+pub(crate) unsafe extern "C" fn memset_pattern16(
+    b: *mut c_void,
+    pattern16: *const c_void,
+    len: usize,
+) {
     if b.is_null() || pattern16.is_null() || len == 0 {
         return;
     }
@@ -315,7 +322,11 @@ pub(crate) unsafe extern "C" fn wcsstr(haystack: *const Wchar, needle: *const Wc
 
 /// C `wmemcpy` → nlist `_wmemcpy`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn wmemcpy(dst: *mut Wchar, src: *const Wchar, n: usize) -> *mut Wchar {
+pub(crate) unsafe extern "C" fn wmemcpy(
+    dst: *mut Wchar,
+    src: *const Wchar,
+    n: usize,
+) -> *mut Wchar {
     if n > 0 && !dst.is_null() && !src.is_null() {
         let bytes = n.saturating_mul(core::mem::size_of::<Wchar>());
         // SAFETY: non-overlapping wide regions.

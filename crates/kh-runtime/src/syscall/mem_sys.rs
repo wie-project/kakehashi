@@ -103,7 +103,9 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         prot
     };
     let host_prot = darwin_to_host_prot(final_prot);
-    if !host::mprotect(base, map_len, host_prot) {
+    // mmap used PROT_READ|PROT_WRITE; skip a no-op mprotect when the guest
+    // asked for the same (hot freestanding heap path — roadmap A5).
+    if host_prot != map_prot && !host::mprotect(base, map_len, host_prot) {
         let _ = host::munmap(base, map_len);
         return SyscallResult::err(name, EPERM);
     }

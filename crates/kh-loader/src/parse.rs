@@ -491,7 +491,10 @@ mod tests {
         assert!(image.summary.fat);
         assert_eq!(image.summary.file_slice_offset, 32);
         assert_eq!(image.summary.cpu, "arm64");
-        assert_eq!(image.summary.entry, parse_bytes(&thin, "thin").unwrap().summary.entry);
+        assert_eq!(
+            image.summary.entry,
+            parse_bytes(&thin, "thin").unwrap().summary.entry
+        );
 
         let plan = image.plan(GuestPageSize::Darwin16K);
         let text = plan

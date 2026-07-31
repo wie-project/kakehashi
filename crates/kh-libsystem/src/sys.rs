@@ -174,9 +174,7 @@ pub(crate) unsafe fn syscall7(
         // SAFETY: slot is process-local; runtime writes once before guest entry.
         let hyper = unsafe { core::ptr::addr_of!(KH_BSD_HYPERCALL).read_volatile() };
         if hyper != 0 {
-            let r = unsafe {
-                hypercall_thin(hyper, a0, a1, a2, a3, a4, a5, a6, u64::from(number))
-            };
+            let r = unsafe { hypercall_thin(hyper, a0, a1, a2, a3, a4, a5, a6, u64::from(number)) };
             if r.error != 0 {
                 let err = isize::try_from(r.retval).unwrap_or(1);
                 if err > 0 {
@@ -213,11 +211,7 @@ pub(crate) unsafe fn syscall7(
         let carry = (flags & (1_u64 << 29)) != 0;
         if carry {
             let err = isize::try_from(ret).unwrap_or(1);
-            if err > 0 {
-                err.saturating_neg()
-            } else {
-                -1
-            }
+            if err > 0 { err.saturating_neg() } else { -1 }
         } else if let Ok(v) = i64::try_from(ret) {
             isize::try_from(v).unwrap_or(-1)
         } else {

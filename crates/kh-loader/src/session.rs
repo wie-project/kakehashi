@@ -84,6 +84,12 @@ pub struct ProcessImage {
     pub role: ImageRole,
     /// Host path attempted / opened.
     pub path: PathBuf,
+    /// Canonical (or best-effort absolute) path, computed **once** at insert.
+    ///
+    /// Used for duplicate detection and bottle alias matching (`libc++` →
+    /// `libSystem`) without re-running `canonicalize` / `readlinkat` on every
+    /// bind site (roadmap A4).
+    pub real_path: PathBuf,
     /// Install name from the load command (or `LC_ID_DYLIB` when mapped).
     pub install_name: String,
     /// Map outcome.
@@ -443,6 +449,7 @@ impl LoadSession {
         let main = ProcessImage {
             role: ImageRole::Main,
             path: self.executable.clone(),
+            real_path: real_path_key(&self.executable).unwrap_or_else(|| self.executable.clone()),
             install_name: self.executable.display().to_string(),
             status: ImageLoadStatus::Mapped,
             image: Some(image),
@@ -530,9 +537,8 @@ impl LoadSession {
                 continue;
             }
 
-            if let Some(key) = real_path_key(&host_path)
-                && !seen_real_paths.insert(key)
-            {
+            let key = real_path_key(&host_path).unwrap_or_else(|| host_path.clone());
+            if !seen_real_paths.insert(key.clone()) {
                 self.push_skipped_path(
                     host_path,
                     edge.install_name.clone(),
@@ -573,6 +579,7 @@ impl LoadSession {
             self.images.push(ProcessImage {
                 role: ImageRole::Dylib,
                 path: host_path,
+                real_path: key,
                 install_name: install,
                 status: ImageLoadStatus::Mapped,
                 image: Some(parsed),
@@ -605,9 +612,12 @@ impl LoadSession {
             resolve = %err,
             "skipped dylib"
         );
+        let path = PathBuf::from(path_display);
+        let real_path = real_path_key(&path).unwrap_or_else(|| path.clone());
         self.images.push(ProcessImage {
             role: ImageRole::Dylib,
-            path: PathBuf::from(path_display),
+            path,
+            real_path,
             install_name,
             status: ImageLoadStatus::Skipped(reason),
             image: None,
@@ -625,9 +635,11 @@ impl LoadSession {
         kind: DylibKind,
         reason: SkipReason,
     ) {
+        let real_path = real_path_key(&path).unwrap_or_else(|| path.clone());
         self.images.push(ProcessImage {
             role: ImageRole::Dylib,
             path,
+            real_path,
             install_name,
             status: ImageLoadStatus::Skipped(reason),
             image: None,

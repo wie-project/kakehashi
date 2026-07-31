@@ -724,8 +724,13 @@ pub fn map_stack(host: HostPageSize, size: u64) -> Result<MappedRegion, MapError
     })
 }
 
-/// Temporarily makes a region read/write (for SVC patching).
+/// Temporarily makes a region read/write (for SVC patching / bind writes).
+///
+/// No-op when Darwin `prot` already includes write (host mapping is already RW).
 pub fn mprotect_rw(region: &MappedRegion) -> Result<(), MapError> {
+    if region.prot & VM_PROT_WRITE != 0 {
+        return Ok(());
+    }
     if host::mprotect(region.ptr, region.len, libc::PROT_READ | libc::PROT_WRITE) {
         Ok(())
     } else {

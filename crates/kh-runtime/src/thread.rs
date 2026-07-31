@@ -294,7 +294,8 @@ mod linux {
         if magic != KH_THREAD_MAGIC {
             return None;
         }
-        let tsd_ptr = std::ptr::with_exposed_provenance::<u64>(base.saturating_add(KH_THREAD_TSD_OFF));
+        let tsd_ptr =
+            std::ptr::with_exposed_provenance::<u64>(base.saturating_add(KH_THREAD_TSD_OFF));
         let tsd = unsafe { core::ptr::read_volatile(tsd_ptr) };
         if tsd == 0 {
             return None;

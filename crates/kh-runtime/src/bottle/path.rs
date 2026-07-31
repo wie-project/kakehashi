@@ -161,7 +161,10 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
         // SAFETY: identity map — guest VA == host VA for mapped pages.
         let byte = unsafe { *base_ptr.wrapping_add(i) };
         if byte == 0 {
-            return stack.get(..i).and_then(|s| std::str::from_utf8(s).ok()).map(str::to_owned);
+            return stack
+                .get(..i)
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .map(str::to_owned);
         }
         if let Some(slot) = stack.get_mut(i) {
             *slot = byte;
@@ -246,8 +249,7 @@ mod tests {
     #[test]
     fn fast_path_dots_in_name_ok() {
         let root = Path::new("/b");
-        let host = translate_path_with_root(Some(root), "/foo..bar")
-            .expect("dots in name");
+        let host = translate_path_with_root(Some(root), "/foo..bar").expect("dots in name");
         assert_eq!(host, PathBuf::from("/b/foo..bar"));
     }
 }

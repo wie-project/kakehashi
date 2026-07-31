@@ -9,8 +9,8 @@ use crate::mem::registry_check_range;
 use crate::host;
 
 use super::common::{
-    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, guest_write, reg_as_i32,
-    reg_as_i64,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, guest_write,
+    reg_as_i32, reg_as_i64,
 };
 use super::fd::guest_to_host_fd;
 

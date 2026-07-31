@@ -264,9 +264,7 @@ impl ImagePlan {
                 vmaddr: seg.vmaddr,
                 vmsize: seg.vmsize,
                 // On-disk offset = thin-relative fileoff + fat container slice base.
-                fileoff: seg
-                    .fileoff
-                    .saturating_add(image.summary.file_slice_offset),
+                fileoff: seg.fileoff.saturating_add(image.summary.file_slice_offset),
                 filesize: seg.filesize,
                 guest_aligned_addr: aligned_addr,
                 guest_aligned_end: aligned_end,
