@@ -71,4 +71,4 @@ Live run of `memory_file_roundtrip.macho` needs CWD such that
 The shared mapping mutates the first payload byte to `X`; restore the file
 before re-running if you need a clean pass.
 
-License: same as the repository (LGPL-3.0-only). No proprietary Apple code.
+License: same as the repository (Apache-2.0). No proprietary Apple code.

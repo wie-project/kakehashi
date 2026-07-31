@@ -57,32 +57,31 @@ Priority is **guest surface**, not another ×5→×4 micro-pass:
 
 | Priority | Direction | Notes |
 | --- | --- | --- |
-| 1 | **curl** (network CLI) | **Active.** Sockets/poll/DNS; installer; HTTP gate. See [curl.md](curl.md) |
-| 2 | **git** | Larger surface (process, pipes, many FS ops); better after sockets + more POSIX |
-| — | Optional polish | `getrusage` / Usage% for 7zz; not a gate |
+| 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
+| 2 | **git** | **Next product slice.** Process/spawn, more pipes/FS; remotes reuse curl network |
+| — | Optional polish | `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen; not gates |
 
-Rationale for curl before git: smaller vertical slice, forces network ABI,
-reuses existing FS/thread foundation. Git exercises more of the world but
-depends on process/spawn, pipes, and often network for remotes — higher
-risk before sockets exist.
+Rationale: curl was the smaller vertical slice that forced network ABI on top
+of FS/threads. Git is larger (process model, more POSIX) but remotes can reuse
+the curl network path.
 
-### Curl milestone (active) — **trace-first**
+### Curl milestone — **done** (trace-first)
 
-Do **not** land speculative socket tables without a probe log. Method and
-artifacts: [curl.md](curl.md).
+Method and commands: [curl.md](curl.md). User-facing recipes:
+[README — What works](../README.md#what-works).
 
 | Slice | State |
 | --- | --- |
-| `kh install curl` (download URL + optional `KAKEHASHI_CURL`) | done |
-| Guest path `/usr/local/bin/curl` | done |
-| `scripts/docker-curl.sh` (+ probe wrapper) | done |
-| G2: first real ENOSYS / load log from Darwin curl | **next** (run probe) |
-| Handlers only for numbers seen in G2 | blocked on probe |
-| Gate: HTTP GET under `kh` (Docker/Colima) | after G2-driven surface |
-| HTTPS / static TLS binary | deferred |
-| UTM bare-metal confirm | later |
+| `kh install curl` (+ optional `KAKEHASHI_CURL`) | done |
+| Guest `/usr/local/bin/curl` + bottle CA seed | done |
+| `scripts/docker-curl.sh` (+ probe) | done |
+| G1 `--version` | **pass** |
+| G3 HTTP GET body + exit 0 | **pass** (Docker + UTM) |
+| G4 HTTPS GET (OpenSSL + CA) | **pass** (Docker) |
+| G5 UTM HTTP confirm | **pass** |
+| Remaining | polish only (HTTPS UTM smoke, broader CLI flags, soft-framework quieting) |
 
-Process notes for curl PRs: internet allowed for live tests; clippy `-D warnings`;
+Process notes for curl polish PRs: internet allowed; clippy `-D warnings`;
 keep `7zz -mmt=4` green; clean-room only (no Darling).
 
 ## Process

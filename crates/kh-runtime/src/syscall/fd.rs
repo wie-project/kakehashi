@@ -118,14 +118,14 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
         }
         // curl `-o nested/file`: parent may not exist yet. With O_CREAT, make
         // parents under the bottle (openat relative) and retry once.
-        if creat {
-            if let Some(parent) = std::path::Path::new(rel).parent() {
-                if !parent.as_os_str().is_empty() && parent != std::path::Path::new(".") {
-                    drop(mkdirat_p(dirfd, parent));
-                    if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
-                        return finish_open(name, rc);
-                    }
-                }
+        if creat
+            && let Some(parent) = std::path::Path::new(rel).parent()
+            && !parent.as_os_str().is_empty()
+            && parent != std::path::Path::new(".")
+        {
+            drop(mkdirat_p(dirfd, parent));
+            if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
+                return finish_open(name, rc);
             }
         }
         log_open_fail(path, "ENOENT(openat)");
@@ -145,14 +145,13 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     }
     // Relative `-o .tmp/out/body` (host CWD) or absolute under bottle: create
     // missing parents when the guest asked for O_CREAT (fopen "w" / curl -o).
-    if creat {
-        if let Some(parent) = host_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                drop(std::fs::create_dir_all(parent));
-                if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
-                    return finish_open(name, rc);
-                }
-            }
+    if creat
+        && let Some(parent) = host_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        drop(std::fs::create_dir_all(parent));
+        if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
+            return finish_open(name, rc);
         }
     }
     log_open_fail(path, "ENOENT");
@@ -177,16 +176,12 @@ fn mkdirat_p(dirfd: RawFd, rel: &std::path::Path) -> std::io::Result<()> {
     let mut cur = std::path::PathBuf::new();
     for comp in rel.components() {
         use std::path::Component;
-        match comp {
-            Component::Normal(s) => {
-                cur.push(s);
-                let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) else {
-                    continue;
-                };
-                host::mkdirat(dirfd, &c, 0o755)?;
-            }
-            Component::CurDir => {}
-            _ => {}
+        if let Component::Normal(s) = comp {
+            cur.push(s);
+            let Ok(c) = std::ffi::CString::new(cur.as_os_str().as_encoded_bytes()) else {
+                continue;
+            };
+            host::mkdirat(dirfd, &c, 0o755)?;
         }
     }
     Ok(())

@@ -10,9 +10,10 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
 | [Roadmap](roadmap.md) | Perf status, next work, process |
-| [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates |
+| [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |
 
-User-facing install and CI economics: root [`README.md`](../README.md).
+User-facing install, **what works** (7zz + curl recipes), and CI economics:
+root [`README.md`](../README.md).
 
 ## Sources of truth (code)
 
