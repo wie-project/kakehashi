@@ -317,18 +317,27 @@ fn handle_wake(args: SyscallArgs) -> SyscallResult {
 }
 
 /// Block while `*addr == expected` (Linux futex; portable fallback = yield).
+///
+/// Uses a **bounded wait** (50 ms) so a lost guest wake cannot wedgelock
+/// multi-thread `7zz -tzip -mmt≥3` forever. Callers recheck the word in a
+/// loop (`pthread_mutex` / `pthread_cond` / join).
 fn park_u32(addr: *mut u32, expected: u32) {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         // SAFETY: guest identity-mapped u32; FUTEX_WAIT returns if value ≠ expected.
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000, // 50 ms safety-net against lost wakeups
+        };
         unsafe {
-            // SYS_futex = 98 on aarch64 Linux. FUTEX_WAIT = 0.
+            // SYS_futex = 98 on aarch64 Linux.
+            // FUTEX_WAIT_PRIVATE = 0 | 128 — same-process guest threads only.
             let _ = libc::syscall(
                 libc::SYS_futex,
                 addr,
-                0_i32, // FUTEX_WAIT
+                128_i32, // FUTEX_WAIT_PRIVATE
                 expected,
-                core::ptr::null::<libc::timespec>(),
+                core::ptr::from_ref(&ts),
                 core::ptr::null_mut::<u32>(),
                 0_i32,
             );
@@ -350,7 +359,7 @@ fn wake_u32(addr: *mut u32, n: i32) -> i32 {
             libc::syscall(
                 libc::SYS_futex,
                 addr,
-                1_i32, // FUTEX_WAKE
+                129_i32, // FUTEX_WAKE_PRIVATE
                 n,
                 core::ptr::null::<libc::timespec>(),
                 core::ptr::null_mut::<u32>(),

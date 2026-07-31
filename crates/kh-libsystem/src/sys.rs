@@ -12,10 +12,16 @@ pub(crate) const SYS_OPEN: u32 = 5;
 pub(crate) const SYS_CLOSE: u32 = 6;
 /// BSD `unlink`.
 pub(crate) const SYS_UNLINK: u32 = 10;
+/// BSD `link` (hard link).
+pub(crate) const SYS_LINK: u32 = 9;
 /// BSD `getpid`.
 pub(crate) const SYS_GETPID: u32 = 20;
 /// BSD `getppid`.
 pub(crate) const SYS_GETPPID: u32 = 39;
+/// BSD `symlink`.
+pub(crate) const SYS_SYMLINK: u32 = 57;
+/// BSD `readlink`.
+pub(crate) const SYS_READLINK: u32 = 58;
 /// BSD `munmap`.
 pub(crate) const SYS_MUNMAP: u32 = 73;
 /// BSD `fsync`.

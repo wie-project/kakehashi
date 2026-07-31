@@ -15,6 +15,8 @@ pub enum BsdSyscall {
     Close,
     /// `getpid`.
     Getpid,
+    /// `getppid`.
+    Getppid,
     /// `access`.
     Access,
     /// `issetugid`.
@@ -41,6 +43,12 @@ pub enum BsdSyscall {
     Lstat,
     /// `unlink`.
     Unlink,
+    /// `link` (hard link).
+    Link,
+    /// `symlink`.
+    Symlink,
+    /// `readlink`.
+    Readlink,
     /// `mkdir`.
     Mkdir,
     /// `rmdir`.
@@ -88,6 +96,7 @@ impl BsdSyscall {
             Self::Open => "open",
             Self::Close => "close",
             Self::Getpid => "getpid",
+            Self::Getppid => "getppid",
             Self::Access => "access",
             Self::Issetugid => "issetugid",
             Self::Munmap => "munmap",
@@ -101,6 +110,9 @@ impl BsdSyscall {
             Self::Fstat => "fstat",
             Self::Lstat => "lstat",
             Self::Unlink => "unlink",
+            Self::Link => "link",
+            Self::Symlink => "symlink",
+            Self::Readlink => "readlink",
             Self::Mkdir => "mkdir",
             Self::Rmdir => "rmdir",
             Self::Rename => "rename",
@@ -131,9 +143,13 @@ impl BsdSyscall {
             Self::Open => 5,
             Self::Close => 6,
             Self::Unlink => 10,
+            Self::Link => 9,
             Self::Getpid => 20,
+            Self::Getppid => 39,
             Self::Access => 33,
             Self::Dup => 41,
+            Self::Symlink => 57,
+            Self::Readlink => 58,
             Self::Sigaction => 46,
             Self::Sigprocmask => 48,
             Self::Msync => 65,
@@ -175,12 +191,16 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         4 | 397 => Some(BsdSyscall::Write),
         5 | 398 => Some(BsdSyscall::Open),
         6 | 399 => Some(BsdSyscall::Close),
+        9 => Some(BsdSyscall::Link),
         10 | 401 => Some(BsdSyscall::Unlink),
         20 => Some(BsdSyscall::Getpid),
         33 => Some(BsdSyscall::Access),
+        39 => Some(BsdSyscall::Getppid),
         41 => Some(BsdSyscall::Dup),
         46 => Some(BsdSyscall::Sigaction),
         48 => Some(BsdSyscall::Sigprocmask),
+        57 => Some(BsdSyscall::Symlink),
+        58 => Some(BsdSyscall::Readlink),
         65 => Some(BsdSyscall::Msync),
         73 => Some(BsdSyscall::Munmap),
         74 => Some(BsdSyscall::Mprotect),
@@ -230,9 +250,12 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (6, "close"),
         (20, "getpid"),
         (33, "access"),
+        (39, "getppid"),
         (41, "dup"),
         (46, "sigaction"),
         (48, "sigprocmask"),
+        (57, "symlink"),
+        (58, "readlink"),
         (65, "msync"),
         (73, "munmap"),
         (74, "mprotect"),
@@ -244,6 +267,7 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (266, "clock_gettime"),
         (274, "sysctlbyname"),
         (327, "issetugid"),
+        (9, "link"),
         (10, "unlink"),
         (95, "fsync"),
         (128, "rename"),

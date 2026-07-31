@@ -247,6 +247,108 @@ pub(crate) fn handle_rename(args: SyscallArgs) -> SyscallResult {
     }
 }
 
+/// Map common host `errno` values to Darwin numbers we surface.
+fn map_host_errno(host: i32) -> i64 {
+    match host {
+        e if e == libc::ENOENT => ENOENT,
+        e if e == libc::EINVAL => EINVAL,
+        e if e == libc::EEXIST => EEXIST,
+        e if e == libc::EFAULT => EFAULT,
+        e if e == libc::EPERM || e == libc::EACCES => EPERM,
+        _ => EPERM,
+    }
+}
+
+/// `readlink` — path `x0`, buf `x1`, count `x2` (no trailing NUL).
+pub(crate) fn handle_readlink(args: SyscallArgs) -> SyscallResult {
+    let name = "readlink";
+    if !registry_check_range(args.x0, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let count = usize::try_from(args.x2).unwrap_or(0);
+    if count > 0 && !registry_check_range(args.x1, count, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(path) = bottle::read_c_string(args.x0, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(host_path) = translate_path(&path) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let mut buf = vec![0_u8; count];
+    match host::readlink_path(&c_path, &mut buf) {
+        Ok(n) => {
+            if let Some(slice) = buf.get(..n).filter(|s| !s.is_empty()) {
+                guest_write(args.x1, slice);
+            }
+            SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
+        }
+        Err(e) => SyscallResult::err(name, map_host_errno(e)),
+    }
+}
+
+/// `symlink` — target `x0` (opaque string), link path `x1` (translated).
+pub(crate) fn handle_symlink(args: SyscallArgs) -> SyscallResult {
+    let name = "symlink";
+    if !registry_check_range(args.x0, 1, false) || !registry_check_range(args.x1, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(target) = bottle::read_c_string(args.x0, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Some(link) = bottle::read_c_string(args.x1, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    // Target is stored as-is (guest path string); only the link node is translated.
+    let Ok(c_target) = std::ffi::CString::new(target) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(host_link) = translate_path(&link) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    let Ok(c_link) = std::ffi::CString::new(host_link.as_os_str().as_encoded_bytes()) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    match host::symlink_path(&c_target, &c_link) {
+        Ok(()) => SyscallResult::ok(name, 0),
+        Err(e) => SyscallResult::err(name, map_host_errno(e)),
+    }
+}
+
+/// `link` — existing `x0`, new name `x1` (hard link).
+pub(crate) fn handle_link(args: SyscallArgs) -> SyscallResult {
+    let name = "link";
+    if !registry_check_range(args.x0, 1, false) || !registry_check_range(args.x1, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(existing) = bottle::read_c_string(args.x0, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Some(newpath) = bottle::read_c_string(args.x1, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(host_existing) = translate_path(&existing) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    let Ok(host_new) = translate_path(&newpath) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    let Ok(c_existing) = std::ffi::CString::new(host_existing.as_os_str().as_encoded_bytes())
+    else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(c_new) = std::ffi::CString::new(host_new.as_os_str().as_encoded_bytes()) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    match host::link_path(&c_existing, &c_new) {
+        Ok(()) => SyscallResult::ok(name, 0),
+        Err(e) => SyscallResult::err(name, map_host_errno(e)),
+    }
+}
+
 /// `ftruncate` — fd `x0`, length `x1`.
 pub(crate) fn handle_ftruncate(args: SyscallArgs) -> SyscallResult {
     let name = "ftruncate";

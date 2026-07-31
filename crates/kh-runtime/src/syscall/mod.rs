@@ -10,7 +10,7 @@
 //! - [`io`] — read/write
 //! - [`fs`] — access/stat/fstat
 //! - [`mem_sys`] — mmap/mprotect/munmap/msync
-//! - [`process`] — exit/getpid/issetugid
+//! - [`process`] — exit/getpid/getppid/issetugid
 //! - [`thread_sys`] — bsdthread_*/thread_selfid
 //! - [`time_sys`] — gettimeofday/clock_gettime
 //! - [`sysctl`] — sysctl/sysctlbyname
@@ -80,6 +80,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Open) => fd::handle_open(args),
         Some(BsdSyscall::Close) => fd::handle_close(args),
         Some(BsdSyscall::Getpid) => process::handle_getpid(),
+        Some(BsdSyscall::Getppid) => process::handle_getppid(),
         Some(BsdSyscall::Access) => fs::handle_access(args),
         Some(BsdSyscall::Issetugid) => process::handle_issetugid(),
         Some(BsdSyscall::Munmap) => mem_sys::handle_munmap(args),
@@ -93,6 +94,9 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Fstat) => fs::handle_fstat(args),
         Some(BsdSyscall::Lstat) => fs::handle_lstat(args),
         Some(BsdSyscall::Unlink) => fs::handle_unlink(args),
+        Some(BsdSyscall::Link) => fs::handle_link(args),
+        Some(BsdSyscall::Symlink) => fs::handle_symlink(args),
+        Some(BsdSyscall::Readlink) => fs::handle_readlink(args),
         Some(BsdSyscall::Mkdir) => fs::handle_mkdir(args),
         Some(BsdSyscall::Rmdir) => fs::handle_rmdir(args),
         Some(BsdSyscall::Rename) => fs::handle_rename(args),
@@ -244,6 +248,16 @@ mod tests {
         reset_syscall_state(256);
         let r = dispatch(args(20, 0, 0, 0));
         assert_eq!(r.name, "getpid");
+        assert!(!r.error);
+        assert!(r.retval.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn getppid_positive() {
+        let _g = lock_syscalls();
+        reset_syscall_state(256);
+        let r = dispatch(args(39, 0, 0, 0));
+        assert_eq!(r.name, "getppid");
         assert!(!r.error);
         assert!(r.retval.unwrap_or(0) > 0);
     }

@@ -198,6 +198,41 @@ pub fn fsync_fd(fd: RawFd) -> Option<()> {
     if rc == 0 { Some(()) } else { None }
 }
 
+/// `readlink(path)` into `buf` (no trailing NUL). Returns bytes written or host errno.
+pub fn readlink_path(path: &std::ffi::CStr, buf: &mut [u8]) -> Result<usize, i32> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    // SAFETY: path is a valid C string; buffer is writable for `buf.len()`.
+    let n = unsafe { libc::readlink(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+    }
+    usize::try_from(n).map_err(|_| libc::EIO)
+}
+
+/// `symlink(target, linkpath)`.
+pub fn symlink_path(target: &std::ffi::CStr, linkpath: &std::ffi::CStr) -> Result<(), i32> {
+    // SAFETY: both are valid C strings for the duration of the call.
+    let rc = unsafe { libc::symlink(target.as_ptr(), linkpath.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    }
+}
+
+/// `link(existing, newpath)` hard link.
+pub fn link_path(existing: &std::ffi::CStr, newpath: &std::ffi::CStr) -> Result<(), i32> {
+    // SAFETY: both are valid C strings for the duration of the call.
+    let rc = unsafe { libc::link(existing.as_ptr(), newpath.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+    }
+}
+
 /// Host `gettimeofday` (timezone ignored).
 pub fn gettimeofday() -> Option<libc::timeval> {
     // SAFETY: stack timeval; null tz pointer is allowed.

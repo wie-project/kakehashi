@@ -400,11 +400,12 @@ mod linux {
 
     fn futex_wake(addr: *mut u32, n: i32) {
         // SAFETY: same identity-mapped word guests park on via KH_HELPER_PARK.
+        // FUTEX_WAKE_PRIVATE (129) must match `helpers::wake_u32` (park uses PRIVATE).
         let _ = unsafe {
             libc::syscall(
                 libc::SYS_futex,
                 addr,
-                1_i32, // FUTEX_WAKE
+                129_i32, // FUTEX_WAKE_PRIVATE
                 n,
                 core::ptr::null::<libc::timespec>(),
                 core::ptr::null_mut::<u32>(),

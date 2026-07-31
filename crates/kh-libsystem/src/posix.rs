@@ -6,8 +6,9 @@ use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_CLOSE, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID, SYS_GETPPID,
-    SYS_GETTIMEOFDAY, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ,
-    SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
+    SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ,
+    SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME,
+    SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -318,27 +319,48 @@ pub(crate) unsafe extern "C" fn chown(_path: *const c_char, _uid: u32, _gid: u32
     not_impl(b"[kh-libsystem] chown ENOSYS\n")
 }
 
-/// C `link` → nlist `_link`.
+/// C `link` → nlist `_link` (hard link: `path` → existing, `link` → new name).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn link(_path1: *const c_char, _path2: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] link ENOSYS\n")
+pub(crate) unsafe extern "C" fn link(path: *const c_char, link: *const c_char) -> c_int {
+    if path.is_null() || link.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall2(SYS_LINK, ptr_u64(path.cast()), ptr_u64(link.cast())) };
+    ret_c_int(ret)
 }
 
-/// C `symlink` → nlist `_symlink`.
+/// C `symlink` → nlist `_symlink` (`path` = target, `link` = new symlink path).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn symlink(_path1: *const c_char, _path2: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] symlink ENOSYS\n")
+pub(crate) unsafe extern "C" fn symlink(path: *const c_char, link: *const c_char) -> c_int {
+    if path.is_null() || link.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall2(SYS_SYMLINK, ptr_u64(path.cast()), ptr_u64(link.cast())) };
+    ret_c_int(ret)
 }
 
-/// C `readlink` → nlist `_readlink`.
+/// C `readlink` → nlist `_readlink` (bytes written; no trailing NUL).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn readlink(
-    _path: *const c_char,
-    _buf: *mut c_char,
-    _bufsize: usize,
+    path: *const c_char,
+    buf: *mut c_char,
+    bufsize: usize,
 ) -> isize {
-    let _ = not_impl(b"[kh-libsystem] readlink ENOSYS\n");
-    -1
+    if path.is_null() || buf.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_READLINK,
+            ptr_u64(path.cast()),
+            ptr_u64(buf.cast()),
+            u64::try_from(bufsize).unwrap_or(0),
+        )
+    };
+    apply_ret(ret)
 }
 
 /// C `umask` → nlist `_umask` (returns previous fixed mask).

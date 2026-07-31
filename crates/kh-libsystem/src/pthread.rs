@@ -337,12 +337,13 @@ pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_in
         return EINVAL;
     }
     let w = unsafe { &*mutex_word(mutex) };
-    // LOCKED(1) → fetch_sub → 0, no wake (uncontended hot path).
-    // CONTENDED(2) → fetch_sub → 1, then clear + wake one waiter.
-    let prev = w.fetch_sub(1, Ordering::Release);
-    if prev != MUTEX_LOCKED {
-        w.store(MUTEX_UNLOCKED, Ordering::Release);
-        wake_word(w, 1);
+    // Swap to 0 (not fetch_sub): avoids a transient LOCKED(1) window after
+    // CONTENDED that can strand waiters under zip multi-thread compress.
+    // Uncontended LOCKED → no wake; CONTENDED → wake all waiters (zip MT
+    // can have several threads on the same mutex after a cond broadcast).
+    let prev = w.swap(MUTEX_UNLOCKED, Ordering::Release);
+    if prev == MUTEX_CONTENDED {
+        wake_word(w, u32::MAX);
     }
     0
 }
@@ -351,12 +352,11 @@ pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_in
 //
 // Layout inside opaque `pthread_cond_t` (Darwin ≥ 40 B opaque; we use 8 B):
 //   word0 @0: generation (futex wait word)
-//   word1 @4: nwaiters (approx; signal/broadcast skip FUTEX_WAKE when 0)
+//   word1 @4: nwaiters (diagnostic / optional wake elision)
 //
-// UTM 8k-file after F1: park almost all `other(cond)`; wake almost all
-// `n=broad` with ~half `woken0`. Root cause was signal≡broadcast + always-wake.
-// Must always bump generation (lost-wakeup if we skip when nwaiters==0 and a
-// waiter is between snapshot and waiters++). Only the WAKE is optional.
+// Always bump generation. Wake is **not** elided on nwaiters==0: zip MT
+// (`7zz a -tzip -mmt≥3`) deadlocked when a notify raced a waiter that had not
+// yet published nwaiters (and related heap-lock inversion amplified it).
 
 #[inline]
 fn cond_gen(cond: *mut c_void) -> *mut AtomicU32 {
@@ -396,8 +396,7 @@ pub(crate) unsafe extern "C" fn pthread_cond_destroy(cond: *mut c_void) -> c_int
 
 /// C `pthread_cond_wait` → nlist `_pthread_cond_wait`.
 ///
-/// Generation wait via host futex park (not yield-spin). Advertises waiters
-/// so signal/broadcast can skip empty wakes.
+/// Generation wait via host futex park (not yield-spin).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     if cond.is_null() || mutex.is_null() {
@@ -405,9 +404,11 @@ pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut
     }
     let generation = unsafe { &*cond_gen(cond) };
     let waiters = unsafe { &*cond_waiters(cond) };
-    let snapshot = generation.load(Ordering::Acquire);
-    // Publish before unlock so a concurrent signal sees nwaiters > 0.
+    // Advertise waiters *before* sampling generation so a concurrent notify
+    // that still elides (older dylibs) is less likely to race; we always wake
+    // now, but ordering still matters for the generation snapshot.
     waiters.fetch_add(1, Ordering::AcqRel);
+    let snapshot = generation.load(Ordering::Acquire);
     let _ = unsafe { pthread_mutex_unlock(mutex) };
     while generation.load(Ordering::Acquire) == snapshot {
         park_word(generation, snapshot);
@@ -417,16 +418,13 @@ pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut
     0
 }
 
-/// Bump generation; wake only if someone is in `pthread_cond_wait`.
+/// Bump generation and always futex-wake (wake_n waiters).
 #[inline]
 fn cond_notify(cond: *mut c_void, wake_n: u32) {
     let generation = unsafe { &*cond_gen(cond) };
-    let waiters = unsafe { &*cond_waiters(cond) };
-    // Always advance generation (prevents lost wakeup across waiters++ race).
     let _ = generation.fetch_add(1, Ordering::Release);
-    if waiters.load(Ordering::Acquire) > 0 {
-        wake_word(generation, wake_n);
-    }
+    // Always wake: eliding on nwaiters==0 lost wakeups under zip -mmt≥3.
+    wake_word(generation, wake_n);
 }
 
 /// C `pthread_cond_broadcast` → nlist `_pthread_cond_broadcast`.

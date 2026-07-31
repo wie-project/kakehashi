@@ -6,11 +6,12 @@
 //! keeps multi‑MiB allocate/free churn alive.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::errno;
 use crate::sys::{self, SYS_MMAP, SYS_MUNMAP};
 use crate::trace;
+use crate::{KH_HELPER_PARK, KH_HELPER_WAKE};
 
 const ALIGN: usize = 16;
 /// Larger arena cuts mmap/munmap trap traffic for 7zz-class working sets.
@@ -52,21 +53,80 @@ static ARENA: Arena = Arena {
     free_head: core::cell::UnsafeCell::new(core::ptr::null_mut()),
 };
 
-static HEAP_LOCK: AtomicBool = AtomicBool::new(false);
+// Futex-style heap lock (same 0/1/2 protocol as freestanding pthread_mutex).
+// Pure spin deadlocks under zip MT: a worker can hold HEAP_LOCK then park on a
+// guest mutex while another holds that mutex and needs malloc (spin forever).
+const HEAP_UNLOCKED: u32 = 0;
+const HEAP_LOCKED: u32 = 1;
+const HEAP_CONTENDED: u32 = 2;
+
+static HEAP_LOCK: AtomicU32 = AtomicU32::new(HEAP_UNLOCKED);
+
+#[inline]
+fn park_u32(word: &AtomicU32, expected: u32) {
+    let addr = u64::try_from(core::ptr::from_ref(word).addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_PARK, addr, u64::from(expected)) };
+}
+
+#[inline]
+fn wake_u32(word: &AtomicU32, n: u32) {
+    let addr = u64::try_from(core::ptr::from_ref(word).addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_WAKE, addr, u64::from(n)) };
+}
 
 #[inline]
 fn lock() {
-    while HEAP_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
+    if HEAP_LOCK
+        .compare_exchange(
+            HEAP_UNLOCKED,
+            HEAP_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok()
     {
-        core::hint::spin_loop();
+        return;
+    }
+    loop {
+        for _ in 0..32_u32 {
+            let cur = HEAP_LOCK.load(Ordering::Relaxed);
+            if cur == HEAP_UNLOCKED {
+                if HEAP_LOCK
+                    .compare_exchange(
+                        HEAP_UNLOCKED,
+                        HEAP_LOCKED,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            } else if cur == HEAP_LOCKED {
+                let _ = HEAP_LOCK.compare_exchange(
+                    HEAP_LOCKED,
+                    HEAP_CONTENDED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+            core::hint::spin_loop();
+        }
+        let prev = HEAP_LOCK.swap(HEAP_CONTENDED, Ordering::Acquire);
+        if prev == HEAP_UNLOCKED {
+            return;
+        }
+        park_u32(&HEAP_LOCK, HEAP_CONTENDED);
     }
 }
 
 #[inline]
 fn unlock() {
-    HEAP_LOCK.store(false, Ordering::Release);
+    // Clear to 0 in one step (avoids intermediate "locked" after contended).
+    let prev = HEAP_LOCK.swap(HEAP_UNLOCKED, Ordering::Release);
+    if prev == HEAP_CONTENDED {
+        wake_u32(&HEAP_LOCK, u32::MAX);
+    }
 }
 
 #[inline]
