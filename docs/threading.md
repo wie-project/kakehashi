@@ -170,7 +170,10 @@ while host TPIDR is live).
 
 Guest mutex/cond use host futex helpers (`KH_HELPER_PARK` / `KH_HELPER_WAKE`)
 with short spin then park. Mutex is a 0/1/2 futex word: unlock wakes only when
-the lock was contended (`2`). Do not reintroduce yield-SVC storms for locks.
+the lock was contended (`2`). Cond is generation (`word0`) + waiter count
+(`word1`): always bump generation on signal/broadcast; issue `FUTEX_WAKE` only
+when `nwaiters > 0`; **signal wakes one**, broadcast wakes all. Do not reintroduce
+yield-SVC storms or signal≡always-broadcast.
 
 **Diagnose residual futex** (host only, no guest change):
 
@@ -185,8 +188,8 @@ KAKEHASHI_FUTEX_STATS=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 …
 | ------ | ------- |
 | `exp1` high after F1 commit | Bottle dylib is **pre-F1** — rebuild `kh`, `kh bottle ensure --libsystem …` |
 | `exp2` high, `wake` ≈ park | Real mutex contention (7zz work queues) |
-| `other` high | `pthread_cond_*` generation park/broadcast |
-| `woken0` ≈ `wake` total | Always-wake / no waiters (old unlock path) |
+| `other` high, `n=broad` high | Cond traffic; after F1c expect fewer `woken0` + more `n=1` if apps use signal |
+| `woken0` ≈ `wake` total | Empty wakes (pre-F1c cond or pre-F1 mutex) |
 
 ## Environment
 

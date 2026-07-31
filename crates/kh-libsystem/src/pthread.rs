@@ -347,11 +347,26 @@ pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_in
     0
 }
 
-// ── cond (first word = generation) ──────────────────────────────────────────
+// ── cond (generation + waiter count) ────────────────────────────────────────
+//
+// Layout inside opaque `pthread_cond_t` (Darwin ≥ 40 B opaque; we use 8 B):
+//   word0 @0: generation (futex wait word)
+//   word1 @4: nwaiters (approx; signal/broadcast skip FUTEX_WAKE when 0)
+//
+// UTM 8k-file after F1: park almost all `other(cond)`; wake almost all
+// `n=broad` with ~half `woken0`. Root cause was signal≡broadcast + always-wake.
+// Must always bump generation (lost-wakeup if we skip when nwaiters==0 and a
+// waiter is between snapshot and waiters++). Only the WAKE is optional.
 
 #[inline]
-fn cond_word(cond: *mut c_void) -> *mut AtomicU32 {
+fn cond_gen(cond: *mut c_void) -> *mut AtomicU32 {
     cond.cast::<AtomicU32>()
+}
+
+#[inline]
+fn cond_waiters(cond: *mut c_void) -> *mut AtomicU32 {
+    // SAFETY: caller ensures non-null cond; +4 within opaque pthread_cond_t.
+    unsafe { cond.cast::<AtomicU32>().add(1) }
 }
 
 /// C `pthread_cond_init` → nlist `_pthread_cond_init`.
@@ -364,7 +379,8 @@ pub(crate) unsafe extern "C" fn pthread_cond_init(
         return EINVAL;
     }
     unsafe {
-        (*cond_word(cond)).store(0, Ordering::Relaxed);
+        (*cond_gen(cond)).store(0, Ordering::Relaxed);
+        (*cond_waiters(cond)).store(0, Ordering::Relaxed);
     }
     0
 }
@@ -380,20 +396,37 @@ pub(crate) unsafe extern "C" fn pthread_cond_destroy(cond: *mut c_void) -> c_int
 
 /// C `pthread_cond_wait` → nlist `_pthread_cond_wait`.
 ///
-/// Generation wait via host futex park (not yield-spin).
+/// Generation wait via host futex park (not yield-spin). Advertises waiters
+/// so signal/broadcast can skip empty wakes.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int {
     if cond.is_null() || mutex.is_null() {
         return EINVAL;
     }
-    let c = unsafe { &*cond_word(cond) };
-    let snapshot = c.load(Ordering::Acquire);
+    let generation = unsafe { &*cond_gen(cond) };
+    let waiters = unsafe { &*cond_waiters(cond) };
+    let snapshot = generation.load(Ordering::Acquire);
+    // Publish before unlock so a concurrent signal sees nwaiters > 0.
+    waiters.fetch_add(1, Ordering::AcqRel);
     let _ = unsafe { pthread_mutex_unlock(mutex) };
-    while c.load(Ordering::Acquire) == snapshot {
-        park_word(c, snapshot);
+    while generation.load(Ordering::Acquire) == snapshot {
+        park_word(generation, snapshot);
     }
+    waiters.fetch_sub(1, Ordering::AcqRel);
     let _ = unsafe { pthread_mutex_lock(mutex) };
     0
+}
+
+/// Bump generation; wake only if someone is in `pthread_cond_wait`.
+#[inline]
+fn cond_notify(cond: *mut c_void, wake_n: u32) {
+    let generation = unsafe { &*cond_gen(cond) };
+    let waiters = unsafe { &*cond_waiters(cond) };
+    // Always advance generation (prevents lost wakeup across waiters++ race).
+    let _ = generation.fetch_add(1, Ordering::Release);
+    if waiters.load(Ordering::Acquire) > 0 {
+        wake_word(generation, wake_n);
+    }
 }
 
 /// C `pthread_cond_broadcast` → nlist `_pthread_cond_broadcast`.
@@ -402,16 +435,18 @@ pub(crate) unsafe extern "C" fn pthread_cond_broadcast(cond: *mut c_void) -> c_i
     if cond.is_null() {
         return EINVAL;
     }
-    let c = unsafe { &*cond_word(cond) };
-    let _ = c.fetch_add(1, Ordering::Release);
-    wake_word(c, u32::MAX);
+    cond_notify(cond, u32::MAX);
     0
 }
 
-/// C `pthread_cond_signal` → nlist `_pthread_cond_signal` (same as broadcast).
+/// C `pthread_cond_signal` → nlist `_pthread_cond_signal` (wake **one**).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_cond_signal(cond: *mut c_void) -> c_int {
-    unsafe { pthread_cond_broadcast(cond) }
+    if cond.is_null() {
+        return EINVAL;
+    }
+    cond_notify(cond, 1);
+    0
 }
 
 // ── attrs ───────────────────────────────────────────────────────────────────
