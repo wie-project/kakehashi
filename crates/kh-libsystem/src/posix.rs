@@ -5,10 +5,10 @@ use core::ffi::{c_char, c_int, c_void};
 use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
-    self, SYS_CLOSE, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID, SYS_GETPPID,
-    SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT, SYS_READ,
-    SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME,
-    SYS_UNLINK,
+    self, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID,
+    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN, SYS_OPENAT,
+    SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
+    SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -109,6 +109,22 @@ pub(crate) unsafe extern "C" fn openat(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn close(fd: c_int) -> c_int {
     let ret = unsafe { sys::syscall1(SYS_CLOSE, u64::from(fd.cast_unsigned())) };
+    ret_c_int(ret)
+}
+
+/// C `fcntl` → nlist `_fcntl` (Darwin BSD #92; runtime already translates).
+///
+/// Curl G1 first-called missing import on `--version` (named trampoline log).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_FCNTL,
+            u64::from(fd.cast_unsigned()),
+            u64::from(cmd.cast_unsigned()),
+            u64::from(arg.cast_unsigned()),
+        )
+    };
     ret_c_int(ret)
 }
 
@@ -846,6 +862,41 @@ pub(crate) unsafe extern "C" fn qsort(
             idx = idx.saturating_add(1);
         }
     }
+}
+
+/// C `bsearch` → nlist `_bsearch` (curl G1 after fopen).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn bsearch(
+    key: *const c_void,
+    base: *const c_void,
+    nel: usize,
+    width: usize,
+    compar: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>,
+) -> *mut c_void {
+    if key.is_null() || base.is_null() || nel == 0 || width == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(cmp) = compar else {
+        return core::ptr::null_mut();
+    };
+    let mut lo = 0_usize;
+    let mut hi = nel;
+    while lo < hi {
+        let mid = lo.saturating_add(hi.saturating_sub(lo).wrapping_shr(1));
+        // SAFETY: base is nel*width; mid < nel.
+        let elem = unsafe { base.cast::<u8>().add(mid.saturating_mul(width)).cast::<c_void>() };
+        // SAFETY: guest compar for key vs elem.
+        let ord = unsafe { cmp(key, elem) };
+        if ord == 0 {
+            return elem.cast_mut();
+        }
+        if ord < 0 {
+            hi = mid;
+        } else {
+            lo = mid.saturating_add(1);
+        }
+    }
+    core::ptr::null_mut()
 }
 
 /// C `getpwuid` / `getgrgid` → null (no passwd DB).

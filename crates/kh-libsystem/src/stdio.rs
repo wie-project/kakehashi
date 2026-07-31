@@ -242,6 +242,139 @@ unsafe fn as_file(stream: *mut c_void) -> *mut FileStub {
     stream.cast()
 }
 
+/// Darwin open flags (subset; matches runtime translation).
+const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+const O_RDWR: c_int = 2;
+const O_APPEND: c_int = 0x0008;
+const O_CREAT: c_int = 0x0200;
+const O_TRUNC: c_int = 0x0400;
+
+/// Parse a simple fopen mode string into Darwin open flags + default mode bits.
+fn open_flags_from_mode(mode: *const c_char) -> Option<(c_int, c_int)> {
+    if mode.is_null() {
+        return None;
+    }
+    // SAFETY: NUL-terminated mode from guest ("r", "rb", "w+", …).
+    let m0 = unsafe { *mode };
+    if m0 == 0 {
+        return None;
+    }
+    // Scan for '+' / 'a' / 'w' / 'r' as unsigned bytes.
+    let mut has_plus = false;
+    let mut kind = m0.cast_unsigned();
+    let mut i = 0_usize;
+    while i < 8 {
+        // SAFETY: stop at NUL within short mode strings.
+        let c = unsafe { (*mode.add(i)).cast_unsigned() };
+        if c == 0 {
+            break;
+        }
+        if c == b'+' {
+            has_plus = true;
+        } else if c == b'a' || c == b'w' || c == b'r' {
+            kind = c;
+        }
+        i = i.saturating_add(1);
+    }
+    let (flags, creat_mode) = if kind == b'w' {
+        if has_plus {
+            (O_RDWR | O_CREAT | O_TRUNC, 0o666)
+        } else {
+            (O_WRONLY | O_CREAT | O_TRUNC, 0o666)
+        }
+    } else if kind == b'a' {
+        if has_plus {
+            (O_RDWR | O_CREAT | O_APPEND, 0o666)
+        } else {
+            (O_WRONLY | O_CREAT | O_APPEND, 0o666)
+        }
+    } else if has_plus {
+        (O_RDWR, 0)
+    } else {
+        (O_RDONLY, 0)
+    };
+    Some((flags, creat_mode))
+}
+
+fn file_from_fd(fd: c_int) -> *mut FileStub {
+    if fd < 0 {
+        return core::ptr::null_mut();
+    }
+    let raw = unsafe { crate::heap::malloc(core::mem::size_of::<FileStub>()) };
+    if raw.is_null() {
+        errno::set_errno(12);
+        return core::ptr::null_mut();
+    }
+    let f = raw.cast::<FileStub>();
+    // Zero the whole stub then set fd (pad field is intentionally anonymous).
+    unsafe {
+        core::ptr::write_bytes(f.cast::<u8>(), 0, core::mem::size_of::<FileStub>());
+        (*f).fd = fd;
+    }
+    f
+}
+
+/// C `fopen` → nlist `_fopen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut c_void {
+    let Some((flags, creat_mode)) = open_flags_from_mode(mode) else {
+        errno::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    if path.is_null() {
+        errno::set_errno(14);
+        return core::ptr::null_mut();
+    }
+    // SAFETY: path/mode from guest; open is our BSD wrapper.
+    let fd = unsafe { crate::posix::open(path, flags, creat_mode) };
+    file_from_fd(fd).cast()
+}
+
+/// Darwin `$DARWIN_EXTSN` symbol variant of `fopen`.
+#[unsafe(export_name = "fopen$DARWIN_EXTSN")]
+pub(crate) unsafe extern "C" fn fopen_darwin_extsn(
+    path: *const c_char,
+    mode: *const c_char,
+) -> *mut c_void {
+    // SAFETY: same as fopen.
+    unsafe { fopen(path, mode) }
+}
+
+/// C `fdopen` → nlist `_fdopen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut c_void {
+    let _ = mode;
+    if fd < 0 {
+        errno::set_errno(9);
+        return core::ptr::null_mut();
+    }
+    file_from_fd(fd).cast()
+}
+
+/// C `fclose` → nlist `_fclose`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    // Do not free/close std streams.
+    let p = stream.cast::<FileStub>();
+    if core::ptr::eq(p, core::ptr::addr_of_mut!(STDIN_FILE))
+        || core::ptr::eq(p, core::ptr::addr_of_mut!(STDOUT_FILE))
+        || core::ptr::eq(p, core::ptr::addr_of_mut!(STDERR_FILE))
+    {
+        return 0;
+    }
+    let fd = unsafe { (*p).fd };
+    let rc = unsafe { crate::posix::close(fd) };
+    unsafe {
+        crate::heap::free(stream);
+    }
+    rc
+}
+
 /// C `fileno` → nlist `_fileno`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fileno(stream: *mut c_void) -> c_int {

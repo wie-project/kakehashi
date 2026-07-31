@@ -243,6 +243,163 @@ fn wake_word(word: *const AtomicU32, n: u32) {
     let _ = unsafe { sys::helper2(KH_HELPER_WAKE, addr, u64::from(n)) };
 }
 
+/// Darwin `pthread_once_t` first word may be a non-zero init signature; we only
+/// treat our own sentinels as terminal/in-progress.
+const ONCE_DONE: u32 = 0x4B48_4F4E; // "KHON"
+const ONCE_RUNNING: u32 = 0x4B48_5255; // "KHRU"
+
+/// C `pthread_once` → nlist `_pthread_once` (curl G1 after `_fcntl`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_once(
+    once_control: *mut c_void,
+    init_routine: Option<unsafe extern "C" fn()>,
+) -> c_int {
+    if once_control.is_null() {
+        return EINVAL;
+    }
+    // First word of `pthread_once_t` (struct or scalar) is our control.
+    let w = unsafe { &*once_control.cast::<AtomicU32>() };
+    loop {
+        let cur = w.load(Ordering::Acquire);
+        if cur == ONCE_DONE {
+            return 0;
+        }
+        if cur == ONCE_RUNNING {
+            park_word(w, ONCE_RUNNING);
+            continue;
+        }
+        // Claim: any other value (incl. Darwin `PTHREAD_ONCE_INIT` magic) → running.
+        if w
+            .compare_exchange(cur, ONCE_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Some(init) = init_routine {
+                // SAFETY: caller registered a valid init routine for this once.
+                unsafe {
+                    init();
+                }
+            }
+            w.store(ONCE_DONE, Ordering::Release);
+            wake_word(w, u32::MAX);
+            return 0;
+        }
+    }
+}
+
+// ── rwlock (minimal; curl G1 after pthread_once) ────────────────────────────
+// Layout: word0 = writer/state, word1 = reader count (u32 each).
+// 0 = free for writers; readers use word1 with word0==0.
+
+const RW_FREE: u32 = 0;
+const RW_WRITE: u32 = 1;
+
+#[inline]
+fn rw_state(rwlock: *mut c_void) -> *mut AtomicU32 {
+    rwlock.cast::<AtomicU32>()
+}
+
+#[inline]
+fn rw_readers(rwlock: *mut c_void) -> *mut AtomicU32 {
+    // SAFETY: Darwin pthread_rwlock_t is large enough for two u32 words.
+    unsafe { rwlock.cast::<AtomicU32>().add(1) }
+}
+
+/// C `pthread_rwlock_init` → nlist `_pthread_rwlock_init`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_rwlock_init(
+    rwlock: *mut c_void,
+    _attr: *const c_void,
+) -> c_int {
+    if rwlock.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        (*rw_state(rwlock)).store(RW_FREE, Ordering::Relaxed);
+        (*rw_readers(rwlock)).store(0, Ordering::Relaxed);
+    }
+    0
+}
+
+/// C `pthread_rwlock_destroy` → nlist `_pthread_rwlock_destroy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_rwlock_destroy(rwlock: *mut c_void) -> c_int {
+    if rwlock.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        (*rw_state(rwlock)).store(RW_FREE, Ordering::Relaxed);
+        (*rw_readers(rwlock)).store(0, Ordering::Relaxed);
+    }
+    0
+}
+
+/// C `pthread_rwlock_rdlock` → nlist `_pthread_rwlock_rdlock`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_rwlock_rdlock(rwlock: *mut c_void) -> c_int {
+    if rwlock.is_null() {
+        return EINVAL;
+    }
+    let st = unsafe { &*rw_state(rwlock) };
+    let rc = unsafe { &*rw_readers(rwlock) };
+    loop {
+        // Wait while a writer holds the lock.
+        while st.load(Ordering::Acquire) != RW_FREE {
+            park_word(st, RW_WRITE);
+        }
+        rc.fetch_add(1, Ordering::AcqRel);
+        // Recheck: writer may have sneaked in.
+        if st.load(Ordering::Acquire) == RW_FREE {
+            return 0;
+        }
+        rc.fetch_sub(1, Ordering::AcqRel);
+        wake_word(st, u32::MAX);
+    }
+}
+
+/// C `pthread_rwlock_wrlock` → nlist `_pthread_rwlock_wrlock`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_rwlock_wrlock(rwlock: *mut c_void) -> c_int {
+    if rwlock.is_null() {
+        return EINVAL;
+    }
+    let st = unsafe { &*rw_state(rwlock) };
+    let rc = unsafe { &*rw_readers(rwlock) };
+    loop {
+        if st
+            .compare_exchange(RW_FREE, RW_WRITE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Wait for existing readers to drain.
+            while rc.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
+            return 0;
+        }
+        park_word(st, RW_WRITE);
+    }
+}
+
+/// C `pthread_rwlock_unlock` → nlist `_pthread_rwlock_unlock`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_rwlock_unlock(rwlock: *mut c_void) -> c_int {
+    if rwlock.is_null() {
+        return EINVAL;
+    }
+    let st = unsafe { &*rw_state(rwlock) };
+    let rc = unsafe { &*rw_readers(rwlock) };
+    if st.load(Ordering::Acquire) == RW_WRITE {
+        st.store(RW_FREE, Ordering::Release);
+        wake_word(st, u32::MAX);
+        return 0;
+    }
+    // Reader unlock.
+    let prev = rc.fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        wake_word(st, u32::MAX);
+    }
+    0
+}
+
 /// C `pthread_mutex_init` → nlist `_pthread_mutex_init`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_mutex_init(
@@ -445,6 +602,146 @@ pub(crate) unsafe extern "C" fn pthread_cond_signal(cond: *mut c_void) -> c_int 
     }
     cond_notify(cond, 1);
     0
+}
+
+// ── TSD / self (curl G1; process-global values enough for single-thread path) ─
+
+const MAX_KEYS: usize = 64;
+/// Next key id (1..=MAX_KEYS). Key 0 is invalid / deleted.
+static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
+static KEY_LIVE: [AtomicBool; MAX_KEYS] = [const { AtomicBool::new(false) }; MAX_KEYS];
+/// Per-key values for the process (main thread). Multi-thread guests need TLS
+/// expansion later; curl `--version` is single-threaded through this surface.
+static TSD_VAL: [AtomicUsize; MAX_KEYS] = [const { AtomicUsize::new(0) }; MAX_KEYS];
+
+/// C `pthread_key_create` → nlist `_pthread_key_create`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_key_create(
+    key: *mut c_int,
+    _destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    if key.is_null() {
+        return EINVAL;
+    }
+    for _ in 0..MAX_KEYS {
+        let id = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id > MAX_KEYS {
+            NEXT_KEY.store(1, Ordering::Relaxed);
+            continue;
+        }
+        let idx = id.saturating_sub(1);
+        if let Some(slot) = KEY_LIVE.get(idx)
+            && slot
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            if let Some(v) = TSD_VAL.get(idx) {
+                v.store(0, Ordering::Relaxed);
+            }
+            // SAFETY: caller provided writable key out-param.
+            unsafe {
+                *key = c_int::try_from(id).unwrap_or(0);
+            }
+            return 0;
+        }
+    }
+    EAGAIN
+}
+
+/// C `pthread_key_delete` → nlist `_pthread_key_delete`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_key_delete(key: c_int) -> c_int {
+    let id = usize::try_from(key).unwrap_or(0);
+    if id == 0 || id > MAX_KEYS {
+        return EINVAL;
+    }
+    let idx = id.saturating_sub(1);
+    if let Some(slot) = KEY_LIVE.get(idx) {
+        slot.store(false, Ordering::Release);
+    }
+    if let Some(v) = TSD_VAL.get(idx) {
+        v.store(0, Ordering::Relaxed);
+    }
+    0
+}
+
+/// C `pthread_getspecific` → nlist `_pthread_getspecific`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_getspecific(key: c_int) -> *mut c_void {
+    let id = usize::try_from(key).unwrap_or(0);
+    if id == 0 || id > MAX_KEYS {
+        return core::ptr::null_mut();
+    }
+    let idx = id.saturating_sub(1);
+    if !KEY_LIVE.get(idx).is_some_and(|s| s.load(Ordering::Acquire)) {
+        return core::ptr::null_mut();
+    }
+    let val = TSD_VAL.get(idx).map_or(0, |v| v.load(Ordering::Acquire));
+    core::ptr::with_exposed_provenance_mut(val)
+}
+
+/// C `pthread_setspecific` → nlist `_pthread_setspecific`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_setspecific(key: c_int, value: *const c_void) -> c_int {
+    let id = usize::try_from(key).unwrap_or(0);
+    if id == 0 || id > MAX_KEYS {
+        return EINVAL;
+    }
+    let idx = id.saturating_sub(1);
+    if !KEY_LIVE.get(idx).is_some_and(|s| s.load(Ordering::Acquire)) {
+        return EINVAL;
+    }
+    if let Some(v) = TSD_VAL.get(idx) {
+        v.store(value.addr(), Ordering::Release);
+    }
+    0
+}
+
+/// Stable non-null main-thread token when TLS `pthread_self` is not set.
+static MAIN_SELF: u64 = 0x4B48_5054_5345_4C46; // "KHPSELF"
+
+/// C `pthread_self` → nlist `_pthread_self`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_self() -> *mut c_void {
+    // Prefer GuestTls.pthread_self when TPIDR is installed.
+    let tpidr: u64;
+    // SAFETY: read TPIDR_EL0 (guest TLS base on our path).
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr, options(nomem, nostack, preserves_flags));
+    }
+    if tpidr != 0 {
+        let tls = core::ptr::with_exposed_provenance::<GuestTls>(
+            usize::try_from(tpidr).unwrap_or(0),
+        );
+        // SAFETY: main TLS page / worker TLS installed by runtime has magic.
+        let magic = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*tls).magic)) };
+        if magic == TLS_MAGIC {
+            let self_va =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*tls).pthread_self)) };
+            if self_va != 0 {
+                return core::ptr::with_exposed_provenance_mut(
+                    usize::try_from(self_va).unwrap_or(0),
+                );
+            }
+        }
+    }
+    core::ptr::from_ref(&MAIN_SELF).cast_mut().cast()
+}
+
+/// C `pthread_equal` → nlist `_pthread_equal`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_equal(t1: *mut c_void, t2: *mut c_void) -> c_int {
+    i32::from(t1 == t2)
+}
+
+/// C `pthread_exit` → nlist `_pthread_exit` (main: process exit).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_exit(retval: *mut c_void) -> ! {
+    let _ = retval;
+    // SAFETY: never returns.
+    unsafe {
+        crate::process::exit_now(0);
+    }
 }
 
 // ── attrs ───────────────────────────────────────────────────────────────────

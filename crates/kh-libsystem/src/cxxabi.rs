@@ -219,9 +219,56 @@ pub(crate) unsafe extern "C" fn dyld_stub_binder_export() {
 ///
 /// `kh-loader` may point unresolved imports here (warn once per name) so large
 /// guests like curl can finish load; the first call aborts with a note.
+/// Prefer [`kh_missing_symbol_named`] via per-import trampolines so G1 logs
+/// which import was first touched.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn kh_missing_symbol() -> ! {
-    trace::note(b"[kh-libsystem] kh_missing_symbol() - bound missing import was called\n");
+    // Always print (trace is off by default); otherwise curl exits 127 silently.
+    trace::force_note(b"[kh-libsystem] kh_missing_symbol() - bound missing import was called\n");
+    // SAFETY: never returns.
+    unsafe {
+        exit_now(127);
+    }
+}
+
+/// Named catch-all: `x0` = C string of the unresolved nlist name (e.g. `_fopen`).
+///
+/// Emitted by `kh-loader` missing-stub trampolines so the first *call* (not
+/// just bind) surfaces which surface we still need for curl G1.
+///
+/// The name pointer often lives in the loader's trampoline pool (anonymous
+/// host `mmap`), which is **not** registered in guest `AddressSpace`. Copying
+/// onto this stack frame is required before `write` — otherwise the trap path
+/// returns `EFAULT` and we lose the symbol name.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn kh_missing_symbol_named(name: *const core::ffi::c_char) -> ! {
+    trace::force_note(b"[kh-libsystem] missing symbol called: ");
+    // Stack is registered guest memory; trampoline-pool strings are not.
+    let mut on_stack = [0_u8; 128];
+    if name.is_null() {
+        on_stack[..6].copy_from_slice(b"<null>");
+        trace::force_note(&on_stack[..6]);
+    } else {
+        let mut len = 0_usize;
+        while len < on_stack.len().saturating_sub(1) {
+            // SAFETY: trampoline embeds a NUL-terminated name; we stop at 127.
+            let b = unsafe { (*name.add(len)).cast_unsigned() };
+            if b == 0 {
+                break;
+            }
+            if let Some(slot) = on_stack.get_mut(len) {
+                *slot = b;
+            }
+            len = len.saturating_add(1);
+        }
+        if len == 0 {
+            on_stack[..7].copy_from_slice(b"<empty>");
+            trace::force_note(&on_stack[..7]);
+        } else if let Some(slice) = on_stack.get(..len) {
+            trace::force_note(slice);
+        }
+    }
+    trace::force_note(b"\n");
     // SAFETY: never returns.
     unsafe {
         exit_now(127);

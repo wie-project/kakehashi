@@ -191,6 +191,7 @@ dependencies = [
  "anyhow",
  "goblin",
  "kh-runtime",
+ "libc",
  "scroll",
  "thiserror",
  "tracing",

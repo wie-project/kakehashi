@@ -19,6 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 goblin.workspace = true
 scroll = "0.13"
+libc.workspace = true
 kh-runtime = { version = "0.1.0", path = "../kh-runtime" }
 
 [dev-dependencies]

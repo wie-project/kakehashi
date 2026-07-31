@@ -9,7 +9,6 @@
 
 /* clangd/Zed: we intentionally redeclare printf-family without <stdio.h>. */
 #pragma clang diagnostic ignored "-Wbuiltin-requires-header"
-#pragma GCC diagnostic ignored "-Wbuiltin-declaration-mismatch"
 
 typedef unsigned long size_t;
 typedef long ssize_t;

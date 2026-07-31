@@ -10,6 +10,8 @@ pub(crate) const SYS_WRITE: u32 = 4;
 pub(crate) const SYS_OPEN: u32 = 5;
 /// BSD `close`.
 pub(crate) const SYS_CLOSE: u32 = 6;
+/// BSD `fcntl`.
+pub(crate) const SYS_FCNTL: u32 = 92;
 /// BSD `unlink`.
 pub(crate) const SYS_UNLINK: u32 = 10;
 /// BSD `link` (hard link).

@@ -12,6 +12,7 @@ pub mod fixture;
 pub mod image;
 pub mod init;
 pub mod link;
+pub mod missing_stub;
 pub mod parse;
 pub mod rebase;
 pub mod resolve;

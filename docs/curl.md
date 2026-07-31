@@ -94,8 +94,8 @@ system binaries or cross-compile in-tree.
 | Guest path `/usr/local/bin/curl` | done |
 | `docker-curl.sh` (like `docker-7zz.sh`) | done |
 | `docker-curl-probe.sh` (G1/G2 capture) | done |
-| G1 first probe (`--version`) | **fail at load** (see below) |
-| Syscall handlers from G2 log | after load/bind succeeds |
+| G1 first probe (`--version`) | **pass** (banner + exit 0) |
+| Syscall handlers from G2 log | next: real HTTP (G3), trace-first |
 
 ### G1 log (Docker probe iteration)
 
@@ -116,12 +116,14 @@ system binaries or cross-compile in-tree.
 2. Then `_fread` / string surface / `dyld_stub_binder` alias.
 3. CF/Security two-level binds: flat fallback + apple stubs + `_kh_missing_symbol`
    catch-all for remaining strong imports (~100) so load can finish.
-4. Guest **runs** but still exits **127** when the first bound-missing import is
-   actually *called* (not yet which name — implement next real body from use).
-5. Freestanding C `*printf` (`printf_fmt.c`, force-loaded) for stable-Rust lack of
-   `c_variadic`.
+4. Named missing trampolines (`_kh_missing_symbol_named`) so first *call* logs
+   the nlist name (not just bind-time list).
+5. Call-order surface for G1: `_fcntl` → `pthread_once` / rwlock / TSD / self →
+   `fopen`/`fclose` → `bsearch` (+ freestanding `*printf` in `printf_fmt.c`).
+6. **G1 pass:** `curl --version` prints the stunnel static-curl banner, exit 0.
 
-No `unknown BSD syscall` yet — still pre-network, filling libSystem surface.
+No `unknown BSD syscall` on `--version` (no network yet). Default download still
+lists Apple frameworks (TLS); HTTP/HTTPS is G3/G4 — implement only from probe logs.
 
-Default download still lists Apple frameworks (TLS); HTTP may avoid them if those
-stubs are never called.
+**Next:** `./scripts/docker-curl-probe.sh -sS -o /Volumes/linux/out/body http://example.com/`
+and fill socket/DNS surface from the first missing / unknown-BSD lines only.

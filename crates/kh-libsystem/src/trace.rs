@@ -6,16 +6,26 @@ use crate::sys::{self, SYS_WRITE};
 /// `max_syscalls` budget (real guests allocate heavily in static ctors).
 static TRACE_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Writes `msg` to fd 2 when tracing is enabled.
+/// Always write `msg` to guest stderr (fd 2). Use for fatal abort notes so
+/// curl G1 can report the first missing import even when verbose trace is off.
 #[inline]
-pub(crate) fn note(msg: &[u8]) {
-    if !TRACE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) || msg.is_empty() {
+pub(crate) fn force_note(msg: &[u8]) {
+    if msg.is_empty() {
         return;
     }
     let ptr = u64::try_from(msg.as_ptr().addr()).unwrap_or(0);
     let len = u64::try_from(msg.len()).unwrap_or(0);
     // SAFETY: buffer live for the syscall; fd 2 = stderr.
     let _ = unsafe { sys::syscall3(SYS_WRITE, 2, ptr, len) };
+}
+
+/// Writes `msg` to fd 2 when tracing is enabled.
+#[inline]
+pub(crate) fn note(msg: &[u8]) {
+    if !TRACE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    force_note(msg);
 }
 
 /// `[kh-libsystem] name(size)\n`

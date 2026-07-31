@@ -11,9 +11,10 @@ use crate::process::exit_now;
 use crate::trace;
 
 fn stub_abort(name: &[u8]) -> ! {
-    trace::note(b"[kh-libsystem] apple stub called: ");
-    trace::note(name);
-    trace::note(b"\n");
+    // Fatal paths always print (verbose libsystem trace stays off by default).
+    trace::force_note(b"[kh-libsystem] apple stub called: ");
+    trace::force_note(name);
+    trace::force_note(b"\n");
     // SAFETY: never returns.
     unsafe {
         exit_now(127);

@@ -123,6 +123,7 @@ pub(crate) fn bind_main_got_nlist(session: &mut LoadSession) -> Result<(), LoadE
     }
     let got_va = got_pref.wrapping_add(main_slide);
 
+    let named_handler = export_map.get("_kh_missing_symbol_named").copied();
     let missing_stub = export_map.get("_kh_missing_symbol").copied();
     let mut values = Vec::with_capacity(undefs.len());
     for u in &undefs {
@@ -136,12 +137,34 @@ pub(crate) fn bind_main_got_nlist(session: &mut LoadSession) -> Result<(), LoadE
                 values.push(0);
             }
             None => {
+                if let Some(handler) = named_handler {
+                    match crate::missing_stub::trampoline_for(&u.name, handler) {
+                        Ok(va) => {
+                            tracing::warn!(
+                                name = %u.name,
+                                stub = format_args!("{va:#x}"),
+                                "unresolved strong nlist; bound to named missing trampoline"
+                            );
+                            values.push(va);
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                name = %u.name,
+                                error = %err,
+                                "missing trampoline emit failed; falling back"
+                            );
+                        }
+                    }
+                }
                 if let Some(stub) = missing_stub {
                     tracing::warn!(
                         name = %u.name,
                         "unresolved strong nlist; bound to _kh_missing_symbol"
                     );
                     values.push(stub);
+                } else if let Some(handler) = named_handler {
+                    values.push(handler);
                 } else {
                     return Err(LoadError::UnresolvedSymbol {
                         name: u.name.clone(),

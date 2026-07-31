@@ -91,7 +91,52 @@ pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
     if !used_any {
         link::bind_main_got_nlist(session)?;
     }
+    crate::missing_stub::seal_pool();
     Ok(())
+}
+
+/// Bind an unresolved strong import to a named missing trampoline (or anonymous
+/// `_kh_missing_symbol` if the named handler is absent).
+fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, LoadError> {
+    let named = lookup_flat(images, "_kh_missing_symbol_named", false).ok();
+    let anon = lookup_flat(images, "_kh_missing_symbol", false).ok();
+    if let Some(handler) = named {
+        match crate::missing_stub::trampoline_for(name, handler) {
+            Ok(va) => {
+                tracing::warn!(
+                    name = %name,
+                    stub = format_args!("{va:#x}"),
+                    "unresolved strong symbol; bound to named missing trampoline"
+                );
+                return Ok(va);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    name = %name,
+                    error = %err,
+                    "missing trampoline emit failed; falling back"
+                );
+            }
+        }
+    }
+    if let Some(stub) = anon {
+        tracing::warn!(
+            name = %name,
+            "unresolved strong symbol; bound to _kh_missing_symbol"
+        );
+        return Ok(stub);
+    }
+    if let Some(handler) = named {
+        // No trampoline path; still better than hard fail for load.
+        tracing::warn!(
+            name = %name,
+            "unresolved strong symbol; bound to _kh_missing_symbol_named (no trampoline)"
+        );
+        return Ok(handler);
+    }
+    Err(LoadError::UnresolvedSymbol {
+        name: name.to_owned(),
+    })
 }
 
 /// Collect POINTER bind sites from `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY`.
@@ -390,17 +435,10 @@ pub(crate) fn resolve_bind_symbol(
         Ok(va) => Ok(va),
         Err(LoadError::UnresolvedSymbol { name }) if !site.weak => {
             // Large guests (curl) import more libc surface than freestanding
-            // libSystem implements. Point strong misses at `_kh_missing_symbol`
-            // so load completes; first call aborts with a guest-visible note.
-            if let Ok(stub) = lookup_flat(images, "_kh_missing_symbol", false) {
-                tracing::warn!(
-                    name = %name,
-                    "unresolved strong symbol; bound to _kh_missing_symbol"
-                );
-                Ok(stub)
-            } else {
-                Err(LoadError::UnresolvedSymbol { name })
-            }
+            // libSystem implements. Point each strong miss at a per-name
+            // trampoline → `_kh_missing_symbol_named` so the first *call*
+            // prints which import we still need (G1).
+            resolve_missing_stub(images, &name)
         }
         Err(err) => Err(err),
     }
