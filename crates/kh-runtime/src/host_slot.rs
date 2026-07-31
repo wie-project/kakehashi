@@ -328,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn arm_disarm_roundtrip() {
         // Ensure a slot exists under host TPIDR.
         with_tls_init(|m| {
@@ -361,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn prepare_enter_updates_guest_snapshot() {
         with_tls_init(|m| {
             m.active = true;
