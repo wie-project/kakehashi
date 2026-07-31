@@ -169,7 +169,8 @@ while host TPIDR is live).
 ## Synchronization (guest)
 
 Guest mutex/cond use host futex helpers (`KH_HELPER_PARK` / `KH_HELPER_WAKE`)
-with short spin then park. Do not reintroduce yield-SVC storms for locks.
+with short spin then park. Mutex is a 0/1/2 futex word: unlock wakes only when
+the lock was contended (`2`). Do not reintroduce yield-SVC storms for locks.
 
 ## Environment
 

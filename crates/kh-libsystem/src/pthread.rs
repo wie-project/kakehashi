@@ -211,8 +211,20 @@ fn munmap_anon(ptr: *mut u8, len: usize) {
 
 // ── mutex (first word of guest pthread_mutex_t) ─────────────────────────────
 //
-// 0 = unlocked, 1 = locked. Contended waiters park on the word via host futex
-// so we do not burn the host with yield-SVC spin storms under 7zz MT.
+// Futex mutex states (Drepper / Linux classic):
+//   0 = unlocked
+//   1 = locked, no known waiters
+//   2 = locked, waiters may exist → unlock must FUTEX_WAKE
+//
+// Uncontended unlock is store-only (no KH_HELPER_WAKE). Always-wake was the
+// main residual futex storm after A1 (UTM 8k-file: ~257k futex, mostly guest).
+
+/// Unlocked.
+const MUTEX_UNLOCKED: u32 = 0;
+/// Locked, no known waiters — unlock without wake.
+const MUTEX_LOCKED: u32 = 1;
+/// Locked with waiters — unlock clears + wakes one.
+const MUTEX_CONTENDED: u32 = 2;
 
 #[inline]
 fn mutex_word(mutex: *mut c_void) -> *mut AtomicU32 {
@@ -241,7 +253,7 @@ pub(crate) unsafe extern "C" fn pthread_mutex_init(
         return EINVAL;
     }
     unsafe {
-        (*mutex_word(mutex)).store(0, Ordering::Relaxed);
+        (*mutex_word(mutex)).store(MUTEX_UNLOCKED, Ordering::Relaxed);
     }
     0
 }
@@ -253,7 +265,7 @@ pub(crate) unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut c_void) -> c_i
         return EINVAL;
     }
     unsafe {
-        (*mutex_word(mutex)).store(0, Ordering::Relaxed);
+        (*mutex_word(mutex)).store(MUTEX_UNLOCKED, Ordering::Relaxed);
     }
     0
 }
@@ -265,24 +277,56 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
         return EINVAL;
     }
     let w = unsafe { &*mutex_word(mutex) };
+
     // Fast path: uncontended.
-    if w.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+    if w
+        .compare_exchange(
+            MUTEX_UNLOCKED,
+            MUTEX_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
         .is_ok()
     {
         return 0;
     }
-    // Short spin then park while still locked.
+
+    // Slow path: short spin, then mark contended and park (F1).
     loop {
         for _ in 0..64_u32 {
-            if w.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return 0;
+            let cur = w.load(Ordering::Relaxed);
+            if cur == MUTEX_UNLOCKED {
+                if w
+                    .compare_exchange(
+                        MUTEX_UNLOCKED,
+                        MUTEX_LOCKED,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return 0;
+                }
+            } else if cur == MUTEX_LOCKED {
+                // Advertise waiters so unlock issues FUTEX_WAKE.
+                let _ = w.compare_exchange(
+                    MUTEX_LOCKED,
+                    MUTEX_CONTENDED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
             }
             core::hint::spin_loop();
         }
-        // FUTEX_WAIT returns if value ≠ expected (unlock raced ahead).
-        park_word(w, 1);
+
+        // Before park: own it as CONTENDED if free, else ensure CONTENDED and wait.
+        // swap(2): if prev==0 we acquired; if prev!=0 someone still holds → park.
+        let prev = w.swap(MUTEX_CONTENDED, Ordering::Acquire);
+        if prev == MUTEX_UNLOCKED {
+            return 0;
+        }
+        // FUTEX_WAIT returns if value ≠ expected (unlock raced ahead → 0).
+        park_word(w, MUTEX_CONTENDED);
     }
 }
 
@@ -293,8 +337,13 @@ pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_in
         return EINVAL;
     }
     let w = unsafe { &*mutex_word(mutex) };
-    w.store(0, Ordering::Release);
-    wake_word(w, 1);
+    // LOCKED(1) → fetch_sub → 0, no wake (uncontended hot path).
+    // CONTENDED(2) → fetch_sub → 1, then clear + wake one waiter.
+    let prev = w.fetch_sub(1, Ordering::Release);
+    if prev != MUTEX_LOCKED {
+        w.store(MUTEX_UNLOCKED, Ordering::Release);
+        wake_word(w, 1);
+    }
     0
 }
 

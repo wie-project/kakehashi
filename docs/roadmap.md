@@ -29,13 +29,13 @@ LZMA”.
 
 Typical hypercall-side noise:
 
-| Host syscall                        | Symptom                              | Likely source                  |
-| ----------------------------------- | ------------------------------------ | ------------------------------ |
-| `gettid` × huge                     | tens of k                            | every `host_slot` lookup       |
-| `futex` × large                     | map `Mutex`                          | same                           |
-| `readlinkat` × large, many `ENOENT` | path / symlink noise                 | bottle / path walk             |
-| `mprotect` × large                  | unexpected for archive               | identify before “optimizing”   |
-| `read` / `openat`                   | similar order of magnitude to native | I/O itself is not the only tax |
+| Host syscall                        | Symptom (post A1/A2/A4/A5)           | Likely source                          |
+| ----------------------------------- | ------------------------------------ | -------------------------------------- |
+| `gettid`                            | ~1k noise (was ~942k → ~631k → ~1k)  | slow path / non-boundary only          |
+| `futex` × large                     | ~95% strace time, ~257k calls (pre-F1)| guest park/wake; always-wake unlock    |
+| `readlinkat`                        | residual after A4                    | bottle / path walk                     |
+| `mprotect`                          | residual after A5                    | genuine prot changes                   |
+| `read` / `openat`                   | similar order of magnitude to native | I/O itself is not the only tax         |
 
 Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 
@@ -74,6 +74,14 @@ Use `strace -c -f` and `perf record -g` on **the same tree** for before/after.
 | **B3** | Avoid global locks on FD map / process state (already lock-free-ish for FD — keep it)                         | MT scaling                                                |
 | **B4** | Optional: no alt-stack switch for pure ST / documented fallback only                                          | Micro-cost; **MUST NOT** become MT default on guest stack |
 | **B5** | Larger guest read sizes / less chatty stdio in freestanding where safe                                        | Fewer hypercalls                                          |
+
+### F — Guest futex / locks (after A1; not host_slot)
+
+| ID     | Idea                                                                 | Why                                                                 | Hard parts                                      |
+| ------ | -------------------------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------- |
+| **F1** | **Contended-bit mutex** (0/1/2; wake only if was 2)                  | ~~Always `FUTEX_WAKE` on unlock~~ **Done** (code) — kill uncontended wake storm | Stage freestanding; MT gate; UTM strace         |
+| **F2** | Adaptive spin / pause tuning                                         | Secondary after F1                                                  | Don't reintroduce yield-SVC storms              |
+| **F3** | Heap freestanding lock → same 0/1/2 if CPU-bound spin shows up       | After F1 validated                                                  | Heap is pure spin today                         |
 
 ---
 
@@ -137,8 +145,9 @@ Recorded during Docker MT stress (`7zz -mmt>1`). Symptoms were SEGV (host `kh` a
 2. **A5** `mprotect` attribution
 3. ~~**A2** merge enter+alt~~ **Done**
 4. ~~**A1** guest-TLS host/alt mirror~~ **Done**
-5. **A3** light I/O entry (last among A — highest MT risk)
-6. Futex wall-time: mostly guest park/wake after A1 (not host_slot map)
+5. ~~**F1** contended-bit guest mutex~~ **Done** (code; UTM strace pending)
+6. **A3** light I/O entry (last among A — highest MT risk)
+7. F2/F3 only if futex still dominates after F1
 
 ---
 
@@ -175,7 +184,8 @@ KAKEHASHI_HYPERCALL=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | **2026-07** | **A4** `readlinkat` storm                                             | **Done** — root cause was per-bind `canonicalize` on bottle alias (`libc++`→`libSystem`). Cache `ProcessImage.real_path` once at insert; alias match uses the cache. (strace “errors” were mostly `EINVAL` from realpath probing non-symlinks, not ENOENT.) |
 | **2026-07** | **A5** excess `mprotect`                                              | **Done** — root cause was bind/rebase `write_slot_rw` doing RW↔restore **per slot** on already-writable `__DATA` (~15k identical `mprotect` on one region). Batch by region; skip mprotect when Darwin `prot` already has write. Also skip no-op mprotect after guest `mmap` when final prot is already RW. |
 | **2026-07** | **A2** merge enter + alt SP                                           | **Done** (v3) — enter returns alt top; one gettid on slow path. **v1/v2** failed (host TLS cache). UTM after A2: gettid ~631k (was ~942k), futex still ~82% time. |
-| **2026-07** | **A1** guest-TLS host/alt mirror                                      | **Done** — different from “cookie→map”: store `host_tpidr@24` + `alt_top@32` in freestanding guest TLS (host-written at prepare / `enter_guest_tls` / alt map). Hot enter: `mrs` + magic check + load mirrors → `msr` host — **no gettid, no Mutex, no thread_local!**. Leave: asm parks guest VA at prolog+80; `kh_tls_leave_host(guest)` restores without gettid. Slow path keeps A2 gettid map. Freestanding `GuestTls` extended (stage dylib). Expect boundary gettid ≈ noise; residual gettid from non-boundary; futex dominated by guest locks. |
+| **2026-07** | **A1** guest-TLS host/alt mirror                                      | **Done** — different from “cookie→map”: store `host_tpidr@24` + `alt_top@32` in freestanding guest TLS (host-written at prepare / `enter_guest_tls` / alt map). Hot enter: `mrs` + magic check + load mirrors → `msr` host — **no gettid, no Mutex, no thread_local!**. Leave: asm parks guest VA at prolog+80; `kh_tls_leave_host(guest)` restores without gettid. Slow path keeps A2 gettid map. Freestanding `GuestTls` extended (stage dylib). **UTM bare-metal 8k-file gate (post-A1):** gettid **1026** (was **631k** after A2 / **~942k** baseline), total syscalls **322k** (was **949k**), strace time **~28s** (was **~91s**). Futex calls still ~257k / ~95% time — guest park/wake, not map Mutex. |
+| **2026-07** | **F1** contended-bit guest mutex                                      | **Done** (code) — freestanding `pthread_mutex_*`: states 0/1/2; unlock wakes only if previous was CONTENDED(2). Uncontended unlock is release store only (no `KH_HELPER_WAKE`). Address histogram on UTM showed many guest VAs + always-wake pattern. Stage dylib required. Expect futex calls and WAKE≫WAIT imbalance to drop sharply; residual = real contention + cond/join. |
 | —          | A3 as above                                                           | Open                                |
 
 ---
