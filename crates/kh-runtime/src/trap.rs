@@ -1190,6 +1190,8 @@ pub fn finish_with_exit_code(code: i32) -> ! {
     if TRACE_ON_EXIT.load(Ordering::SeqCst) {
         dump_events_before_exit();
     }
+    // Host TPIDR: opt-in F1 diagnosis (park expected buckets / wake efficiency).
+    crate::syscall::dump_futex_stats_if_enabled();
     let expect = EXPECT_CODE.load(Ordering::SeqCst);
     let status = if expect == i32::MIN || expect == code {
         code

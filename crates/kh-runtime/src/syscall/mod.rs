@@ -40,6 +40,12 @@ pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
 /// Resets FD table, soft signal state, and syscall counter for a new run.
 pub fn reset_syscall_state(max_syscalls: usize) {
     proc_state::reset_run(max_syscalls);
+    helpers::reset_futex_stats();
+}
+
+/// Print guest park/wake helper counters when `KAKEHASHI_FUTEX_STATS` is set.
+pub(crate) fn dump_futex_stats_if_enabled() {
+    helpers::dump_futex_stats_if_enabled();
 }
 
 /// Dispatches a Darwin BSD syscall by number.

@@ -144,7 +144,8 @@ not of a random guest bug.
 | -------- | ------- | ------- |
 | `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall pointer |
 | `KAKEHASHI_HYPERCALL=0` | — | Force SIGTRAP/svc path |
-| `KAKEHASHI_HYPERCALL_LIGHT` | **off** | A3: skip second NEON save on freestanding hypercall (`1`/`true`/`yes`/`on`). Kill-switch = unset. Default stays full tramp until MT+UTM gates are green for default-on. |
+| `KAKEHASHI_HYPERCALL_LIGHT` | **off** | A3: skip second NEON save on freestanding hypercall (`1`/`true`/`yes`/`on`). Kill-switch = unset. UTM 8k bench: **no wall win**; keep opt-in only. |
+| `KAKEHASHI_FUTEX_STATS` | **off** | Print guest `KH_HELPER_PARK`/`WAKE` counters at exit (park expected buckets → F1 vs pre-F1 vs cond). |
 | `KAKEHASHI_TRAMPOLINE` | off | Experimental svc→veneer rewrite (separate from freestanding hypercall) |
 
 ## Related documents

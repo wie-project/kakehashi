@@ -172,12 +172,29 @@ Guest mutex/cond use host futex helpers (`KH_HELPER_PARK` / `KH_HELPER_WAKE`)
 with short spin then park. Mutex is a 0/1/2 futex word: unlock wakes only when
 the lock was contended (`2`). Do not reintroduce yield-SVC storms for locks.
 
+**Diagnose residual futex** (host only, no guest change):
+
+```bash
+KAKEHASHI_FUTEX_STATS=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 …
+# stderr at exit:
+#   park … exp0(join) exp1(pre-F1 mutex) exp2(F1 mutex) other(cond)
+#   wake … n=1 n=broad woken_sum woken0
+```
+
+| Bucket | Meaning |
+| ------ | ------- |
+| `exp1` high after F1 commit | Bottle dylib is **pre-F1** — rebuild `kh`, `kh bottle ensure --libsystem …` |
+| `exp2` high, `wake` ≈ park | Real mutex contention (7zz work queues) |
+| `other` high | `pthread_cond_*` generation park/broadcast |
+| `woken0` ≈ `wake` total | Always-wake / no waiters (old unlock path) |
+
 ## Environment
 
 | Variable | Effect |
 | -------- | ------ |
 | `KAKEHASHI_HYPERCALL=0` | Disable freestanding hypercall wire-up; workers use patched `brk`/SIGTRAP |
 | (default) | Hypercall ON for all threads when `_kh_bsd_hypercall` is patched |
+| `KAKEHASHI_FUTEX_STATS=1` | Print guest park/wake helper counters on process exit (stderr) |
 
 Hypercall is the production path for workers. Dual-path “workers only on
 SIGTRAP” is legacy; do not reintroduce it as the default.

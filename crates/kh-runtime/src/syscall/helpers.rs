@@ -7,6 +7,7 @@
 #![allow(unsafe_code)] // futex park/wake via libc::syscall
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use crate::bottle;
@@ -16,6 +17,133 @@ use crate::process as proc_state;
 use super::common::{
     EBADF, EFAULT, EINVAL, ENOSYS, SyscallArgs, SyscallResult, guest_write, reg_as_i32,
 };
+
+// ── Opt-in park/wake stats (`KAKEHASHI_FUTEX_STATS=1`) ───────────────────────
+//
+// Classifies guest KH_HELPER_PARK / WAKE without changing lock semantics.
+// On UTM after F1, use this to see *what* still drives ~257k host futex:
+//
+// | park expected | Typical source                         |
+// |---------------|----------------------------------------|
+// | 0             | `pthread_join` on `KhThread.done`      |
+// | 1             | **pre-F1** mutex (`park while locked`)  |
+// | 2             | **F1** mutex (`MUTEX_CONTENDED`)        |
+// | other         | `pthread_cond_*` generation wait        |
+//
+// Many `wake` with `woken=0` ⇒ uncontended always-wake (old dylib) or races.
+// High `park_exp1` after F1 stage ⇒ bottle still has pre-F1 libSystem.
+
+static PARK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PARK_EXP0: AtomicU64 = AtomicU64::new(0);
+static PARK_EXP1: AtomicU64 = AtomicU64::new(0);
+static PARK_EXP2: AtomicU64 = AtomicU64::new(0);
+static PARK_EXP_OTHER: AtomicU64 = AtomicU64::new(0);
+/// Value already ≠ expected before `FUTEX_WAIT` (no sleep).
+static PARK_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WAKE_N1: AtomicU64 = AtomicU64::new(0);
+static WAKE_NBROAD: AtomicU64 = AtomicU64::new(0);
+static WAKE_WOKEN_SUM: AtomicU64 = AtomicU64::new(0);
+static WAKE_ZERO: AtomicU64 = AtomicU64::new(0);
+
+/// Clear park/wake counters (new guest run).
+pub(crate) fn reset_futex_stats() {
+    for a in [
+        &PARK_TOTAL,
+        &PARK_EXP0,
+        &PARK_EXP1,
+        &PARK_EXP2,
+        &PARK_EXP_OTHER,
+        &PARK_MISMATCH,
+        &WAKE_TOTAL,
+        &WAKE_N1,
+        &WAKE_NBROAD,
+        &WAKE_WOKEN_SUM,
+        &WAKE_ZERO,
+    ] {
+        a.store(0, Ordering::Relaxed);
+    }
+}
+
+fn futex_stats_enabled() -> bool {
+    match std::env::var_os("KAKEHASHI_FUTEX_STATS") {
+        None => false,
+        Some(v) => {
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+    }
+}
+
+/// Print park/wake summary to stderr when `KAKEHASHI_FUTEX_STATS` is set.
+///
+/// Safe to call under host TPIDR at process exit (`finish_with_exit_code`).
+pub(crate) fn dump_futex_stats_if_enabled() {
+    if !futex_stats_enabled() {
+        return;
+    }
+    let park = PARK_TOTAL.load(Ordering::Relaxed);
+    let wake = WAKE_TOTAL.load(Ordering::Relaxed);
+    if park == 0 && wake == 0 {
+        drop(io::stderr().write_all(b"kh futex stats: park=0 wake=0 (no helpers)\n"));
+        return;
+    }
+    let msg = format!(
+        "kh futex stats:\n\
+         \tpark total={park}  mismatch_before_wait={}  \
+exp0(join)={} exp1(pre-F1 mutex)={} exp2(F1 mutex)={} other(cond)={}\n\
+         \twake total={wake}  n=1={}  n=broad={}  woken_sum={}  woken0={}\n",
+        PARK_MISMATCH.load(Ordering::Relaxed),
+        PARK_EXP0.load(Ordering::Relaxed),
+        PARK_EXP1.load(Ordering::Relaxed),
+        PARK_EXP2.load(Ordering::Relaxed),
+        PARK_EXP_OTHER.load(Ordering::Relaxed),
+        WAKE_N1.load(Ordering::Relaxed),
+        WAKE_NBROAD.load(Ordering::Relaxed),
+        WAKE_WOKEN_SUM.load(Ordering::Relaxed),
+        WAKE_ZERO.load(Ordering::Relaxed),
+    );
+    drop(io::stderr().write_all(msg.as_bytes()));
+}
+
+#[inline]
+fn note_park(expected: u32, mismatch: bool) {
+    PARK_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if mismatch {
+        PARK_MISMATCH.fetch_add(1, Ordering::Relaxed);
+    }
+    match expected {
+        0 => {
+            PARK_EXP0.fetch_add(1, Ordering::Relaxed);
+        }
+        1 => {
+            PARK_EXP1.fetch_add(1, Ordering::Relaxed);
+        }
+        2 => {
+            PARK_EXP2.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            PARK_EXP_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[inline]
+fn note_wake(n: i32, woken: i32) {
+    WAKE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if n <= 0 || n == i32::MAX {
+        WAKE_NBROAD.fetch_add(1, Ordering::Relaxed);
+    } else if n == 1 {
+        WAKE_N1.fetch_add(1, Ordering::Relaxed);
+    }
+    if woken <= 0 {
+        WAKE_ZERO.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WAKE_WOKEN_SUM.fetch_add(u64::try_from(woken).unwrap_or(0), Ordering::Relaxed);
+    }
+}
 
 /// Base for Kakehashi host helpers (`'KH' << 16`).
 pub(super) const KH_HELPER_BASE: u32 = 0x4B48_0000;
@@ -163,7 +291,13 @@ fn handle_park(args: SyscallArgs) -> SyscallResult {
     // Identity map: guest VA is host VA.
     let ptr = usize::try_from(addr).unwrap_or(0);
     let u32_ptr = std::ptr::with_exposed_provenance_mut::<u32>(ptr);
-    park_u32(u32_ptr, expected);
+    // SAFETY: range checked; identity-mapped guest word.
+    let cur = unsafe { core::ptr::read_volatile(u32_ptr) };
+    let mismatch = cur != expected;
+    note_park(expected, mismatch);
+    if !mismatch {
+        park_u32(u32_ptr, expected);
+    }
     SyscallResult::ok(name, 0)
 }
 
@@ -178,6 +312,7 @@ fn handle_wake(args: SyscallArgs) -> SyscallResult {
     let u32_ptr = std::ptr::with_exposed_provenance_mut::<u32>(ptr);
     let count = if n <= 0 { i32::MAX } else { n };
     let woken = wake_u32(u32_ptr, count);
+    note_wake(n, woken);
     SyscallResult::ok(name, u64::try_from(woken).unwrap_or(0))
 }
 
