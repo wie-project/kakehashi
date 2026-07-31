@@ -57,7 +57,7 @@ Priority is **guest surface**, not another ×5→×4 micro-pass:
 
 | Priority | Direction | Notes |
 | --- | --- | --- |
-| 1 | **curl** (or other network CLI) | New syscall class: sockets, poll, DNS; proves network I/O |
+| 1 | **curl** (network CLI) | **Active.** Sockets/poll/DNS; installer; HTTP gate. See [curl.md](curl.md) |
 | 2 | **git** | Larger surface (process, pipes, many FS ops); better after sockets + more POSIX |
 | — | Optional polish | `getrusage` / Usage% for 7zz; not a gate |
 
@@ -65,6 +65,25 @@ Rationale for curl before git: smaller vertical slice, forces network ABI,
 reuses existing FS/thread foundation. Git exercises more of the world but
 depends on process/spawn, pipes, and often network for remotes — higher
 risk before sockets exist.
+
+### Curl milestone (active) — **trace-first**
+
+Do **not** land speculative socket tables without a probe log. Method and
+artifacts: [curl.md](curl.md).
+
+| Slice | State |
+| --- | --- |
+| `kh install curl` (download URL + optional `KAKEHASHI_CURL`) | done |
+| Guest path `/usr/local/bin/curl` | done |
+| `scripts/docker-curl.sh` (+ probe wrapper) | done |
+| G2: first real ENOSYS / load log from Darwin curl | **next** (run probe) |
+| Handlers only for numbers seen in G2 | blocked on probe |
+| Gate: HTTP GET under `kh` (Docker/Colima) | after G2-driven surface |
+| HTTPS / static TLS binary | deferred |
+| UTM bare-metal confirm | later |
+
+Process notes for curl PRs: internet allowed for live tests; clippy `-D warnings`;
+keep `7zz -mmt=4` green; clean-room only (no Darling).
 
 ## Process
 

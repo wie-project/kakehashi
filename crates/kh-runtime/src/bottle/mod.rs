@@ -6,7 +6,7 @@
 //!   `usr/lib/libc++.1.dylib` → `libSystem.B.dylib`) and installs guest
 //!   `libSystem.B.dylib` from disk discovery or the crate-embedded freestanding
 //!   dylib (`resources/libSystem.B.dylib`, published on crates.io).
-//! * **Guest tools** — host path discovery for integration binaries (`7zz`).
+//! * **Guest tools** — host path discovery for integration binaries (`7zz`, `curl`).
 
 mod guest_tools;
 mod layout;
@@ -16,9 +16,9 @@ mod path;
 mod registry;
 
 pub use guest_tools::{
-    DARWIN_7ZZ_URL, DEFAULT_7ZZ_PATH, ENV_7ZZ, GUEST_7ZZ_REL, GUEST_PATH_DIRS, InstallPackage,
-    InstallReport, ToolError, discover_7zz, guest_path_to_host, install_package, package_host_path,
-    resolve_guest_program,
+    DARWIN_7ZZ_URL, DARWIN_CURL_URL, DEFAULT_7ZZ_PATH, ENV_7ZZ, ENV_CURL, GUEST_7ZZ_REL,
+    GUEST_CURL_REL, GUEST_PATH_DIRS, InstallPackage, InstallReport, ToolError, discover_7zz,
+    discover_curl, guest_path_to_host, install_package, package_host_path, resolve_guest_program,
 };
 pub use layout::{
     GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX,

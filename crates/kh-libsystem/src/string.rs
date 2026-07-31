@@ -336,3 +336,539 @@ pub(crate) unsafe extern "C" fn wmemcpy(
     }
     dst
 }
+
+// ── curl G1 string surface (from Docker unresolved list) ────────────────────
+
+/// C `strdup` → nlist `_strdup`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    let n = unsafe { crate::stdio::strlen(s) };
+    let total = n.saturating_add(1);
+    let p = unsafe { crate::malloc(total).cast::<c_char>() };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let _ = memcpy(p.cast(), s.cast(), total);
+    }
+    p
+}
+
+/// C `strcpy` → nlist `_strcpy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strcpy(dst: *mut c_char, src: *const c_char) -> *mut c_char {
+    if dst.is_null() || src.is_null() {
+        return dst;
+    }
+    unsafe {
+        let n = crate::stdio::strlen(src).saturating_add(1);
+        let _ = memcpy(dst.cast(), src.cast(), n);
+    }
+    dst
+}
+
+/// C `strncpy` → nlist `_strncpy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strncpy(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+) -> *mut c_char {
+    if dst.is_null() || n == 0 {
+        return dst;
+    }
+    if src.is_null() {
+        unsafe {
+            let _ = crate::stdio::memset(dst.cast(), 0, n);
+        }
+        return dst;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            let b = src.add(i).read();
+            dst.add(i).write(b);
+            if b == 0 {
+                i = i.saturating_add(1);
+                while i < n {
+                    dst.add(i).write(0);
+                    i = i.saturating_add(1);
+                }
+                break;
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    dst
+}
+
+/// C `strcat` → nlist `_strcat`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strcat(dst: *mut c_char, src: *const c_char) -> *mut c_char {
+    if dst.is_null() || src.is_null() {
+        return dst;
+    }
+    unsafe {
+        let end = dst.add(crate::stdio::strlen(dst));
+        let _ = strcpy(end, src);
+    }
+    dst
+}
+
+/// C `strncmp` → nlist `_strncmp`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strncmp(s1: *const c_char, s2: *const c_char, n: usize) -> c_int {
+    if n == 0 || s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            let a = s1.add(i).read().cast_unsigned();
+            let b = s2.add(i).read().cast_unsigned();
+            if a != b {
+                return c_int::from(a).wrapping_sub(c_int::from(b));
+            }
+            if a == 0 {
+                return 0;
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    0
+}
+
+/// C `memchr` → nlist `_memchr`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn memchr(
+    haystack: *const c_void,
+    ch: c_int,
+    nbytes: usize,
+) -> *mut c_void {
+    if haystack.is_null() || nbytes == 0 {
+        return core::ptr::null_mut();
+    }
+    let needle = u8::try_from(ch.cast_unsigned() & 0xff).unwrap_or(0);
+    unsafe {
+        let base = haystack.cast::<u8>();
+        let mut idx = 0_usize;
+        while idx < nbytes {
+            if base.add(idx).read() == needle {
+                return base.add(idx).cast_mut().cast();
+            }
+            idx = idx.saturating_add(1);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// C `atoi` → nlist `_atoi` (ASCII decimal, no errno).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn atoi(s: *const c_char) -> c_int {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut p = s;
+        // skip leading space
+        loop {
+            let b = p.read().cast_unsigned();
+            if b == 0 {
+                return 0;
+            }
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' || b == b'\x0b' || b == b'\x0c' {
+                p = p.add(1);
+                continue;
+            }
+            break;
+        }
+        let mut sign = 1_i32;
+        let b0 = p.read().cast_unsigned();
+        if b0 == b'+' {
+            p = p.add(1);
+        } else if b0 == b'-' {
+            sign = -1;
+            p = p.add(1);
+        }
+        let mut acc = 0_i32;
+        loop {
+            let b = p.read().cast_unsigned();
+            if !b.is_ascii_digit() {
+                break;
+            }
+            let digit = i32::from(b.wrapping_sub(b'0'));
+            acc = acc.saturating_mul(10).saturating_add(digit);
+            p = p.add(1);
+        }
+        acc.saturating_mul(sign)
+    }
+}
+
+/// C `isdigit` → nlist `_isdigit`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn isdigit(c: c_int) -> c_int {
+    let u = c.cast_unsigned();
+    c_int::from((u >= u32::from(b'0')) && (u <= u32::from(b'9')))
+}
+
+/// C `isspace` → nlist `_isspace`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn isspace(c: c_int) -> c_int {
+    if c < 0 {
+        return 0;
+    }
+    let u = c.cast_unsigned();
+    c_int::from(
+        u == u32::from(b' ')
+            || u == u32::from(b'\t')
+            || u == u32::from(b'\n')
+            || u == u32::from(b'\r')
+            || u == u32::from(b'\x0b')
+            || u == u32::from(b'\x0c'),
+    )
+}
+
+/// C `isupper` → nlist `_isupper`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn isupper(c: c_int) -> c_int {
+    let u = c.cast_unsigned();
+    c_int::from((u >= u32::from(b'A')) && (u <= u32::from(b'Z')))
+}
+
+/// C `tolower` → nlist `_tolower`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tolower(c: c_int) -> c_int {
+    let upper_a = c_int::from(b'A');
+    let upper_z = c_int::from(b'Z');
+    if (upper_a..=upper_z).contains(&c) {
+        c.wrapping_sub(upper_a).wrapping_add(c_int::from(b'a'))
+    } else {
+        c
+    }
+}
+
+/// C `strcasecmp` → nlist `_strcasecmp`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strcasecmp(s1: *const c_char, s2: *const c_char) -> c_int {
+    if s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut left = s1;
+        let mut right = s2;
+        loop {
+            let a = tolower(c_int::from(left.read().cast_unsigned()));
+            let b = tolower(c_int::from(right.read().cast_unsigned()));
+            if a != b {
+                return a.wrapping_sub(b);
+            }
+            if a == 0 {
+                return 0;
+            }
+            left = left.add(1);
+            right = right.add(1);
+        }
+    }
+}
+
+/// C `strncasecmp` → nlist `_strncasecmp`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strncasecmp(
+    s1: *const c_char,
+    s2: *const c_char,
+    n: usize,
+) -> c_int {
+    if n == 0 || s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            let a = tolower(c_int::from(s1.add(i).read().cast_unsigned()));
+            let b = tolower(c_int::from(s2.add(i).read().cast_unsigned()));
+            if a != b {
+                return a.wrapping_sub(b);
+            }
+            if a == 0 {
+                return 0;
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    0
+}
+
+/// C `strrchr` → nlist `_strrchr`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strrchr(s: *const c_char, c: c_int) -> *mut c_char {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    let needle = u8::try_from(c.cast_unsigned() & 0xff).unwrap_or(0);
+    let mut last: *mut c_char = core::ptr::null_mut();
+    unsafe {
+        let mut p = s;
+        loop {
+            let byte = p.read().cast_unsigned();
+            if byte == needle {
+                last = p.cast_mut();
+            }
+            if byte == 0 {
+                return last;
+            }
+            p = p.add(1);
+        }
+    }
+}
+
+/// C `strnlen` → nlist `_strnlen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strnlen(s: *const c_char, maxlen: usize) -> usize {
+    if s.is_null() || maxlen == 0 {
+        return 0;
+    }
+    let mut n = 0_usize;
+    unsafe {
+        while n < maxlen {
+            if s.add(n).read() == 0 {
+                break;
+            }
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+/// C `strtol` → nlist `_strtol`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtol(
+    s: *const c_char,
+    endp: *mut *mut c_char,
+    base: c_int,
+) -> i64 {
+    unsafe { strto_i64(s, endp, base) }
+}
+
+/// C `strtoll` → nlist `_strtoll`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtoll(
+    s: *const c_char,
+    endp: *mut *mut c_char,
+    base: c_int,
+) -> i64 {
+    unsafe { strto_i64(s, endp, base) }
+}
+
+/// C `strtoul` → nlist `_strtoul`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtoul(
+    s: *const c_char,
+    endp: *mut *mut c_char,
+    base: c_int,
+) -> u64 {
+    let v = unsafe { strto_i64(s, endp, base) };
+    v.cast_unsigned()
+}
+
+unsafe fn strto_i64(s: *const c_char, endp: *mut *mut c_char, base: c_int) -> i64 {
+    if s.is_null() {
+        return 0;
+    }
+    let mut p = s;
+    unsafe {
+        // skip spaces
+        loop {
+            let b = p.read().cast_unsigned();
+            if b == 0 {
+                if !endp.is_null() {
+                    endp.write(p.cast_mut());
+                }
+                return 0;
+            }
+            if isspace(c_int::from(b)) != 0 {
+                p = p.add(1);
+                continue;
+            }
+            break;
+        }
+        let mut sign = 1_i64;
+        let b0 = p.read().cast_unsigned();
+        if b0 == b'+' {
+            p = p.add(1);
+        } else if b0 == b'-' {
+            sign = -1;
+            p = p.add(1);
+        }
+        let mut radix = base;
+        if radix == 0 {
+            if p.read().cast_unsigned() == b'0' {
+                let n = p.add(1).read().cast_unsigned();
+                if n == b'x' || n == b'X' {
+                    radix = 16;
+                    p = p.add(2);
+                } else {
+                    radix = 8;
+                }
+            } else {
+                radix = 10;
+            }
+        } else if radix == 16
+            && p.read().cast_unsigned() == b'0'
+            && {
+                let n = p.add(1).read().cast_unsigned();
+                n == b'x' || n == b'X'
+            }
+        {
+            p = p.add(2);
+        }
+        if !(2..=36).contains(&radix) {
+            if !endp.is_null() {
+                endp.write(s.cast_mut());
+            }
+            return 0;
+        }
+        let radix_u = u32::try_from(radix).unwrap_or(10);
+        let mut acc = 0_i64;
+        let start = p;
+        loop {
+            let b = p.read().cast_unsigned();
+            let digit = if b.is_ascii_digit() {
+                u32::from(b.wrapping_sub(b'0'))
+            } else if b.is_ascii_lowercase() {
+                u32::from(b.wrapping_sub(b'a')).saturating_add(10)
+            } else if b.is_ascii_uppercase() {
+                u32::from(b.wrapping_sub(b'A')).saturating_add(10)
+            } else {
+                break;
+            };
+            if digit >= radix_u {
+                break;
+            }
+            acc = acc
+                .saturating_mul(i64::from(radix_u))
+                .saturating_add(i64::from(digit));
+            p = p.add(1);
+        }
+        if p == start {
+            if !endp.is_null() {
+                endp.write(s.cast_mut());
+            }
+            return 0;
+        }
+        if !endp.is_null() {
+            endp.write(p.cast_mut());
+        }
+        acc.saturating_mul(sign)
+    }
+}
+
+/// C `strcspn` → nlist `_strcspn`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strcspn(s: *const c_char, reject: *const c_char) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut n = 0_usize;
+        loop {
+            let b = s.add(n).read();
+            if b == 0 {
+                return n;
+            }
+            if !reject.is_null() && !strchr(reject, c_int::from(b.cast_unsigned())).is_null() {
+                return n;
+            }
+            n = n.saturating_add(1);
+        }
+    }
+}
+
+/// C `strspn` → nlist `_strspn`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strspn(s: *const c_char, accept: *const c_char) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut n = 0_usize;
+        loop {
+            let b = s.add(n).read();
+            if b == 0 {
+                return n;
+            }
+            if accept.is_null() || strchr(accept, c_int::from(b.cast_unsigned())).is_null() {
+                return n;
+            }
+            n = n.saturating_add(1);
+        }
+    }
+}
+
+// Darwin fortify wrappers (curl imports these; bounds not enforced yet).
+
+/// `___strcpy_chk` → nlist `___strcpy_chk`.
+#[unsafe(export_name = "__strcpy_chk")]
+pub(crate) unsafe extern "C" fn __strcpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    _dstlen: usize,
+) -> *mut c_char {
+    unsafe { strcpy(dst, src) }
+}
+
+/// `___strncpy_chk` → nlist `___strncpy_chk`.
+#[unsafe(export_name = "__strncpy_chk")]
+pub(crate) unsafe extern "C" fn __strncpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    len: usize,
+    _dstlen: usize,
+) -> *mut c_char {
+    unsafe { strncpy(dst, src, len) }
+}
+
+/// `___strcat_chk` → nlist `___strcat_chk`.
+#[unsafe(export_name = "__strcat_chk")]
+pub(crate) unsafe extern "C" fn __strcat_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    _dstlen: usize,
+) -> *mut c_char {
+    unsafe { strcat(dst, src) }
+}
+
+/// `___memcpy_chk` → nlist `___memcpy_chk`.
+#[unsafe(export_name = "__memcpy_chk")]
+pub(crate) unsafe extern "C" fn __memcpy_chk(
+    dst: *mut c_void,
+    src: *const c_void,
+    len: usize,
+    _dstlen: usize,
+) -> *mut c_void {
+    unsafe { memcpy(dst, src, len) }
+}
+
+/// `___memmove_chk` → nlist `___memmove_chk`.
+#[unsafe(export_name = "__memmove_chk")]
+pub(crate) unsafe extern "C" fn __memmove_chk(
+    dst: *mut c_void,
+    src: *const c_void,
+    len: usize,
+    _dstlen: usize,
+) -> *mut c_void {
+    unsafe { crate::stdio::memmove(dst, src, len) }
+}
+
+/// `___memset_chk` → nlist `___memset_chk`.
+#[unsafe(export_name = "__memset_chk")]
+pub(crate) unsafe extern "C" fn __memset_chk(
+    dst: *mut c_void,
+    c: c_int,
+    len: usize,
+    _dstlen: usize,
+) -> *mut c_void {
+    unsafe { crate::stdio::memset(dst, c, len) }
+}

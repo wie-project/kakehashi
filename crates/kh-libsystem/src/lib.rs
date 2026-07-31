@@ -33,9 +33,11 @@
 #![allow(unsafe_code)] // guest C ABI + raw Darwin SVC
 #![allow(clippy::missing_safety_doc)]
 
+mod apple_stubs;
 mod cxxabi;
 mod errno;
 mod heap;
+mod locale;
 mod posix;
 mod process;
 mod pthread;

@@ -200,3 +200,30 @@ pub(crate) unsafe extern "C" fn stack_chk_fail() -> ! {
 pub(crate) unsafe extern "C" fn chkstk_darwin() {
     // Called with stack growth in x9 on Darwin; we ignore.
 }
+
+/// Bottle export for guests that nlist-import `dyld_stub_binder`.
+///
+/// Darwin ld emits this as `_dyld_stub_binder`; `kh-loader` also registers the
+/// unadorned `dyld_stub_binder` name in the export map (curl uses that spelling).
+/// Eager bind should not call this; if it runs, abort.
+#[unsafe(export_name = "dyld_stub_binder")]
+pub(crate) unsafe extern "C" fn dyld_stub_binder_export() {
+    trace::note(b"[kh-libsystem] dyld_stub_binder() unexpected\n");
+    // SAFETY: never returns.
+    unsafe {
+        exit_now(127);
+    }
+}
+
+/// Catch-all for strong binds that have no real definition yet.
+///
+/// `kh-loader` may point unresolved imports here (warn once per name) so large
+/// guests like curl can finish load; the first call aborts with a note.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn kh_missing_symbol() -> ! {
+    trace::note(b"[kh-libsystem] kh_missing_symbol() - bound missing import was called\n");
+    // SAFETY: never returns.
+    unsafe {
+        exit_now(127);
+    }
+}

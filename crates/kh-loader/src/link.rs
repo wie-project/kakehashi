@@ -123,6 +123,7 @@ pub(crate) fn bind_main_got_nlist(session: &mut LoadSession) -> Result<(), LoadE
     }
     let got_va = got_pref.wrapping_add(main_slide);
 
+    let missing_stub = export_map.get("_kh_missing_symbol").copied();
     let mut values = Vec::with_capacity(undefs.len());
     for u in &undefs {
         match export_map.get(&u.name) {
@@ -135,9 +136,17 @@ pub(crate) fn bind_main_got_nlist(session: &mut LoadSession) -> Result<(), LoadE
                 values.push(0);
             }
             None => {
-                return Err(LoadError::UnresolvedSymbol {
-                    name: u.name.clone(),
-                });
+                if let Some(stub) = missing_stub {
+                    tracing::warn!(
+                        name = %u.name,
+                        "unresolved strong nlist; bound to _kh_missing_symbol"
+                    );
+                    values.push(stub);
+                } else {
+                    return Err(LoadError::UnresolvedSymbol {
+                        name: u.name.clone(),
+                    });
+                }
             }
         }
     }
@@ -173,6 +182,11 @@ pub(crate) fn build_export_map(images: &[ProcessImage]) -> HashMap<String, u64> 
             map.entry(exp.name.clone())
                 .or_insert_with(|| exp.value.wrapping_add(slide));
         }
+    }
+    // Darwin clients (e.g. curl) import the unadorned dyld helper name; freestanding
+    // libSystem exports the C-style `_dyld_stub_binder` nlist.
+    if let Some(&va) = map.get("_dyld_stub_binder") {
+        map.entry("dyld_stub_binder".into()).or_insert(va);
     }
     map
 }

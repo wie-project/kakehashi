@@ -16,6 +16,9 @@ use super::registry;
 /// Env override: host path of a Darwin `7zz` binary (skip download).
 pub const ENV_7ZZ: &str = "KAKEHASHI_7ZZ";
 
+/// Env override: host path of a Darwin `curl` binary (skip download).
+pub const ENV_CURL: &str = "KAKEHASHI_CURL";
+
 /// Legacy ad-hoc drop location (still checked by discovery helpers).
 pub const DEFAULT_7ZZ_PATH: &str = "/tmp/7zz";
 
@@ -23,16 +26,30 @@ pub const DEFAULT_7ZZ_PATH: &str = "/tmp/7zz";
 pub const DARWIN_7ZZ_URL: &str =
     "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-mac.tar.xz";
 
+/// Public Darwin arm64 static-ish curl (stunnel/static-curl release).
+///
+/// Archive root contains a single `curl` Mach-O. Prefer this over Apple
+/// `/usr/bin/curl` (which needs `libcurl.4.dylib`). Still may link Apple
+/// frameworks for TLS — probe will surface that; see `docs/curl.md`.
+pub const DARWIN_CURL_URL: &str = "https://github.com/stunnel/static-curl/releases/download/8.21.0/curl-macos-arm64-8.21.0.tar.xz";
+
 /// Guest-relative install path for Darwin 7zz (under bottle root).
 ///
 /// On a real Mac this is `/usr/local/bin/7zz`.
 pub const GUEST_7ZZ_REL: &str = "usr/local/bin/7zz";
+
+/// Guest-relative install path for Darwin curl (under bottle root).
+///
+/// On a real Mac this is `/usr/local/bin/curl`.
+pub const GUEST_CURL_REL: &str = "usr/local/bin/curl";
 
 /// Known installable package ids (`kh install <name>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPackage {
     /// Darwin 7-Zip console (`7zz`).
     SevenZip,
+    /// Darwin `curl` (downloaded arm64 Mach-O; see `docs/curl.md`).
+    Curl,
 }
 
 impl InstallPackage {
@@ -41,6 +58,7 @@ impl InstallPackage {
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "7zip" | "7zz" | "sevenzip" | "p7zip" => Some(Self::SevenZip),
+            "curl" => Some(Self::Curl),
             _ => None,
         }
     }
@@ -50,6 +68,7 @@ impl InstallPackage {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SevenZip => "7zip",
+            Self::Curl => "curl",
         }
     }
 
@@ -58,6 +77,7 @@ impl InstallPackage {
     pub const fn guest_path(self) -> &'static str {
         match self {
             Self::SevenZip => "/usr/local/bin/7zz",
+            Self::Curl => "/usr/local/bin/curl",
         }
     }
 }
@@ -78,7 +98,7 @@ pub enum ToolError {
     #[error("expected binary not found in downloaded archive")]
     MissingBinary,
     /// Unknown package name.
-    #[error("unknown package `{0}` (known: 7zip)")]
+    #[error("unknown package `{0}` (known: 7zip, curl)")]
     UnknownPackage(String),
 }
 
@@ -87,6 +107,7 @@ pub enum ToolError {
 pub fn package_host_path(bottle: &Path, package: InstallPackage) -> PathBuf {
     match package {
         InstallPackage::SevenZip => bottle.join(GUEST_7ZZ_REL),
+        InstallPackage::Curl => bottle.join(GUEST_CURL_REL),
     }
 }
 
@@ -143,6 +164,7 @@ pub fn install_package(name: &str) -> Result<InstallReport, ToolError> {
         InstallPackage::parse(name).ok_or_else(|| ToolError::UnknownPackage(name.to_owned()))?;
     match package {
         InstallPackage::SevenZip => install_sevenzip(),
+        InstallPackage::Curl => install_curl(),
     }
 }
 
@@ -229,6 +251,104 @@ fn install_sevenzip() -> Result<InstallReport, ToolError> {
         guest_path: InstallPackage::SevenZip.guest_path(),
         bottle,
     })
+}
+
+/// Install Darwin `curl` into the bottle at `/usr/local/bin/curl`.
+///
+/// Order: `KAKEHASHI_CURL` (already a binary) → download [`DARWIN_CURL_URL`]
+/// and extract the `curl` Mach-O from the tarball.
+fn install_curl() -> Result<InstallReport, ToolError> {
+    let bottle = ensure_active_bottle()?;
+    let dest = package_host_path(&bottle, InstallPackage::Curl);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Prefer env override (already a binary) over download.
+    if let Ok(raw) = std::env::var(ENV_CURL) {
+        let src = PathBuf::from(raw);
+        if src.is_file() {
+            if dest.exists() {
+                drop(fs::remove_file(&dest));
+            }
+            fs::copy(&src, &dest)?;
+            set_executable(&dest)?;
+            return Ok(InstallReport {
+                package: InstallPackage::Curl.as_str(),
+                host_path: dest,
+                guest_path: InstallPackage::Curl.guest_path(),
+                bottle,
+            });
+        }
+    }
+
+    let tmp_root = registry::data_dir()?.join(".kh-dl-curl");
+    drop(fs::remove_dir_all(&tmp_root));
+    fs::create_dir_all(&tmp_root)?;
+    let archive = tmp_root.join("curl-macos-arm64.tar.xz");
+    download_url(DARWIN_CURL_URL, &archive)?;
+
+    let status = Command::new("tar")
+        .args(["-xJf"])
+        .arg(&archive)
+        .current_dir(&tmp_root)
+        .status()
+        .map_err(|e| ToolError::Command(format!("tar: {e}")))?;
+    if !status.success() {
+        drop(fs::remove_dir_all(&tmp_root));
+        return Err(ToolError::Command(format!(
+            "tar extract failed (status {status})"
+        )));
+    }
+
+    let found = find_named_file(&tmp_root, "curl").ok_or(ToolError::MissingBinary)?;
+    // Avoid copying the archive itself if it were ever named `curl`.
+    if found == archive {
+        drop(fs::remove_dir_all(&tmp_root));
+        return Err(ToolError::MissingBinary);
+    }
+    if dest.exists() {
+        drop(fs::remove_file(&dest));
+    }
+    fs::copy(&found, &dest)?;
+    set_executable(&dest)?;
+    drop(fs::remove_dir_all(&tmp_root));
+
+    Ok(InstallReport {
+        package: InstallPackage::Curl.as_str(),
+        host_path: dest,
+        guest_path: InstallPackage::Curl.guest_path(),
+        bottle,
+    })
+}
+
+/// Discover Darwin `curl` for convenience helpers.
+///
+/// Order: explicit → `KAKEHASHI_CURL` → active bottle `/usr/local/bin/curl`.
+#[must_use]
+pub fn discover_curl(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        return None;
+    }
+
+    if let Ok(raw) = std::env::var(ENV_CURL) {
+        let p = PathBuf::from(raw);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(Some(root)) = manage::active_root() {
+        let p = package_host_path(&root, InstallPackage::Curl);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    None
 }
 
 fn set_executable(path: &Path) -> io::Result<()> {
@@ -347,6 +467,8 @@ mod tests {
             Some(InstallPackage::SevenZip)
         );
         assert_eq!(InstallPackage::parse("7ZZ"), Some(InstallPackage::SevenZip));
+        assert_eq!(InstallPackage::parse("curl"), Some(InstallPackage::Curl));
+        assert_eq!(InstallPackage::parse("CURL"), Some(InstallPackage::Curl));
         assert!(InstallPackage::parse("foo").is_none());
     }
 

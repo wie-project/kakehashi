@@ -29,7 +29,7 @@ ships the dylib; end users do not need a separate download.
 - Rust 1.97+
 - **Linux aarch64** for live `kh run` / `kh trace`
 - Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
-- Optional: `curl`/`wget` + `tar` for `kh install 7zip`
+- Optional: `curl`/`wget` + `tar` for `kh install 7zip` / `kh install curl`
 
 ## Install
 
@@ -39,6 +39,7 @@ cargo install kakehashi
 
 kh bottle ensure          # embeds libSystem into the bottle
 kh install 7zip           # optional: Darwin 7zz → guest /usr/local/bin/7zz
+kh install curl           # optional: Darwin curl → guest /usr/local/bin/curl
 kh run 7zz -- a /tmp/demo.7z ./README.md
 ```
 
@@ -51,6 +52,7 @@ Default root: `~/.local/share/kakehashi/bottle/` (override with
 | --- | --- |
 | `…/bottle/` | `/` |
 | `…/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
+| `…/usr/local/bin/curl` | `/usr/local/bin/curl` |
 | `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
 | `…/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
 
@@ -143,6 +145,7 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 | Fixtures | `kh run --expect-code … tests/fixtures/…` | see `tests/fixtures/README.md` |
 | Clang probes | `kh run --root tests/fixtures/bottle tests/clang-probe/puts_hello` | stdout `hello` |
 | Real Darwin `7zz` | `./scripts/docker-7zz.sh …` | host `.tmp/kh-out/` |
+| Real Darwin `curl` | `./scripts/docker-curl.sh …` | host `.tmp/kh-out/`; probe → `.tmp/kh-curl-probe/` |
 | Fair CPU bench | `./scripts/bench-fair-local.sh` | host `.tmp/kh-bench-fair/` |
 
 `.tmp/`, `.kh/`, and `target/` are gitignored.
@@ -178,6 +181,8 @@ KAKEHASHI_HYPERCALL=1 ./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
 | `scripts/install-linux.sh` | Local build + install `kh` + `bottle ensure` |
 | `scripts/docker-smoke.sh` | Smoke suite inside `Dockerfile` image |
 | `scripts/docker-7zz.sh` | Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
+| `scripts/docker-curl.sh` | Darwin `curl` under `kh` (same shape as `docker-7zz`) |
+| `scripts/docker-curl-probe.sh` | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`) |
 | `scripts/bench-fair-local.sh` | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`) |
 
 ## License

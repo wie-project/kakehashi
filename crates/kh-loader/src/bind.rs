@@ -386,6 +386,31 @@ pub(crate) fn resolve_bind_symbol(
     binder_idx: usize,
     site: &BindSite,
 ) -> Result<u64, LoadError> {
+    match resolve_bind_symbol_inner(images, binder_idx, site) {
+        Ok(va) => Ok(va),
+        Err(LoadError::UnresolvedSymbol { name }) if !site.weak => {
+            // Large guests (curl) import more libc surface than freestanding
+            // libSystem implements. Point strong misses at `_kh_missing_symbol`
+            // so load completes; first call aborts with a guest-visible note.
+            if let Ok(stub) = lookup_flat(images, "_kh_missing_symbol", false) {
+                tracing::warn!(
+                    name = %name,
+                    "unresolved strong symbol; bound to _kh_missing_symbol"
+                );
+                Ok(stub)
+            } else {
+                Err(LoadError::UnresolvedSymbol { name })
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn resolve_bind_symbol_inner(
+    images: &[ProcessImage],
+    binder_idx: usize,
+    site: &BindSite,
+) -> Result<u64, LoadError> {
     // Specials from SET_DYLIB_SPECIAL_IMM / chained import ordinals are
     // sign-extended to negative i16 (SELF=0, MAIN=-1, FLAT=-2, WEAK=-3).
     // Positive ordinals are 1-based LC_LOAD_* order.
@@ -420,9 +445,17 @@ pub(crate) fn resolve_bind_symbol(
                 lookup_in_image(Some(img), &site.name, site.weak)
             } else if site.weak {
                 Ok(0)
+            } else if let Ok(va) = lookup_flat(images, &site.name, false) {
+                // Framework skipped (e.g. CoreFoundation) but freestanding
+                // libSystem may still export a stub for G1 probes (curl).
+                tracing::debug!(
+                    name = %site.name,
+                    missing = %dep_name,
+                    "two-level target missing; flat stub resolve"
+                );
+                Ok(va)
             } else {
-                // Two-level target not mapped: strong symbols stay unresolved
-                // (matches no-bottle libSystem).
+                // Two-level target not mapped and no flat definition.
                 Err(LoadError::UnresolvedSymbol {
                     name: site.name.clone(),
                 })
@@ -519,6 +552,13 @@ fn lookup_in_image(img: Option<&ProcessImage>, name: &str, weak: bool) -> Result
     }
     let slide = img.slide();
     if let Some(exp) = img.exports.iter().find(|e| e.name == name) {
+        return Ok(exp.value.wrapping_add(slide));
+    }
+    // curl imports unadorned `dyld_stub_binder`; freestanding libSystem exports
+    // the C nlist `_dyld_stub_binder` (see `build_export_map` alias).
+    if name == "dyld_stub_binder"
+        && let Some(exp) = img.exports.iter().find(|e| e.name == "_dyld_stub_binder")
+    {
         return Ok(exp.value.wrapping_add(slide));
     }
     if weak {

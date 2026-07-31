@@ -34,3 +34,13 @@ pub unsafe extern "C" fn kh_bottle_mark() -> c_int {
     trace::note(b"[kh-libsystem] kh_bottle_mark() -> 77\n");
     KH_BOTTLE_MARK_VALUE
 }
+
+/// C `abort` → nlist `_abort` (curl G1; exit 134 ≈ SIGABRT).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn abort() -> ! {
+    trace::note(b"[kh-libsystem] abort()\n");
+    // SAFETY: never returns.
+    unsafe {
+        exit_now(134);
+    }
+}

@@ -42,16 +42,34 @@ pub(crate) fn run(args: &InstallArgs<'_>) -> Result<()> {
     writeln!(out)?;
     writeln!(out, "Run under kh (PATH search works for bare names):")?;
     writeln!(out, "  kh run {} -- …", report.guest_path)?;
-    writeln!(out, "  kh run 7zz -- a /tmp/out.7z ./file")?;
+    match report.package {
+        "curl" => {
+            writeln!(out, "  kh run curl -- -sS http://example.com/")?;
+            writeln!(
+                out,
+                "  (override binary: KAKEHASHI_CURL=/path/to/darwin-curl)"
+            )?;
+        }
+        _ => {
+            writeln!(out, "  kh run 7zz -- a /tmp/out.7z ./file")?;
+        }
+    }
     Ok(())
 }
 
 fn list_packages(json: bool) -> Result<()> {
-    let items = [(
-        "7zip",
-        "/usr/local/bin/7zz",
-        "Darwin 7-Zip console (official macOS build)",
-    )];
+    let items = [
+        (
+            "7zip",
+            "/usr/local/bin/7zz",
+            "Darwin 7-Zip console (official macOS build)",
+        ),
+        (
+            "curl",
+            "/usr/local/bin/curl",
+            "Darwin arm64 curl (download; override with KAKEHASHI_CURL)",
+        ),
+    ];
     if json {
         let arr: Vec<_> = items
             .iter()
@@ -73,6 +91,7 @@ fn list_packages(json: bool) -> Result<()> {
     }
     writeln!(out)?;
     writeln!(out, "  kh install 7zip")?;
+    writeln!(out, "  kh install curl")?;
     Ok(())
 }
 

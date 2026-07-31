@@ -338,6 +338,74 @@ pub(crate) unsafe extern "C" fn fgetc(stream: *mut c_void) -> c_int {
     c_int::from(byte[0])
 }
 
+/// C `fread` → nlist `_fread` (curl G1 follow-up after `_DefaultRuneLocale`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fread(
+    ptr: *mut c_void,
+    size: usize,
+    nitems: usize,
+    stream: *mut c_void,
+) -> usize {
+    if stream.is_null() || size == 0 || nitems == 0 {
+        return 0;
+    }
+    if ptr.is_null() {
+        errno::set_errno(14);
+        return 0;
+    }
+    let f = unsafe { as_file(stream) };
+    let total = size.saturating_mul(nitems);
+    let fd = unsafe { (*f).fd };
+    let fd_u = u64::from(fd.cast_unsigned());
+    let n = unsafe { sys::syscall3(SYS_READ, fd_u, ptr_to_u64(ptr), usize_to_u64(total)) };
+    if n < 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+            (*f).err = 1;
+        }
+        return 0;
+    }
+    if n == 0 {
+        unsafe {
+            (*f).flags |= FILE_EOF;
+        }
+        return 0;
+    }
+    let got = usize::try_from(n).unwrap_or(0);
+    // Whole items only (POSIX fread).
+    got.checked_div(size).unwrap_or(0)
+}
+
+/// C `fwrite` → nlist `_fwrite`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fwrite(
+    ptr: *const c_void,
+    size: usize,
+    nitems: usize,
+    stream: *mut c_void,
+) -> usize {
+    if stream.is_null() || size == 0 || nitems == 0 {
+        return 0;
+    }
+    if ptr.is_null() {
+        errno::set_errno(14);
+        return 0;
+    }
+    let f = unsafe { as_file(stream) };
+    let total = size.saturating_mul(nitems);
+    let fd = unsafe { (*f).fd };
+    let ret = unsafe { write(fd, ptr, total) };
+    if ret < 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+            (*f).err = 1;
+        }
+        return 0;
+    }
+    let got = usize::try_from(ret).unwrap_or(0);
+    got.checked_div(size).unwrap_or(0)
+}
+
 #[inline]
 fn usize_to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(0)

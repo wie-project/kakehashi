@@ -23,6 +23,9 @@ bench = false
 [dependencies]
 # Intentionally empty: freestanding guest stubs (no host libSystem / libc body).
 
+[build-dependencies]
+cc = "1.2"
+
 [lints]
 workspace = true
 

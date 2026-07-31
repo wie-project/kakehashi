@@ -10,6 +10,7 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
 | [Roadmap](roadmap.md) | Perf status, next work, process |
+| [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates |
 
 User-facing install and CI economics: root [`README.md`](../README.md).
 

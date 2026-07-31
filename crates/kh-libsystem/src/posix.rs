@@ -733,6 +733,121 @@ pub(crate) unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_ch
     core::ptr::addr_of_mut!(C_LOCALE).cast()
 }
 
+/// C `getenv` → nlist `_getenv` (no environ yet; always null).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
+    core::ptr::null_mut()
+}
+
+/// C `uselocale` → nlist `_uselocale` (no thread locales; return null).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn uselocale(_new: *mut c_void) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// C `getuid` → nlist `_getuid`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getuid() -> u32 {
+    501
+}
+
+/// C `geteuid` → nlist `_geteuid`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn geteuid() -> u32 {
+    501
+}
+
+/// C `getgid` → nlist `_getgid`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getgid() -> u32 {
+    20
+}
+
+/// C `getegid` → nlist `_getegid`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getegid() -> u32 {
+    20
+}
+
+/// C `setvbuf` → nlist `_setvbuf` (no buffering).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setvbuf(
+    _stream: *mut c_void,
+    _buf: *mut c_char,
+    _mode: c_int,
+    _size: usize,
+) -> c_int {
+    0
+}
+
+/// C `clock_gettime` → nlist `_clock_gettime` (via gettimeofday).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn clock_gettime(clock_id: c_int, tp: *mut c_void) -> c_int {
+    let _ = clock_id;
+    if tp.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // timespec: i64 sec + i64 nsec on Darwin arm64
+    let mut tv = [0_u8; 16];
+    let ret = unsafe { sys::syscall2(SYS_GETTIMEOFDAY, ptr_u64(tv.as_mut_ptr().cast()), 0) };
+    if ret < 0 {
+        return ret_c_int(ret);
+    }
+    let sec = i64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let usec = i32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]);
+    let nsec = i64::from(usec).saturating_mul(1000);
+    unsafe {
+        let out = tp.cast::<u8>();
+        out.copy_from_nonoverlapping(sec.to_le_bytes().as_ptr(), 8);
+        out.add(8)
+            .copy_from_nonoverlapping(nsec.to_le_bytes().as_ptr(), 8);
+    }
+    0
+}
+
+/// C `qsort` → nlist `_qsort` (simple insertion sort).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn qsort(
+    base: *mut c_void,
+    nel: usize,
+    width: usize,
+    compar: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> c_int>,
+) {
+    if base.is_null() || nel < 2 || width == 0 {
+        return;
+    }
+    let Some(cmp) = compar else {
+        return;
+    };
+    // SAFETY: guest buffer of nel*width; insertion sort.
+    unsafe {
+        let mut idx = 1_usize;
+        while idx < nel {
+            let mut jdx = idx;
+            while jdx > 0 {
+                let cur = base.cast::<u8>().add(jdx.saturating_mul(width));
+                let prev = base
+                    .cast::<u8>()
+                    .add(jdx.saturating_sub(1).saturating_mul(width));
+                if cmp(cur.cast(), prev.cast()) >= 0 {
+                    break;
+                }
+                // swap width bytes
+                let mut off = 0_usize;
+                while off < width {
+                    let tmp = cur.add(off).read();
+                    cur.add(off).write(prev.add(off).read());
+                    prev.add(off).write(tmp);
+                    off = off.saturating_add(1);
+                }
+                jdx = jdx.saturating_sub(1);
+            }
+            idx = idx.saturating_add(1);
+        }
+    }
+}
+
 /// C `getpwuid` / `getgrgid` → null (no passwd DB).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getpwuid(_uid: u32) -> *mut c_void {
