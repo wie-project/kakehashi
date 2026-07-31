@@ -26,7 +26,7 @@ multi-thread gate in [docs/README.md](README.md#verification-threading).
 ## Hypercall and stacks
 
 12. **MUST** use a single production syscall entry for main and workers: freestanding hypercall → `kh_hypercall_entry`.
-13. **MUST** save full **Q0–Q31 + FPCR/FPSR** before any host `bl` in the hypercall entry. A **second** save (`TRAMP_BYTES`) may be skipped only when that prolog save+restore is intact (`KAKEHASHI_HYPERCALL_LIGHT`); never skip the prolog itself.
+13. **MUST** save full **Q0–Q31 + FPCR/FPSR** before any host `bl` in the hypercall entry (prolog). Production path also uses full `TRAMP_BYTES` around Rust dispatch. **MUST NOT** reintroduce a "light" skip of NEON save without a measured wall win and MT re-validation.
 14. **MUST** run host dispatch on the **host alt stack**, not the guest worker stack.
 15. **MUST** pre-map the host alt stack while host TPIDR is live (main install / worker prepare).
 16. **MUST NOT** rely on “dispatch on guest stack” as an MT-safe fallback.

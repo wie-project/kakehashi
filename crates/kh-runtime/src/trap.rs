@@ -315,19 +315,6 @@ fn trampoline_enabled() -> bool {
     env_flag_truthy("KAKEHASHI_TRAMPOLINE")
 }
 
-/// A3 opt-in: skip the **second** full NEON save (`TRAMP_BYTES`) on the
-/// freestanding hypercall path. Default **off** (full tramp).
-///
-/// Safe only because `kh_hypercall_entry` prolog already saves/restores
-/// Q0–Q31 + FPCR/FPSR. Does **not** affect svc veneer hubs (they embed their
-/// own full `TRAMP_BYTES`). Kill-switch: unset / `0` / omit the var.
-///
-/// See `docs/roadmap.md` A3 and invariant 13.
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn hypercall_light_enabled() -> bool {
-    env_flag_truthy("KAKEHASHI_HYPERCALL_LIGHT")
-}
-
 /// Flush D/I caches after writing executable code (aarch64 requirement).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn clear_icache(ptr: *mut u8, len: usize) {
@@ -646,13 +633,11 @@ pub unsafe extern "C" fn kh_trampoline_dispatch(
 //
 // **NEON:** Darwin `svc` preserves Q0–Q31. We must too. Any `bl` into Rust/C
 // (TLS enter, alt-stack map) clobbers caller-saved SIMD under AAPCS64, so full
-// Q0–Q31 + FPCR/FPSR are saved on the *guest* prolog frame *before* any `bl`.
-//
-// **A3 light path** (`KAKEHASHI_HYPERCALL_LIGHT=1`): `kh_neon_tramp_entry`
-// skips `TRAMP_BYTES` (the *second* full NEON save) and tail-calls
-// `kh_trampoline_dispatch`. Valid IFF this prolog still saves+restores Q*
-// (invariant 13). Default remains full tramp. Do not wire light into svc
-// veneer hubs — they embed their own full TRAMP_BYTES without this prolog.
+// Q0–Q31 + FPCR/FPSR are saved on the *guest* prolog frame *before* any `bl`
+// (invariant 13). Dispatch goes through mapped `TRAMP_BYTES` (second full NEON
+// frame on the host/alt stack) — required for veneer hubs and production path.
+// A former "light" skip of the second save showed no wall win on UTM 8k and
+// was removed to keep one code path.
 //
 // ABI: x0–x6 + number in x7 → TrampRet in x0/x1.
 // Guest frame layout (640 B):
@@ -670,7 +655,6 @@ std::arch::global_asm!(
     .type kh_hypercall_entry, %function
 kh_hypercall_entry:
     // Guest prolog: GPRs + full NEON *before* any bl (NEON must survive host TLS).
-    // A3 must NEVER remove or shrink this block.
     sub sp, sp, #640
     stp x29, x30, [sp, #0]
     stp x0, x1, [sp, #16]
@@ -794,12 +778,9 @@ kh_hypercall_entry:
     "#
 );
 
-// `kh_neon_tramp_entry` + `KH_NEON_TRAMP_VA` / `KH_HYPERCALL_LIGHT`.
-//
-// Light path (A3): when KH_HYPERCALL_LIGHT != 0, skip mapped TRAMP_BYTES and
-// tail-call Rust dispatch. Guest SIMD lives only on the hypercall prolog
-// frame (saved above, restored after return). Full tramp remains default and
-// is still required for svc veneer hubs (separate mapping, no prolog).
+// `kh_neon_tramp_entry` + `KH_NEON_TRAMP_VA`: branch into mapped `TRAMP_BYTES`
+// (full Q* save around Rust dispatch). Fallback if tramp not mapped yet:
+// tail-call `kh_trampoline_dispatch` (still safe: prolog owns guest Q*).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 std::arch::global_asm!(
     r#"
@@ -808,17 +789,12 @@ std::arch::global_asm!(
     .global kh_neon_tramp_entry
     .type kh_neon_tramp_entry, %function
 kh_neon_tramp_entry:
-    // A3: non-zero → skip second full NEON save (prolog already owns Q*).
-    adrp x17, KH_HYPERCALL_LIGHT
-    ldr x17, [x17, :lo12:KH_HYPERCALL_LIGHT]
-    cbnz x17, 2f
     adrp x17, KH_NEON_TRAMP_VA
     ldr x17, [x17, :lo12:KH_NEON_TRAMP_VA]
-    cbz x17, 2f
+    cbz x17, 1f
     br x17
-2:
-    // Light / no-tramp fallback: number in x16 → AAPCS 8th arg x7; tail call.
-    // LR still points into kh_hypercall_entry (caller used bl).
+1:
+    // No-tramp fallback: number in x16 → AAPCS 8th arg x7; tail call.
     mov x7, x16
     b kh_trampoline_dispatch
     .size kh_neon_tramp_entry, .-kh_neon_tramp_entry
@@ -828,10 +804,6 @@ kh_neon_tramp_entry:
     .global KH_NEON_TRAMP_VA
 KH_NEON_TRAMP_VA:
     .quad 0
-    .global KH_HYPERCALL_LIGHT
-    .align 3
-KH_HYPERCALL_LIGHT:
-    .quad 0
     "#
 );
 
@@ -839,8 +811,6 @@ KH_HYPERCALL_LIGHT:
 unsafe extern "C" {
     fn kh_hypercall_entry();
     static mut KH_NEON_TRAMP_VA: u64;
-    /// Non-zero when `KAKEHASHI_HYPERCALL_LIGHT` is enabled (A3).
-    static mut KH_HYPERCALL_LIGHT: u64;
 }
 
 /// Address of freestanding hypercall entry (alt stack + NEON tramp + dispatch).
@@ -848,31 +818,13 @@ unsafe extern "C" {
 #[must_use]
 pub fn hypercall_entry_addr() -> u64 {
     ensure_neon_tramp();
-    publish_hypercall_light_flag();
     #[allow(clippy::as_conversions, function_casts_as_integer)]
     {
         u64::try_from(kh_hypercall_entry as usize).unwrap_or(0)
     }
 }
 
-/// Publish A3 light flag for `kh_neon_tramp_entry` (read once before guest).
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn publish_hypercall_light_flag() {
-    let on = hypercall_light_enabled();
-    // SAFETY: written once under host TPIDR before guest entry; asm loads it
-    // only after `kh_tls_enter_host` on the hypercall path.
-    unsafe {
-        KH_HYPERCALL_LIGHT = u64::from(on);
-    }
-    if on {
-        tracing::info!("A3 hypercall light path enabled (skip second NEON tramp)");
-    }
-}
-
 /// Map TRAMP_BYTES once and publish its VA to `KH_NEON_TRAMP_VA`.
-///
-/// Still mapped when light is on: kill-switch / veneer / future toggles can
-/// use full tramp without remapping.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn ensure_neon_tramp() {
     static ONCE: AtomicU64 = AtomicU64::new(0);
