@@ -27,6 +27,9 @@ pub(crate) fn handle_fork(_args: SyscallArgs) -> SyscallResult {
     let name = "fork";
     match host::fork_process() {
         Ok(pid) => {
+            if pid > 0 {
+                crate::process::child_born();
+            }
             tracing::debug!(pid, "fork");
             SyscallResult::ok(name, u64::try_from(pid).unwrap_or(0))
         }
@@ -46,6 +49,10 @@ pub(crate) fn handle_wait4(args: SyscallArgs) -> SyscallResult {
     }
     match host::wait_pid(pid, options) {
         Ok((wpid, status)) => {
+            // wpid == 0 with WNOHANG: no child ready (not a reap).
+            if wpid > 0 {
+                crate::process::child_reaped();
+            }
             if status_ptr != 0 {
                 guest_write(status_ptr, &status.to_ne_bytes());
             }

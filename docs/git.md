@@ -76,7 +76,7 @@ kh run git -- status                  # clean on main
 | HOME | Guest `HOME=/Volumes/linux{host $HOME}` so host `~/.gitconfig` is readable. Confirm: `kh run git -- config user.name`. |
 | FSEvents | Soft stubs in freestanding libSystem (`FSEventStreamCreate` → null). Nested post-commit `git maintenance --detach` used to fail load when bottle was lost under guest HOME (`unresolved symbol _FSEventStreamCreate`); fixed by always injecting host KAKEHASHI_* paths on re-exec. |
 | `_environ` | Must be a **data** export. Binding a missing-function trampoline here made git walk trampoline bytes as `char **` and SIGSEGV after `pipe` in `start_command`. |
-| Pipe | Darwin-like **blocking** `pipe(2)` (no default `O_NONBLOCK`); git’s notify pipe does a blocking `read` after `fork`. |
+| Pipe | Host `pipe(2)` is `O_NONBLOCK` (curl/c-ares). Git’s notify-pipe blocking `read` after `fork` is emulated: while unreaped children exist, `read` waits for readability instead of returning `EAGAIN`. |
 | Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates, attributes) |
 
 ## Install (public Software Update catalog)

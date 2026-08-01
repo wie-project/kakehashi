@@ -20,6 +20,12 @@ static SYSCALL_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Cap for [`SYSCALL_COUNT`]; updated by [`reset_run`].
 static MAX_SYSCALLS: AtomicU64 = AtomicU64::new(256);
 
+/// Unreaped host children from guest `fork` (parent side only).
+///
+/// Used so `read` can emulate Darwin **blocking** notify-pipe waits after
+/// spawn while pipes themselves stay `O_NONBLOCK` for curl/c-ares.
+static LIVE_CHILDREN: AtomicU64 = AtomicU64::new(0);
+
 /// Max guest FD slots (stdio 0–2 + table). Keeps FDs under typical OPEN_MAX.
 const FD_SLOTS: usize = 1024;
 /// Empty slot in the lock-free FD map.
@@ -232,6 +238,7 @@ impl ProcessState {
         let max = u64::try_from(max_syscalls).unwrap_or(256);
         MAX_SYSCALLS.store(max, Ordering::Relaxed);
         SYSCALL_COUNT.store(0, Ordering::Relaxed);
+        LIVE_CHILDREN.store(0, Ordering::Relaxed);
         crate::thread::reset_thread_runtime();
     }
 
@@ -291,6 +298,27 @@ impl Default for ProcessState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Parent observed a successful `fork` (child pid > 0).
+#[inline]
+pub fn child_born() {
+    LIVE_CHILDREN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Parent reaped at least one child via `waitpid`/`wait4`.
+#[inline]
+pub fn child_reaped() {
+    let _ = LIVE_CHILDREN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
+
+/// Number of unreaped host children (approximate; for pipe blocking heuristics).
+#[must_use]
+#[inline]
+pub fn live_children() -> u64 {
+    LIVE_CHILDREN.load(Ordering::Relaxed)
 }
 
 /// Bumps the process-wide syscall counter without taking the process lock.

@@ -137,21 +137,75 @@ fn socklen_of(len: usize) -> Option<libc::socklen_t> {
 
 /// `pipe(2)` — returns `(read_fd, write_fd)` or `None` on failure.
 ///
-/// **Blocking**, no default `CLOEXEC` — matches Darwin `pipe(2)`. Git
-/// `start_command` does a blocking `read` on the notify pipe after `fork`;
-/// non-blocking ends surface `EAGAIN` and break spawn. Guests that need
-/// non-block (curl/c-ares) set `O_NONBLOCK` via `fcntl`.
+/// Both ends are set `O_NONBLOCK|O_CLOEXEC`. Freestanding curl/c-ares often
+/// `poll` then `read` the wakeup pipe; a **blocking** host pipe deadlocks the
+/// single-threaded guest when nothing is writable yet.
+///
+/// Git’s `start_command` wants a blocking notify-pipe `read` after `fork`.
+/// That is emulated in the `read` syscall: while unreaped children exist, an
+/// `EAGAIN` on a pipe waits for readability (see `io::handle_read`).
 #[must_use]
 pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
     let mut fds = [0_i32; 2];
-    // SAFETY: stack buffer of two ints for the kernel to fill.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
+    // Prefer pipe2 when available (Linux).
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: stack buffer of two ints for the kernel to fill.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if rc != 0 {
+            return None;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: stack buffer of two ints for the kernel to fill.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        for fd in fds {
+            // SAFETY: freshly created pipe ends.
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                if fl >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+                }
+                let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
     }
     match (fds.first().copied(), fds.get(1).copied()) {
         (Some(r), Some(w)) => Some((r, w)),
         _ => None,
+    }
+}
+
+/// Block until `fd` is readable, hung-up, or errored. `timeout_ms` as in
+/// `poll(2)` (`-1` = forever). Returns `true` if any interesting revent.
+#[must_use]
+pub fn poll_fd_readable(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: single pollfd on the stack; fd is a live host descriptor.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let err = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(0);
+            if err == libc::EINTR {
+                continue;
+            }
+            return false;
+        }
+        if rc == 0 {
+            return false;
+        }
+        let interest = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        return pfd.revents & interest != 0;
     }
 }
 

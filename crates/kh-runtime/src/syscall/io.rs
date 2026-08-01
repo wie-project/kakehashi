@@ -130,20 +130,29 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     // Read straight into guest memory (identity map) — no intermediate heap
     // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
     let buf = guest_slice_mut(args.x1, len);
-    match read_host_fd(host_fd, buf) {
-        Ok(nread) => {
-            tracing::debug!(gfd, nread, "read ok");
-            SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0))
-        }
-        Err(e) => {
-            let os = e.raw_os_error().unwrap_or(0);
-            // Map Linux EAGAIN/EWOULDBLOCK → Darwin EAGAIN (35).
-            if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
-                tracing::debug!(gfd, "read EAGAIN");
-                return SyscallResult::err(name, 35);
+    // Host pipes are `O_NONBLOCK` (curl/c-ares). Git’s notify pipe after
+    // `fork` expects Darwin blocking `read`: while unreaped children exist,
+    // wait for readability instead of returning EAGAIN immediately.
+    loop {
+        match read_host_fd(host_fd, buf) {
+            Ok(nread) => {
+                tracing::debug!(gfd, nread, "read ok");
+                return SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0));
             }
-            tracing::warn!(gfd, os, "read fail");
-            SyscallResult::err(name, EPERM)
+            Err(e) => {
+                let os = e.raw_os_error().unwrap_or(0);
+                if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
+                    if crate::process::live_children() > 0
+                        && crate::host::poll_fd_readable(host_fd, -1)
+                    {
+                        continue;
+                    }
+                    tracing::debug!(gfd, "read EAGAIN");
+                    return SyscallResult::err(name, 35);
+                }
+                tracing::warn!(gfd, os, "read fail");
+                return SyscallResult::err(name, EPERM);
+            }
         }
     }
 }
