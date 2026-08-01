@@ -38,6 +38,7 @@ mod cxxabi;
 mod errno;
 mod extra_stubs;
 mod heap;
+mod iconv;
 mod locale;
 mod net;
 mod posix;
@@ -48,6 +49,37 @@ mod stdio;
 mod string;
 mod sys;
 mod trace;
+mod zlib;
+
+/// Route Rust `alloc` (miniz_oxide) through freestanding `malloc`/`free`.
+struct KhGlobalAlloc;
+
+// SAFETY: forwards to our freestanding heap; layout size is respected.
+unsafe impl core::alloc::GlobalAlloc for KhGlobalAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let p = unsafe { heap::malloc(layout.size().max(layout.align()).max(1)) };
+        p.cast::<u8>()
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
+        unsafe {
+            heap::free(ptr.cast());
+        }
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        _layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let p = unsafe { heap::realloc(ptr.cast(), new_size.max(1)) };
+        p.cast::<u8>()
+    }
+}
+
+#[global_allocator]
+static KH_ALLOC: KhGlobalAlloc = KhGlobalAlloc;
 
 pub use errno::__error;
 pub use heap::{calloc, free, malloc, realloc};

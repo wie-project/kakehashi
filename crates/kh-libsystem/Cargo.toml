@@ -21,7 +21,8 @@ doctest = false
 bench = false
 
 [dependencies]
-# Intentionally empty: freestanding guest stubs (no host libSystem / libc body).
+# Pure Rust DEFLATE for freestanding zlib (Apple git object store).
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [build-dependencies]
 cc = "1.2"

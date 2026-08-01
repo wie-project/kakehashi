@@ -9,7 +9,7 @@ use crate::mem::registry_check_range;
 use crate::host;
 
 use super::common::{
-    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, guest_write,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, ERANGE, SyscallArgs, SyscallResult, guest_write,
     reg_as_i32, reg_as_i64,
 };
 use super::fd::guest_to_host_fd;
@@ -31,17 +31,22 @@ pub(crate) fn handle_access(args: SyscallArgs) -> SyscallResult {
             return SyscallResult::err(name, EFAULT);
         };
         return if host::faccessat_ok(dirfd, &c_rel) {
+            tracing::debug!(guest = %path, rel, "access ok (bottle openat)");
             SyscallResult::ok(name, 0)
         } else {
+            tracing::debug!(guest = %path, rel, "access enoent (bottle openat)");
             SyscallResult::err(name, ENOENT)
         };
     }
     let Ok(host_path) = translate_path(&path) else {
+        tracing::debug!(guest = %path, "access enoent (translate)");
         return SyscallResult::err(name, ENOENT);
     };
     if host_path.exists() {
+        tracing::debug!(guest = %path, host = %host_path.display(), "access ok");
         SyscallResult::ok(name, 0)
     } else {
+        tracing::debug!(guest = %path, host = %host_path.display(), "access enoent");
         SyscallResult::err(name, ENOENT)
     }
 }
@@ -72,11 +77,13 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
             return SyscallResult::err(name, EFAULT);
         };
         let Some(st) = host::fstatat(dirfd, &c_rel, no_follow) else {
+            tracing::debug!(op = name, guest = %path, rel, "stat enoent (bottle openat)");
             return SyscallResult::err(name, ENOENT);
         };
         return write_darwin_stat64_from_libc(args.x1, &st, name);
     }
     let Ok(host_path) = translate_path(&path) else {
+        tracing::debug!(op = name, guest = %path, "stat enoent (translate)");
         return SyscallResult::err(name, ENOENT);
     };
     let meta = if no_follow {
@@ -85,8 +92,12 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
         std::fs::metadata(&host_path)
     };
     let Ok(meta) = meta else {
+        tracing::debug!(op = name, guest = %path, host = %host_path.display(), "stat enoent");
         return SyscallResult::err(name, ENOENT);
     };
+    if path.contains("README") {
+        tracing::debug!(op = name, guest = %path, host = %host_path.display(), "stat ok");
+    }
     write_darwin_stat64(args.x1, &meta, name)
 }
 
@@ -183,6 +194,62 @@ pub(crate) fn handle_unlink(args: SyscallArgs) -> SyscallResult {
     }
 }
 
+/// `chdir` — path `x0`. Host CWD is the process working directory (see getcwd).
+pub(crate) fn handle_chdir(args: SyscallArgs) -> SyscallResult {
+    let name = "chdir";
+    if !registry_check_range(args.x0, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(path) = bottle::read_c_string(args.x0, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(host_path) = translate_path(&path) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    match std::env::set_current_dir(&host_path) {
+        Ok(()) => {
+            tracing::debug!(guest = %path, host = %host_path.display(), "chdir ok");
+            SyscallResult::ok(name, 0)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SyscallResult::err(name, ENOENT),
+        Err(_) => SyscallResult::err(name, EPERM),
+    }
+}
+
+/// Darwin `__getcwd` — buf `x0`, buflen `x1`. Writes guest absolute path + NUL.
+///
+/// Outside the bottle, path is under `/Volumes/linux/…` so open/mkdir still
+/// resolve via the host bridge symlink.
+pub(crate) fn handle_getcwd(args: SyscallArgs) -> SyscallResult {
+    let name = "__getcwd";
+    let Ok(buflen) = usize::try_from(args.x1) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if buflen == 0 {
+        return SyscallResult::err(name, EINVAL);
+    }
+    if !registry_check_range(args.x0, buflen, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(guest) = bottle::guest_cwd_string() else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    tracing::debug!(
+        guest = %guest,
+        host = %std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+        "getcwd"
+    );
+    let bytes = guest.as_bytes();
+    // Need room for path + NUL.
+    let need = bytes.len().saturating_add(1);
+    if need > buflen {
+        return SyscallResult::err(name, ERANGE);
+    }
+    guest_write(args.x0, bytes);
+    guest_write(args.x0.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)), &[0]);
+    SyscallResult::ok(name, 0)
+}
+
 /// `mkdir` — path `x0`, mode `x1` (mode currently ignored; host umask applies).
 pub(crate) fn handle_mkdir(args: SyscallArgs) -> SyscallResult {
     let name = "mkdir";
@@ -273,6 +340,7 @@ pub(crate) fn handle_readlink(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     };
     let Ok(host_path) = translate_path(&path) else {
+        tracing::debug!(guest = %path, "readlink enoent (translate)");
         return SyscallResult::err(name, ENOENT);
     };
     let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
@@ -284,9 +352,18 @@ pub(crate) fn handle_readlink(args: SyscallArgs) -> SyscallResult {
             if let Some(slice) = buf.get(..n).filter(|s| !s.is_empty()) {
                 guest_write(args.x1, slice);
             }
+            tracing::debug!(guest = %path, host = %host_path.display(), n, "readlink ok");
             SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
         }
-        Err(e) => SyscallResult::err(name, map_host_errno(e)),
+        Err(e) => {
+            tracing::debug!(
+                guest = %path,
+                host = %host_path.display(),
+                errno = e,
+                "readlink err"
+            );
+            SyscallResult::err(name, map_host_errno(e))
+        }
     }
 }
 

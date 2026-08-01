@@ -5,11 +5,12 @@ use core::ffi::{c_char, c_int, c_void};
 use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
-    self, SYS_ACCESS, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE,
-    SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP,
-    SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR,
-    SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME,
-    SYS_UNLINK,
+    self, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC,
+    SYS_FTRUNCATE, SYS_GETCWD, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPID, SYS_GETPPID,
+    SYS_GETTIMEOFDAY, SYS_GETUID, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_OPENAT, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_READLINK,
+    SYS_RENAME, SYS_RMDIR, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
+    SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -42,10 +43,29 @@ fn ret_c_int(ret: isize) -> c_int {
     }
 }
 
+/// POSIX `ssize_t` success path: length; error path: **always `-1`** + errno.
+///
+/// Raw Darwin/BSD syscalls surface `-errno` in the register. Libc wrappers must
+/// not leak that to callers — code like git's `is_reinit()` does
+/// `readlink(...) != -1` and would treat `-ENOENT` as success.
+#[inline]
+fn ret_ssize(ret: isize) -> isize {
+    let r = apply_ret(ret);
+    if r < 0 {
+        -1
+    } else {
+        r
+    }
+}
+
 #[inline]
 fn ret_i64(ret: isize) -> i64 {
     let r = apply_ret(ret);
-    i64::try_from(r).unwrap_or(-1)
+    if r < 0 {
+        -1
+    } else {
+        i64::try_from(r).unwrap_or(-1)
+    }
 }
 
 #[inline]
@@ -78,6 +98,69 @@ pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_
         )
     };
     ret_c_int(ret)
+}
+
+/// Darwin `O_RDWR | O_CREAT | O_EXCL` for [`mkstemp`].
+const O_RDWR: c_int = 0x0002;
+const O_CREAT: c_int = 0x0200;
+const O_EXCL: c_int = 0x0800;
+const EEXIST: i32 = 17;
+const MKSTEMP_ALPH: &[u8] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// C `mkstemp` → nlist `_mkstemp` (template ends in `XXXXXX`; rewritten in place).
+///
+/// Used by Apple `git init` for the symlink/case-sensitivity probe.
+#[unsafe(no_mangle)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_wrap
+)]
+pub(crate) unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
+    if template.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let len = unsafe { crate::stdio::strlen(template) };
+    if len < 6 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let xs = unsafe { template.add(len.saturating_sub(6)) };
+    // Verify trailing XXXXXX.
+    for i in 0..6 {
+        if unsafe { *xs.add(i) } != b'X'.cast_signed() {
+            errno::set_errno(EINVAL);
+            return -1;
+        }
+    }
+    // Cheap LCG seed from address + length.
+    let mut state = template.addr().wrapping_mul(0x9E37_79B9).wrapping_add(len);
+    for _attempt in 0..256 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let mut s = state;
+        for i in 0..6 {
+            let idx = s % 62;
+            let ch = MKSTEMP_ALPH.get(idx).copied().unwrap_or(b'0');
+            unsafe {
+                *xs.add(i) = ch.cast_signed();
+            }
+            s >>= 6;
+        }
+        let fd = unsafe { open(template, O_RDWR | O_CREAT | O_EXCL, 0o600) };
+        if fd >= 0 {
+            return fd;
+        }
+        // Retry only on EEXIST; other errors fail out.
+        if errno::get_errno() != EEXIST {
+            return -1;
+        }
+    }
+    errno::set_errno(EEXIST);
+    -1
 }
 
 /// C `openat` → nlist `_openat`.
@@ -144,7 +227,7 @@ pub(crate) unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, nbyte: usize) 
             u64::try_from(nbyte).unwrap_or(0),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// C `lseek` → nlist `_lseek`.
@@ -159,6 +242,54 @@ pub(crate) unsafe extern "C" fn lseek(fd: c_int, offset: i64, whence: c_int) -> 
         )
     };
     ret_i64(ret)
+}
+
+/// C `pread` → nlist `_pread` (read at offset without changing file position).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pread(
+    fd: c_int,
+    buf: *mut c_void,
+    nbyte: usize,
+    offset: i64,
+) -> isize {
+    if buf.is_null() && nbyte > 0 {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall4(
+            SYS_PREAD,
+            u64::from(fd.cast_unsigned()),
+            ptr_u64(buf),
+            u64::try_from(nbyte).unwrap_or(0),
+            offset.cast_unsigned(),
+        )
+    };
+    ret_ssize(ret)
+}
+
+/// C `pwrite` → nlist `_pwrite`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pwrite(
+    fd: c_int,
+    buf: *const c_void,
+    nbyte: usize,
+    offset: i64,
+) -> isize {
+    if buf.is_null() && nbyte > 0 {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall4(
+            SYS_PWRITE,
+            u64::from(fd.cast_unsigned()),
+            ptr_u64(buf),
+            u64::try_from(nbyte).unwrap_or(0),
+            offset.cast_unsigned(),
+        )
+    };
+    ret_ssize(ret)
 }
 
 /// C `fstat` → nlist `_fstat` (stat64 buffer).
@@ -300,26 +431,37 @@ pub(crate) unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
     ret_c_int(ret)
 }
 
-/// C `chdir` → nlist `_chdir`.
+/// C `chdir` → nlist `_chdir` (host CWD via BSD `chdir`).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn chdir(_path: *const c_char) -> c_int {
-    not_impl(b"[kh-libsystem] chdir ENOSYS\n")
+pub(crate) unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall1(SYS_CHDIR, ptr_u64(path.cast())) };
+    ret_c_int(ret)
 }
 
-/// C `getcwd` → nlist `_getcwd` (returns bottle-ish "/").
+/// C `getcwd` → nlist `_getcwd` (via Darwin `__getcwd` → guest absolute path).
+///
+/// Outside the bottle the path is under `/Volumes/linux/…` so absolute
+/// open/mkdir still reach the host FS through the bottle bridge.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
     if buf.is_null() || size == 0 {
         errno::set_errno(22);
         return core::ptr::null_mut();
     }
-    if size < 2 {
-        errno::set_errno(34); // ERANGE
+    let ret = unsafe {
+        sys::syscall2(
+            SYS_GETCWD,
+            ptr_u64(buf.cast()),
+            u64::try_from(size).unwrap_or(0),
+        )
+    };
+    if ret < 0 {
+        let _ = apply_ret(ret);
         return core::ptr::null_mut();
-    }
-    unsafe {
-        buf.write(b'/'.cast_signed());
-        buf.add(1).write(0);
     }
     buf
 }
@@ -377,7 +519,7 @@ pub(crate) unsafe extern "C" fn readlink(
             u64::try_from(bufsize).unwrap_or(0),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// C `umask` → nlist `_umask` (returns previous fixed mask).
@@ -605,6 +747,22 @@ pub(crate) unsafe extern "C" fn dirfd(dirp: *mut c_void) -> c_int {
 }
 
 // ── process / misc ──────────────────────────────────────────────────────────
+
+/// C `fork` → nlist `_fork` (not supported in freestanding bottle; soft fail).
+///
+/// Apple `git commit` may try `start_command` (hooks/pager). Returning -1 with
+/// `ENOSYS` avoids a null-deref SIGSEGV when spawn infrastructure is absent.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fork() -> c_int {
+    errno::set_errno(ENOSYS);
+    -1
+}
+
+/// C `vfork` → nlist `_vfork` (same as [`fork`]).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn vfork() -> c_int {
+    unsafe { fork() }
+}
 
 /// C `getpid` → nlist `_getpid`.
 #[unsafe(no_mangle)]
@@ -1174,28 +1332,48 @@ pub(crate) unsafe extern "C" fn uselocale(_new: *mut c_void) -> *mut c_void {
     core::ptr::null_mut()
 }
 
-/// C `getuid` → nlist `_getuid`.
+/// C `getuid` → nlist `_getuid` (host uid via BSD syscall).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getuid() -> u32 {
-    501
+    let ret = unsafe { sys::syscall0(SYS_GETUID) };
+    if ret < 0 {
+        0
+    } else {
+        u32::try_from(ret).unwrap_or(0)
+    }
 }
 
 /// C `geteuid` → nlist `_geteuid`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn geteuid() -> u32 {
-    501
+    let ret = unsafe { sys::syscall0(SYS_GETEUID) };
+    if ret < 0 {
+        0
+    } else {
+        u32::try_from(ret).unwrap_or(0)
+    }
 }
 
 /// C `getgid` → nlist `_getgid`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getgid() -> u32 {
-    20
+    let ret = unsafe { sys::syscall0(SYS_GETGID) };
+    if ret < 0 {
+        0
+    } else {
+        u32::try_from(ret).unwrap_or(0)
+    }
 }
 
 /// C `getegid` → nlist `_getegid`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getegid() -> u32 {
-    20
+    let ret = unsafe { sys::syscall0(SYS_GETEGID) };
+    if ret < 0 {
+        0
+    } else {
+        u32::try_from(ret).unwrap_or(0)
+    }
 }
 
 /// C `setvbuf` → nlist `_setvbuf` (no buffering).

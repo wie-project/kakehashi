@@ -14,10 +14,22 @@ pub(crate) const SYS_CLOSE: u32 = 6;
 pub(crate) const SYS_FCNTL: u32 = 92;
 /// BSD `unlink`.
 pub(crate) const SYS_UNLINK: u32 = 10;
+/// BSD `chdir`.
+pub(crate) const SYS_CHDIR: u32 = 12;
+/// BSD `__getcwd`.
+pub(crate) const SYS_GETCWD: u32 = 344;
 /// BSD `link` (hard link).
 pub(crate) const SYS_LINK: u32 = 9;
 /// BSD `getpid`.
 pub(crate) const SYS_GETPID: u32 = 20;
+/// BSD `getuid`.
+pub(crate) const SYS_GETUID: u32 = 24;
+/// BSD `geteuid`.
+pub(crate) const SYS_GETEUID: u32 = 25;
+/// BSD `getgid`.
+pub(crate) const SYS_GETGID: u32 = 47;
+/// BSD `getegid`.
+pub(crate) const SYS_GETEGID: u32 = 43;
 /// BSD `getppid`.
 pub(crate) const SYS_GETPPID: u32 = 39;
 /// BSD `symlink`.
@@ -42,6 +54,10 @@ pub(crate) const SYS_RMDIR: u32 = 137;
 pub(crate) const SYS_MMAP: u32 = 197;
 /// BSD `lseek`.
 pub(crate) const SYS_LSEEK: u32 = 199;
+/// BSD `pread`.
+pub(crate) const SYS_PREAD: u32 = 153;
+/// BSD `pwrite`.
+pub(crate) const SYS_PWRITE: u32 = 154;
 /// BSD `ftruncate`.
 pub(crate) const SYS_FTRUNCATE: u32 = 201;
 /// BSD `sysctl`.
@@ -148,6 +164,16 @@ pub(crate) unsafe fn syscall2(number: u32, a0: u64, a1: u64) -> isize {
 #[inline]
 pub(crate) unsafe fn syscall3(number: u32, a0: u64, a1: u64, a2: u64) -> isize {
     unsafe { syscall6(number, a0, a1, a2, 0, 0, 0) }
+}
+
+/// Invokes a Darwin BSD syscall with four arguments (`pread` / `pwrite`).
+///
+/// # Safety
+///
+/// Valid Darwin call for the guest (or translated by `kh-runtime`).
+#[inline]
+pub(crate) unsafe fn syscall4(number: u32, a0: u64, a1: u64, a2: u64, a3: u64) -> isize {
+    unsafe { syscall6(number, a0, a1, a2, a3, 0, 0) }
 }
 
 /// Invokes a Darwin BSD syscall with up to six arguments.

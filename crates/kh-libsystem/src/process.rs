@@ -18,7 +18,7 @@ pub unsafe extern "C" fn exit_now(status: c_int) -> ! {
     }
 }
 
-/// C `exit` → nlist `_exit` (no atexit yet).
+/// C `exit` → nlist `_exit` (no atexit handlers yet).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exit(status: c_int) -> ! {
     trace::note_size(b"exit", usize::try_from(status.max(0)).unwrap_or(0));
@@ -26,6 +26,14 @@ pub unsafe extern "C" fn exit(status: c_int) -> ! {
     unsafe {
         exit_now(status);
     }
+}
+
+/// C `atexit` → nlist `_atexit` (register ignored; handlers not run on exit).
+///
+/// Apple `git init` calls this once; a hard missing trampoline aborts with 127.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn atexit(_func: Option<unsafe extern "C" fn()>) -> c_int {
+    0
 }
 
 /// Smoke probe → nlist `_kh_bottle_mark` (returns **77**).

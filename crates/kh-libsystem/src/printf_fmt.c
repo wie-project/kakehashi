@@ -1,8 +1,9 @@
-/* Minimal freestanding *printf for Darwin curl G1 (kh-libsystem).
+/* Minimal freestanding *printf for Darwin curl/git G1–G3 (kh-libsystem).
  * Linked into libkh_libsystem.dylib via build.rs (cc).
- * Supports %s %d %i %u %x %X %c %p %% and simple width/0-pad.
+ * Supports %s %d %i %u %o %x %X %c %p %% , width/0-pad, and precision
+ * including %.*s / %*s (git pathspec / prefix_path / tree "%o %s").
  *
- * Why C (not Rust): stable Rust has no c_variadic; curl imports snprintf /
+ * Why C (not Rust): stable Rust has no c_variadic; curl/git import snprintf /
  * fprintf with `...`. This file is freestanding (-ffreestanding) and only
  * calls Rust exports write / fileno / _exit — not host libc bodies.
  */
@@ -93,6 +94,7 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
     }
     int zero_pad = 0;
     size_t width = 0;
+    int prec = -1; /* -1 = unspecified */
     for (;;) {
       char f = fmt[i];
       if (f == '0') {
@@ -106,14 +108,34 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
       }
       break;
     }
-    while (fmt[i] >= '0' && fmt[i] <= '9') {
-      width = width * 10 + (size_t)(fmt[i] - '0');
+    if (fmt[i] == '*') {
+      /* %*s / %*d — width from next int arg */
+      int w = va_arg(ap, int);
+      if (w < 0)
+        w = 0;
+      width = (size_t)w;
       i++;
+    } else {
+      while (fmt[i] >= '0' && fmt[i] <= '9') {
+        width = width * 10 + (size_t)(fmt[i] - '0');
+        i++;
+      }
     }
     if (fmt[i] == '.') {
       i++;
-      while (fmt[i] >= '0' && fmt[i] <= '9')
+      if (fmt[i] == '*') {
+        /* %.*s — precision from next int arg (critical for git prefix_path) */
+        prec = va_arg(ap, int);
+        if (prec < 0)
+          prec = -1;
         i++;
+      } else {
+        prec = 0;
+        while (fmt[i] >= '0' && fmt[i] <= '9') {
+          prec = prec * 10 + (fmt[i] - '0');
+          i++;
+        }
+      }
     }
     int long_mod = 0;
     for (;;) {
@@ -145,6 +167,14 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
       if (!s)
         s = "(null)";
       size_t n = c_strlen(s);
+      if (prec >= 0 && (size_t)prec < n)
+        n = (size_t)prec;
+      /* optional left-pad to width (git rarely needs it for %s) */
+      if (width > n) {
+        size_t pad = width - n;
+        for (size_t p = 0; p < pad; p++)
+          push_byte(dst, cap, &out_len, ' ');
+      }
       for (size_t k = 0; k < n; k++)
         push_byte(dst, cap, &out_len, (unsigned char)s[k]);
     } else if (spec == 'd' || spec == 'i') {
@@ -165,6 +195,16 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
       else
         v = va_arg(ap, unsigned);
       push_u64(dst, cap, &out_len, v, width, zero_pad, 10, 0);
+    } else if (spec == 'o') {
+      /* Octal — git tree entries: strbuf_addf("%o %s%c", mode, path, 0) */
+      uint64_t v;
+      if (long_mod >= 2)
+        v = va_arg(ap, unsigned long long);
+      else if (long_mod == 1 || long_mod == 3)
+        v = va_arg(ap, unsigned long);
+      else
+        v = va_arg(ap, unsigned);
+      push_u64(dst, cap, &out_len, v, width, zero_pad, 8, 0);
     } else if (spec == 'x' || spec == 'X') {
       uint64_t v;
       if (long_mod >= 2)

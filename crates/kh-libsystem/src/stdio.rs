@@ -22,6 +22,8 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, nbyte: usize) -> i
     let ret = unsafe { sys::syscall3(SYS_WRITE, fd_u, ptr, len) };
     if ret < 0 {
         errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
+        // POSIX `ssize_t` error: always -1 + errno (not -errno).
+        return -1;
     }
     ret
 }
@@ -468,6 +470,12 @@ pub(crate) unsafe extern "C" fn fflush(_stream: *mut c_void) -> c_int {
     0
 }
 
+/// C `putc` → nlist `_putc` (same as `fputc`; git log pretty-print).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn putc(c: c_int, stream: *mut c_void) -> c_int {
+    unsafe { fputc(c, stream) }
+}
+
 /// C `fputc` → nlist `_fputc`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fputc(c: c_int, stream: *mut c_void) -> c_int {
@@ -575,6 +583,85 @@ pub(crate) unsafe extern "C" fn fgets(
         s.add(i).write(0);
     }
     s
+}
+
+/// C `getdelim` → nlist `_getdelim` (git pathspec / config line reader).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getdelim(
+    lineptr: *mut *mut c_char,
+    n: *mut usize,
+    delim: c_int,
+    stream: *mut c_void,
+) -> isize {
+    if lineptr.is_null() || n.is_null() || stream.is_null() {
+        errno::set_errno(22);
+        return -1;
+    }
+    let delim_b = u8::try_from(delim.cast_unsigned() & 0xff).unwrap_or(b'\n');
+    let mut cap = unsafe { *n };
+    let mut buf = unsafe { *lineptr };
+    if buf.is_null() || cap == 0 {
+        cap = 128;
+        buf = unsafe { crate::heap::malloc(cap).cast::<c_char>() };
+        if buf.is_null() {
+            errno::set_errno(12);
+            return -1;
+        }
+        unsafe {
+            *lineptr = buf;
+            *n = cap;
+        }
+    }
+    let mut len = 0_usize;
+    loop {
+        let ch = unsafe { fgetc(stream) };
+        if ch < 0 {
+            if len == 0 {
+                return -1; // EOF, nothing read
+            }
+            break;
+        }
+        let b = u8::try_from(ch).unwrap_or(0);
+        // Ensure room for byte + NUL.
+        if len.saturating_add(2) > cap {
+            let new_cap = cap.saturating_mul(2).max(len.saturating_add(2)).max(128);
+            let new_buf = unsafe { crate::heap::realloc(buf.cast(), new_cap).cast::<c_char>() };
+            if new_buf.is_null() {
+                errno::set_errno(12);
+                return -1;
+            }
+            buf = new_buf;
+            cap = new_cap;
+            unsafe {
+                *lineptr = buf;
+                *n = cap;
+            }
+        }
+        unsafe {
+            buf.add(len).write(b.cast_signed());
+        }
+        len = len.saturating_add(1);
+        if b == delim_b {
+            break;
+        }
+        if len > (1 << 20) {
+            break;
+        }
+    }
+    unsafe {
+        buf.add(len).write(0);
+    }
+    isize::try_from(len).unwrap_or(-1)
+}
+
+/// C `getline` → nlist `_getline`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getline(
+    lineptr: *mut *mut c_char,
+    n: *mut usize,
+    stream: *mut c_void,
+) -> isize {
+    unsafe { getdelim(lineptr, n, c_int::from(b'\n'), stream) }
 }
 
 /// C `fread` → nlist `_fread` (curl G1 follow-up after `_DefaultRuneLocale`).

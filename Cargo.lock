@@ -264,6 +264,7 @@ name = "kh-libsystem"
 version = "0.1.6"
 dependencies = [
  "cc",
+ "miniz_oxide",
 ]
 
 [[package]]

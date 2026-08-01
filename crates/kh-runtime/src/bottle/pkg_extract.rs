@@ -53,10 +53,7 @@ fn xar_locate_member(file: &mut File, want: &str) -> Result<XarMember, PkgError>
             "not a XAR package (missing xar! magic): expected Apple flat .pkg".into(),
         ));
     }
-    let header_size = u16::from_be_bytes([
-        *hdr.get(4).unwrap_or(&0),
-        *hdr.get(5).unwrap_or(&0),
-    ]);
+    let header_size = u16::from_be_bytes([*hdr.get(4).unwrap_or(&0), *hdr.get(5).unwrap_or(&0)]);
     let toc_compressed = {
         let mut a = [0_u8; 8];
         if let Some(s) = hdr.get(8..16) {
@@ -88,16 +85,15 @@ fn xar_locate_member(file: &mut File, want: &str) -> Result<XarMember, PkgError>
 
     let mut toc_z = vec![
         0_u8;
-        usize::try_from(toc_compressed).map_err(|_| {
-            PkgError::Format("toc_compressed too large".into())
-        })?
+        usize::try_from(toc_compressed)
+            .map_err(|_| { PkgError::Format("toc_compressed too large".into()) })?
     ];
     file.read_exact(&mut toc_z).map_err(PkgError::Io)?;
     let mut decoder = ZlibDecoder::new(toc_z.as_slice());
     let mut toc = Vec::new();
-    decoder.read_to_end(&mut toc).map_err(|e| {
-        PkgError::Format(format!("xar TOC zlib decompress failed: {e}"))
-    })?;
+    decoder
+        .read_to_end(&mut toc)
+        .map_err(|e| PkgError::Format(format!("xar TOC zlib decompress failed: {e}")))?;
     let toc_str = String::from_utf8_lossy(&toc);
     let heap_base = u64::from(header_size).saturating_add(toc_compressed);
     let member = parse_xar_toc_member(&toc_str, want).ok_or_else(|| {
@@ -165,17 +161,17 @@ fn extract_pbzx_odc<R: Read>(mut input: R, dest: &Path) -> Result<(), PkgError> 
         }
         let xz_size = {
             let mut a = [0_u8; 8];
-            a.copy_from_slice(hdr.get(8..16).ok_or_else(|| {
-                PkgError::Format("pbzx chunk header truncated".into())
-            })?);
+            a.copy_from_slice(
+                hdr.get(8..16)
+                    .ok_or_else(|| PkgError::Format("pbzx chunk header truncated".into()))?,
+            );
             u64::from_be_bytes(a)
         };
         if xz_size == 0 {
             break;
         }
-        let xz_len = usize::try_from(xz_size).map_err(|_| {
-            PkgError::Format(format!("pbzx xz chunk too large ({xz_size})"))
-        })?;
+        let xz_len = usize::try_from(xz_size)
+            .map_err(|_| PkgError::Format(format!("pbzx xz chunk too large ({xz_size})")))?;
 
         // Read exactly one xz frame and decompress.
         let mut xz_buf = vec![0_u8; xz_len];
@@ -188,17 +184,15 @@ fn extract_pbzx_odc<R: Read>(mut input: R, dest: &Path) -> Result<(), PkgError> 
         }
         let mut decoder = XzDecoder::new(xz_buf.as_slice());
         let mut plain = Vec::new();
-        decoder.read_to_end(&mut plain).map_err(|e| {
-            PkgError::Format(format!("xz decompress chunk {chunks}: {e}"))
-        })?;
+        decoder
+            .read_to_end(&mut plain)
+            .map_err(|e| PkgError::Format(format!("xz decompress chunk {chunks}: {e}")))?;
         parser.push(&plain)?;
         chunks = chunks.saturating_add(1);
     }
     parser.finish()?;
     if chunks == 0 {
-        return Err(PkgError::Format(
-            "pbzx contained no xz chunks".into(),
-        ));
+        return Err(PkgError::Format("pbzx contained no xz chunks".into()));
     }
     Ok(())
 }
@@ -233,9 +227,7 @@ impl OdcCpioExtractor {
     fn finish(&mut self) -> Result<(), PkgError> {
         while self.consume_one()? {}
         if self.entries == 0 {
-            return Err(PkgError::Format(
-                "odc cpio produced zero entries".into(),
-            ));
+            return Err(PkgError::Format("odc cpio produced zero entries".into()));
         }
         Ok(())
     }
@@ -263,12 +255,10 @@ impl OdcCpioExtractor {
         let namesize = oct_field(&self.buf, 59, 6)?;
         let filesize = oct_field(&self.buf, 65, 11)?;
         let mode = oct_field(&self.buf, 18, 6)?;
-        let name_len = usize::try_from(namesize).map_err(|_| {
-            PkgError::Format("odc namesize overflow".into())
-        })?;
-        let data_len = usize::try_from(filesize).map_err(|_| {
-            PkgError::Format("odc filesize overflow".into())
-        })?;
+        let name_len = usize::try_from(namesize)
+            .map_err(|_| PkgError::Format("odc namesize overflow".into()))?;
+        let data_len = usize::try_from(filesize)
+            .map_err(|_| PkgError::Format("odc filesize overflow".into()))?;
         let total = HDR
             .checked_add(name_len)
             .and_then(|n| n.checked_add(data_len))
@@ -277,9 +267,10 @@ impl OdcCpioExtractor {
             return Ok(false);
         }
 
-        let name_bytes = self.buf.get(HDR..HDR.saturating_add(name_len)).ok_or_else(|| {
-            PkgError::Format("odc name slice".into())
-        })?;
+        let name_bytes = self
+            .buf
+            .get(HDR..HDR.saturating_add(name_len))
+            .ok_or_else(|| PkgError::Format("odc name slice".into()))?;
         // namesize includes trailing NUL
         let name_end = name_bytes
             .iter()
@@ -323,9 +314,8 @@ impl OdcCpioExtractor {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(PkgError::Io)?;
                 }
-                let target = std::str::from_utf8(data).map_err(|e| {
-                    PkgError::Format(format!("symlink target utf-8: {e}"))
-                })?;
+                let target = std::str::from_utf8(data)
+                    .map_err(|e| PkgError::Format(format!("symlink target utf-8: {e}")))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::symlink;
@@ -362,18 +352,16 @@ impl OdcCpioExtractor {
 
 fn oct_field(buf: &[u8], start: usize, len: usize) -> Result<u64, PkgError> {
     let end = start.saturating_add(len);
-    let slice = buf.get(start..end).ok_or_else(|| {
-        PkgError::Format("odc field out of range".into())
-    })?;
+    let slice = buf
+        .get(start..end)
+        .ok_or_else(|| PkgError::Format("odc field out of range".into()))?;
     let s = std::str::from_utf8(slice)
         .map_err(|e| PkgError::Format(format!("odc field utf-8: {e}")))?
         .trim();
     if s.is_empty() {
         return Ok(0);
     }
-    u64::from_str_radix(s, 8).map_err(|e| {
-        PkgError::Format(format!("odc octal parse {s:?}: {e}"))
-    })
+    u64::from_str_radix(s, 8).map_err(|e| PkgError::Format(format!("odc octal parse {s:?}: {e}")))
 }
 
 #[cfg(test)]

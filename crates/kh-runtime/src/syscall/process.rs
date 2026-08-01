@@ -8,6 +8,35 @@ pub(crate) fn handle_exit(args: SyscallArgs) -> SyscallResult {
 }
 
 /// `getpid`.
+/// `getuid` — host real user id (must match file owners for git safe.directory).
+#[allow(unsafe_code)]
+pub(crate) fn handle_getuid() -> SyscallResult {
+    // SAFETY: host getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    SyscallResult::ok("getuid", u64::from(uid))
+}
+
+/// `geteuid`.
+#[allow(unsafe_code)]
+pub(crate) fn handle_geteuid() -> SyscallResult {
+    let uid = unsafe { libc::geteuid() };
+    SyscallResult::ok("geteuid", u64::from(uid))
+}
+
+/// `getgid`.
+#[allow(unsafe_code)]
+pub(crate) fn handle_getgid() -> SyscallResult {
+    let gid = unsafe { libc::getgid() };
+    SyscallResult::ok("getgid", u64::from(gid))
+}
+
+/// `getegid`.
+#[allow(unsafe_code)]
+pub(crate) fn handle_getegid() -> SyscallResult {
+    let gid = unsafe { libc::getegid() };
+    SyscallResult::ok("getegid", u64::from(gid))
+}
+
 pub(crate) fn handle_getpid() -> SyscallResult {
     SyscallResult::ok("getpid", u64::from(std::process::id()))
 }

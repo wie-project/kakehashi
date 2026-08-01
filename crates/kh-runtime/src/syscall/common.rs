@@ -12,6 +12,8 @@ pub const EBADF: i64 = 9;
 pub const EFAULT: i64 = 14;
 pub const EEXIST: i64 = 17;
 pub const EINVAL: i64 = 22;
+/// Darwin `ERANGE` (getcwd buffer too small).
+pub(crate) const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 78;
 pub const ENOMEM: i64 = 12;
 

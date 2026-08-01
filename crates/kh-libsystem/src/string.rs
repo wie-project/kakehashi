@@ -766,6 +766,27 @@ pub(crate) unsafe extern "C" fn strtoul(
     v.cast_unsigned()
 }
 
+/// C `strtoimax` → nlist `_strtoimax`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtoimax(
+    s: *const c_char,
+    endp: *mut *mut c_char,
+    base: c_int,
+) -> i64 {
+    unsafe { strto_i64(s, endp, base) }
+}
+
+/// C `strtoumax` → nlist `_strtoumax`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtoumax(
+    s: *const c_char,
+    endp: *mut *mut c_char,
+    base: c_int,
+) -> u64 {
+    let v = unsafe { strto_i64(s, endp, base) };
+    v.cast_unsigned()
+}
+
 unsafe fn strto_i64(s: *const c_char, endp: *mut *mut c_char, base: c_int) -> i64 {
     if s.is_null() {
         return 0;
@@ -1011,6 +1032,17 @@ pub(crate) unsafe extern "C" fn basename(path: *mut c_char) -> *mut c_char {
 }
 
 // Darwin fortify wrappers (curl imports these; bounds not enforced yet).
+
+/// `___strlcpy_chk` → nlist `___strlcpy_chk` (git init HEAD / path copy).
+#[unsafe(export_name = "__strlcpy_chk")]
+pub(crate) unsafe extern "C" fn __strlcpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    size: usize,
+    _dstlen: usize,
+) -> usize {
+    unsafe { crate::posix::strlcpy(dst, src, size) }
+}
 
 /// `___strcpy_chk` → nlist `___strcpy_chk`.
 #[unsafe(export_name = "__strcpy_chk")]

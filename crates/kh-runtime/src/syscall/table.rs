@@ -17,6 +17,14 @@ pub enum BsdSyscall {
     Getpid,
     /// `getppid`.
     Getppid,
+    /// `getuid`.
+    Getuid,
+    /// `geteuid`.
+    Geteuid,
+    /// `getgid`.
+    Getgid,
+    /// `getegid`.
+    Getegid,
     /// `access`.
     Access,
     /// `issetugid`.
@@ -35,6 +43,10 @@ pub enum BsdSyscall {
     Fcntl,
     /// `lseek`.
     Lseek,
+    /// `pread`.
+    Pread,
+    /// `pwrite`.
+    Pwrite,
     /// `stat` / `stat64`.
     Stat,
     /// `fstat` / `fstat64`.
@@ -53,6 +65,10 @@ pub enum BsdSyscall {
     Mkdir,
     /// `rmdir`.
     Rmdir,
+    /// `chdir`.
+    Chdir,
+    /// `__getcwd` (fills absolute path buffer).
+    Getcwd,
     /// `rename`.
     Rename,
     /// `ftruncate`.
@@ -137,6 +153,10 @@ impl BsdSyscall {
             Self::Close => "close",
             Self::Getpid => "getpid",
             Self::Getppid => "getppid",
+            Self::Getuid => "getuid",
+            Self::Geteuid => "geteuid",
+            Self::Getgid => "getgid",
+            Self::Getegid => "getegid",
             Self::Access => "access",
             Self::Issetugid => "issetugid",
             Self::Munmap => "munmap",
@@ -146,6 +166,8 @@ impl BsdSyscall {
             Self::Dup => "dup",
             Self::Fcntl => "fcntl",
             Self::Lseek => "lseek",
+            Self::Pread => "pread",
+            Self::Pwrite => "pwrite",
             Self::Stat => "stat",
             Self::Fstat => "fstat",
             Self::Lstat => "lstat",
@@ -155,6 +177,8 @@ impl BsdSyscall {
             Self::Readlink => "readlink",
             Self::Mkdir => "mkdir",
             Self::Rmdir => "rmdir",
+            Self::Chdir => "chdir",
+            Self::Getcwd => "__getcwd",
             Self::Rename => "rename",
             Self::Ftruncate => "ftruncate",
             Self::Fsync => "fsync",
@@ -205,6 +229,10 @@ impl BsdSyscall {
             Self::Unlink => 10,
             Self::Link => 9,
             Self::Getpid => 20,
+            Self::Getuid => 24,
+            Self::Geteuid => 25,
+            Self::Getgid => 47,
+            Self::Getegid => 43,
             Self::Getppid => 39,
             Self::Access => 33,
             Self::Dup => 41,
@@ -221,8 +249,12 @@ impl BsdSyscall {
             Self::Rename => 128,
             Self::Mkdir => 136,
             Self::Rmdir => 137,
+            Self::Chdir => 12,
+            Self::Getcwd => 344,
             Self::Mmap => 197,
             Self::Lseek => 199,
+            Self::Pread => 153,
+            Self::Pwrite => 154,
             Self::Ftruncate => 201,
             Self::Sysctl => 202,
             Self::ClockGettime => 266,
@@ -271,9 +303,14 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         6 | 399 => Some(BsdSyscall::Close),
         9 => Some(BsdSyscall::Link),
         10 | 401 => Some(BsdSyscall::Unlink),
+        12 => Some(BsdSyscall::Chdir),
         20 => Some(BsdSyscall::Getpid),
+        24 => Some(BsdSyscall::Getuid),
+        25 => Some(BsdSyscall::Geteuid),
         33 => Some(BsdSyscall::Access),
         39 => Some(BsdSyscall::Getppid),
+        43 => Some(BsdSyscall::Getegid),
+        47 => Some(BsdSyscall::Getgid),
         27 | 402 => Some(BsdSyscall::Recvmsg),  // recvmsg / nocancel
         28 | 408 => Some(BsdSyscall::Sendmsg),  // sendmsg / nocancel-ish
         29 | 403 => Some(BsdSyscall::Recvfrom), // recvfrom / nocancel
@@ -301,6 +338,8 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         116 => Some(BsdSyscall::Gettimeofday),
         118 => Some(BsdSyscall::Getsockopt),
         128 => Some(BsdSyscall::Rename),
+        153 | 474 => Some(BsdSyscall::Pread),  // pread / pread_nocancel-ish
+        154 | 475 => Some(BsdSyscall::Pwrite), // pwrite
         133 | 407 => Some(BsdSyscall::Sendto), // sendto / nocancel
         134 => Some(BsdSyscall::Shutdown),
         136 => Some(BsdSyscall::Mkdir),
@@ -316,6 +355,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         266 => Some(BsdSyscall::ClockGettime),
         274 => Some(BsdSyscall::Sysctlbyname),
         327 => Some(BsdSyscall::Issetugid),
+        344 => Some(BsdSyscall::Getcwd),
         360 => Some(BsdSyscall::BsdthreadCreate),
         361 => Some(BsdSyscall::BsdthreadTerminate),
         366 => Some(BsdSyscall::BsdthreadRegister),
@@ -345,8 +385,12 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (5, "open"),
         (6, "close"),
         (20, "getpid"),
+        (24, "getuid"),
+        (25, "geteuid"),
         (33, "access"),
         (39, "getppid"),
+        (43, "getegid"),
+        (47, "getgid"),
         (41, "dup"),
         (46, "sigaction"),
         (48, "sigprocmask"),
@@ -358,6 +402,8 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (92, "fcntl"),
         (116, "gettimeofday"),
         (197, "mmap"),
+        (153, "pread"),
+        (154, "pwrite"),
         (199, "lseek"),
         (202, "sysctl"),
         (266, "clock_gettime"),
@@ -367,8 +413,10 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (10, "unlink"),
         (95, "fsync"),
         (128, "rename"),
+        (12, "chdir"),
         (136, "mkdir"),
         (137, "rmdir"),
+        (344, "__getcwd"),
         (201, "ftruncate"),
         (338, "stat"),
         (339, "fstat"),

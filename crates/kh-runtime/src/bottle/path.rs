@@ -62,6 +62,13 @@ pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<Path
         return Ok(PathBuf::from(guest));
     }
 
+    // Host bridge prefixes: do **not** walk through bottle symlinks. Apple git
+    // realpath's `/Volumes/linux/tmp/…` via `readlink` → `/tmp/…`; that must still
+    // hit the host FS, not bottle `private/tmp`.
+    if let Some(host) = host_bridge_guest_to_host(guest)? {
+        return Ok(host);
+    }
+
     // Fast path: no `..` and no empty components → strip leading slashes / `.`
     // without allocating intermediate PathBufs for each component.
     if let Some(rel) = try_fast_relative(guest) {
@@ -96,13 +103,55 @@ pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<Path
     }
 }
 
+/// Map guest bridge paths to host absolute paths (no bottle join).
+///
+/// | Guest | Host |
+/// | --- | --- |
+/// | `/Volumes/linux` + rest | `/` + rest |
+/// | `/tmp` + rest | `/tmp` + rest |
+/// | `/private/tmp` + rest | `/tmp` + rest (Darwin layout) |
+fn host_bridge_guest_to_host(guest: &str) -> Result<Option<PathBuf>, PathError> {
+    const VOL: &str = "/Volumes/linux";
+    if guest == VOL || guest.starts_with("/Volumes/linux/") {
+        let rest = guest.strip_prefix(VOL).unwrap_or("");
+        // Reject `..` in the host-relative rest.
+        let host = if rest.is_empty() {
+            PathBuf::from("/")
+        } else {
+            strip_root_components(Path::new(rest))?;
+            PathBuf::from(rest)
+        };
+        return Ok(Some(host));
+    }
+    if guest == "/private/tmp" || guest.starts_with("/private/tmp/") {
+        let rest = guest.strip_prefix("/private/tmp").unwrap_or("");
+        let host = if rest.is_empty() {
+            PathBuf::from("/tmp")
+        } else {
+            strip_root_components(Path::new(rest))?;
+            PathBuf::from(format!("/tmp{rest}"))
+        };
+        return Ok(Some(host));
+    }
+    if guest == "/tmp" || guest.starts_with("/tmp/") {
+        strip_root_components(Path::new(guest))?;
+        return Ok(Some(PathBuf::from(guest)));
+    }
+    Ok(None)
+}
+
 /// Bottle-relative openat target for an absolute guest path (B1).
 ///
 /// When `Some((dirfd, rel))`, callers should `openat`/`fstatat` with `rel`
 /// (`"."` when the guest path is `/`) instead of allocating `{root}/{rel}`.
+/// Host-bridge paths (`/Volumes/linux`, `/tmp`, `/private/tmp`) return `None`
+/// so callers use [`translate_path`] instead.
 #[must_use]
 pub fn bottle_openat_rel(guest: &str) -> Option<(std::os::fd::RawFd, &str)> {
     if !guest.starts_with('/') {
+        return None;
+    }
+    if host_bridge_guest_to_host(guest).ok().flatten().is_some() {
         return None;
     }
     let dirfd = process::bottle_dirfd()?;
@@ -152,6 +201,55 @@ fn strip_root_components(path: &Path) -> Result<PathBuf, PathError> {
         }
     }
     Ok(out)
+}
+
+/// Guest absolute path for the host process CWD.
+///
+/// * Host under bottle → bottle-relative absolute (`/usr/…`).
+/// * Host under `/tmp` → Darwin-style `/private/tmp/…` (bridged to host `/tmp`).
+/// * Else → `/Volumes/linux` + host absolute (bridged to host).
+#[must_use]
+pub fn guest_cwd_string() -> Option<String> {
+    let host = std::env::current_dir().ok()?;
+    host_path_to_guest(&host)
+}
+
+/// Maps an absolute host path to a guest absolute path (bottle or host bridge).
+#[must_use]
+pub fn host_path_to_guest(host: &Path) -> Option<String> {
+    let host_abs = if host.is_absolute() {
+        host.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(host)
+    };
+    // Prefer real paths so strip_prefix works across symlinks.
+    let host_real = host_abs.canonicalize().unwrap_or(host_abs);
+
+    if let Some(root) = bottle_root() {
+        let root_real = root.canonicalize().unwrap_or(root);
+        if let Ok(rel) = host_real.strip_prefix(&root_real) {
+            if rel.as_os_str().is_empty() {
+                return Some("/".to_owned());
+            }
+            let mut s = String::from("/");
+            s.push_str(&rel.to_string_lossy());
+            return Some(s.replace('\\', "/"));
+        }
+    }
+
+    let lossy = host_real.to_string_lossy();
+    // Prefer Darwin `/private/tmp` for host `/tmp` so realpath/readlink walks
+    // stay on the host bridge (see [`host_bridge_guest_to_host`]).
+    if lossy == "/tmp" {
+        return Some("/private/tmp".to_owned());
+    }
+    if let Some(rest) = lossy.strip_prefix("/tmp/") {
+        return Some(format!("/private/tmp/{rest}"));
+    }
+    if lossy == "/" {
+        return Some(format!("/{}", super::layout::VOLUMES_LINUX));
+    }
+    Some(format!("/{}{lossy}", super::layout::VOLUMES_LINUX).replace('\\', "/"))
 }
 
 /// Stack buffer size for typical guest paths (avoids heap on open/stat).
@@ -250,14 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn volumes_linux_under_bottle() {
+    fn volumes_linux_is_host_bridge_not_bottle_join() {
         let root = Path::new("/var/lib/my-renamed-bottle");
         let host = translate_path_with_root(Some(root), "/Volumes/linux/tmp/x")
             .expect("translate volumes");
-        assert_eq!(
-            host,
-            PathBuf::from("/var/lib/my-renamed-bottle/Volumes/linux/tmp/x")
-        );
+        assert_eq!(host, PathBuf::from("/tmp/x"));
     }
 
     #[test]
@@ -265,6 +360,27 @@ mod tests {
         let root = Path::new("/b");
         let host = translate_path_with_root(Some(root), "/foo..bar").expect("dots in name");
         assert_eq!(host, PathBuf::from("/b/foo..bar"));
+    }
+
+    #[test]
+    fn host_tmp_maps_to_private_tmp_guest() {
+        set_bottle_root(None);
+        let guest = host_path_to_guest(Path::new("/tmp/kh-guest-cwd-test")).expect("map");
+        assert_eq!(guest, "/private/tmp/kh-guest-cwd-test");
+    }
+
+    #[test]
+    fn bridge_private_tmp_to_host() {
+        let host = translate_path_with_root(Some(Path::new("/opt/bottle")), "/private/tmp/x")
+            .expect("bridge");
+        assert_eq!(host, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn bridge_volumes_linux_to_host() {
+        let host = translate_path_with_root(Some(Path::new("/opt/bottle")), "/Volumes/linux/home/a")
+            .expect("bridge");
+        assert_eq!(host, PathBuf::from("/home/a"));
     }
 
     #[test]

@@ -669,19 +669,17 @@ fn skip_reason_from_resolve(err: &ResolveError, kind: DylibKind) -> SkipReason {
 }
 
 fn log_skip(install_name: &str, reason: &SkipReason) {
-    let is_libsystem = install_name.contains("/usr/lib/libSystem");
+    // Expected soft skips (CF/libz/libiconv/…) are debug; only odd failures stay warn.
     match reason {
-        SkipReason::NoBottle | SkipReason::MissingPath if is_libsystem => {
-            tracing::debug!(install_name, reason = reason.as_str(), "skip dylib");
-        }
         SkipReason::NoBottle
         | SkipReason::MissingPath
-        | SkipReason::OutsideAllowlist
-        | SkipReason::WeakMissing => {
-            tracing::warn!(install_name, reason = reason.as_str(), "skip dylib");
-        }
-        SkipReason::Duplicate | SkipReason::KindNotFollowed => {
+        | SkipReason::WeakMissing
+        | SkipReason::Duplicate
+        | SkipReason::KindNotFollowed => {
             tracing::debug!(install_name, reason = reason.as_str(), "skip dylib");
+        }
+        SkipReason::OutsideAllowlist => {
+            tracing::warn!(install_name, reason = reason.as_str(), "skip dylib");
         }
     }
 }

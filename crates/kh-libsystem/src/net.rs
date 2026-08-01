@@ -41,6 +41,17 @@ fn ret_c_int(ret: isize) -> c_int {
     }
 }
 
+/// POSIX `ssize_t`: success length, error always `-1` + errno (not `-errno`).
+#[inline]
+fn ret_ssize(ret: isize) -> isize {
+    let r = apply_ret(ret);
+    if r < 0 {
+        -1
+    } else {
+        r
+    }
+}
+
 // ── dl* soft stubs (curl probes; no real dynamic load in freestanding bottle)
 
 /// C `dlopen` → null (no plugins).
@@ -356,7 +367,7 @@ pub(crate) unsafe extern "C" fn sendto(
             u64::from(addrlen),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// C `send`.
@@ -389,7 +400,7 @@ pub(crate) unsafe extern "C" fn sendmsg(
             u64::from(flags.cast_unsigned()),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// C `recvmsg` → nlist `_recvmsg`.
@@ -407,7 +418,7 @@ pub(crate) unsafe extern "C" fn recvmsg(sockfd: c_int, msg: *mut c_void, flags: 
             u64::from(flags.cast_unsigned()),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// Darwin `connectx` → fall back to `connect` on the destination endpoint.
@@ -621,7 +632,7 @@ pub(crate) unsafe extern "C" fn recvfrom(
             ptr_u64(addrlen.cast()),
         )
     };
-    apply_ret(ret)
+    ret_ssize(ret)
 }
 
 /// C `recv`.
