@@ -13,7 +13,7 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/git` | **pass** (swscan, no Apple ID) |
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
 | G2 | Missing surface from probes | **in progress** (see below) |
-| G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker; commit exit 0) |
+| G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
 | G4 | Remote over HTTPS (reuse curl network path) | pending |
 
 ### G3 notes (path, uid, zlib, printf)
@@ -53,28 +53,31 @@ After freestanding changes: rebuild dylib → `./scripts/stage-libsystem.sh` →
 `kh bottle ensure` (or Docker helpers). Clippy: host crates +
 `kh-libsystem --target aarch64-apple-darwin`.
 
-### G3 Docker smoke
+### G3 smoke (Docker / UTM)
 
 ```bash
+# Host identity once (visible under kh via HOME bridge):
+git config --global user.email "you@example.com"
+git config --global user.name "Your Name"
+
 rm -rf /tmp/kh-g3 && mkdir -p /tmp/kh-g3 && cd /tmp/kh-g3
 kh run git -- init
 printf 'hi\n' > README
 kh run git -- add README
-# Identity: host `git config --global` works when HOME bridges via
-# /Volumes/linux$HOME (default). Or pass -c / write config under kh:
-#   kh run git -- config user.email t@t
-#   kh run git -- config user.name t
-kh run git -- -c user.email=t@t -c user.name=t commit -m init
-kh run git -- log --oneline   # e.g. 7cdb95d init
-kh run git -- status          # clean on main
+kh run git -- commit -m init          # no -c needed when ~/.gitconfig bridges
+kh run git -- log --oneline          # e.g. 7cdb95d init
+kh run git -- status                  # clean on main
+# (nothing-to-commit → guest exit 1 is normal git)
 ```
 
 | Note | Detail |
 | --- | --- |
 | Spawn | Host `fork` + `waitpid` + `dup2`; `execve` of Mach-O re-execs `kh run <path> -- args` (injects `KAKEHASHI_*`). Shell scripts use host `/bin/sh` etc. Post-commit `git maintenance` runs as a nested guest. |
+| HOME | Guest `HOME=/Volumes/linux{host $HOME}` so host `~/.gitconfig` is readable. Confirm: `kh run git -- config user.name`. |
+| FSEvents | Soft stubs in freestanding libSystem (`FSEventStreamCreate` → null). Stale bottle dylib → nested `micro run failed: unresolved symbol _FSEventStreamCreate` (commit still durable). Fix: rebuild libsystem → `stage-libsystem.sh` → rebuild `kh` → `kh bottle ensure`. Verify: `nm -gU $BOTTLE/usr/lib/libSystem.B.dylib \| grep FSEvent`. |
 | `_environ` | Must be a **data** export. Binding a missing-function trampoline here made git walk trampoline bytes as `char **` and SIGSEGV after `pipe` in `start_command`. |
 | Pipe | Darwin-like **blocking** `pipe(2)` (no default `O_NONBLOCK`); git’s notify pipe does a blocking `read` after `fork`. |
-| Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates) |
+| Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates, attributes) |
 
 ## Install (public Software Update catalog)
 
