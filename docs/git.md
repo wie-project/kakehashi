@@ -13,7 +13,7 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/git` | **pass** (swscan, no Apple ID) |
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
 | G2 | Missing surface from probes | **in progress** (see below) |
-| G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker; see note on post-commit exit) |
+| G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker; commit exit 0) |
 | G4 | Remote over HTTPS (reuse curl network path) | pending |
 
 ### G3 notes (path, uid, zlib, printf)
@@ -36,7 +36,10 @@ Also for G3: `chdir`, identity `iconv_*`, soft `atexit`, host
 root-owned under Docker), `strtoimax`/`strtoumax`, `getdelim`/`getline`,
 freestanding **zlib** (`deflate*`/`inflate*`/`crc32`/`adler32` via
 `miniz_oxide` with **history-buffered inflate** for streaming),
-`pread`/`pwrite`, `mkstemp`, `___strlcpy_chk`, soft `fork`/`vfork`, `putc`.
+`pread`/`pwrite`, `mkstemp`, `___strlcpy_chk`, **real spawn** (`fork` /
+`waitpid` / `dup2` / `execve` → re-exec `kh run` for Mach-O; scripts via
+shebang), real **`_environ`** data symbol (+ soft `getenv`/`setenv` table),
+`setsid`/`setpgid`/`getpgrp`/`kill`, soft `pthread_setcancelstate`, `putc`.
 
 **Printf** must implement POSIX `ssize_t` error returns as **`-1` + errno**
 (not `-errno`): git’s `is_reinit()` does `readlink(...) != -1`, so `-ENOENT`
@@ -64,7 +67,9 @@ kh run git -- status          # clean on main
 
 | Note | Detail |
 | --- | --- |
-| Post-commit exit | `git commit` may still **SIGSEGV in `start_command`** (subprocess/hooks surface) after writing the commit; the commit is durable (`log` / clean `status`). Soft `fork` is present; fuller spawn is G3+ polish. |
+| Spawn | Host `fork` + `waitpid` + `dup2`; `execve` of Mach-O re-execs `kh run <path> -- args` (injects `KAKEHASHI_*`). Shell scripts use host `/bin/sh` etc. Post-commit `git maintenance` runs as a nested guest. |
+| `_environ` | Must be a **data** export. Binding a missing-function trampoline here made git walk trampoline bytes as `char **` and SIGSEGV after `pipe` in `start_command`. |
+| Pipe | Darwin-like **blocking** `pipe(2)` (no default `O_NONBLOCK`); git’s notify pipe does a blocking `read` after `fork`. |
 | Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates) |
 
 ## Install (public Software Update catalog)

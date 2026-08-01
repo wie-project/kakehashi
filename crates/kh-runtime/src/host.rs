@@ -76,6 +76,55 @@ pub fn dup_fd(fd: RawFd) -> Option<RawFd> {
     if rc < 0 { None } else { Some(rc) }
 }
 
+/// `dup2(old, new)` on the host. Returns `new` or `None` on failure.
+#[must_use]
+pub fn dup2_fd(old: RawFd, new: RawFd) -> Option<RawFd> {
+    // SAFETY: both fds are valid host descriptors for the duration of the call.
+    let rc = unsafe { libc::dup2(old, new) };
+    if rc < 0 { None } else { Some(rc) }
+}
+
+/// Host `fork`. Returns `Ok(pid)` where pid is 0 in the child, or `Err(errno)`.
+pub fn fork_process() -> Result<i32, i32> {
+    // SAFETY: Linux fork; only the calling thread is duplicated.
+    let rc = unsafe { libc::fork() };
+    if rc < 0 {
+        Err(last_errno())
+    } else {
+        Ok(rc)
+    }
+}
+
+/// Host `waitpid`. Returns `(pid, status)` or `Err(errno)`. `pid == 0` with
+/// `WNOHANG` means no child ready.
+pub fn wait_pid(pid: i32, options: i32) -> Result<(i32, i32), i32> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: status is stack-local; waitpid is well-defined.
+    let rc = unsafe { libc::waitpid(pid, &raw mut status, options) };
+    if rc < 0 {
+        Err(last_errno())
+    } else {
+        Ok((rc, status))
+    }
+}
+
+/// Host `execve` with owned C strings (never returns on success).
+///
+/// # Safety
+///
+/// `argv` and `envp` must be NULL-terminated arrays of valid C strings; this
+/// process image is replaced on success.
+pub unsafe fn execve_host(
+    path: &std::ffi::CStr,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+) -> i32 {
+    // SAFETY: caller guarantees NUL-terminated argv/envp; path is a CStr.
+    let rc = unsafe { libc::execve(path.as_ptr(), argv.as_ptr().cast(), envp.as_ptr().cast()) };
+    let _ = rc;
+    last_errno()
+}
+
 fn last_errno() -> i32 {
     io::Error::last_os_error()
         .raw_os_error()
@@ -88,38 +137,17 @@ fn socklen_of(len: usize) -> Option<libc::socklen_t> {
 
 /// `pipe(2)` — returns `(read_fd, write_fd)` or `None` on failure.
 ///
-/// Both ends are set `O_NONBLOCK|O_CLOEXEC`. Darwin guests (curl/c-ares) often
-/// assume they can `poll` then `read` the wakeup pipe; a blocking `read` after
-/// `poll` timeout=0 deadlocks the freestanding guest when no peer writes.
+/// **Blocking**, no default `CLOEXEC` — matches Darwin `pipe(2)`. Git
+/// `start_command` does a blocking `read` on the notify pipe after `fork`;
+/// non-blocking ends surface `EAGAIN` and break spawn. Guests that need
+/// non-block (curl/c-ares) set `O_NONBLOCK` via `fcntl`.
 #[must_use]
 pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
     let mut fds = [0_i32; 2];
-    // Prefer pipe2 when available (Linux).
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: stack buffer of two ints for the kernel to fill.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        if rc != 0 {
-            return None;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // SAFETY: stack buffer of two ints for the kernel to fill.
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if rc != 0 {
-            return None;
-        }
-        for fd in fds {
-            // SAFETY: freshly created pipe ends.
-            unsafe {
-                let fl = libc::fcntl(fd, libc::F_GETFL);
-                if fl >= 0 {
-                    let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                }
-                let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
+    // SAFETY: stack buffer of two ints for the kernel to fill.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
     }
     match (fds.first().copied(), fds.get(1).copied()) {
         (Some(r), Some(w)) => Some((r, w)),

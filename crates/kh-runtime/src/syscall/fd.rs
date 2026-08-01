@@ -272,6 +272,40 @@ pub(crate) fn handle_dup(args: SyscallArgs) -> SyscallResult {
     finish_open(name, new_host)
 }
 
+/// `dup2` — oldfd `x0`, newfd `x1`.
+pub(crate) fn handle_dup2(args: SyscallArgs) -> SyscallResult {
+    let name = "dup2";
+    let old = reg_as_i32(args.x0);
+    let new = reg_as_i32(args.x1);
+    if new < 0 {
+        return SyscallResult::err(name, EBADF);
+    }
+    let Some(host_old) = guest_to_host_fd_i32(old) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if old == new {
+        return SyscallResult::ok(name, u64::try_from(new).unwrap_or(0));
+    }
+
+    // Stdio slots are identity-mapped to host 0/1/2 — must host-dup2 so the
+    // next `execve` (re-exec of `kh`) inherits the redirected descriptors.
+    if new <= 2 {
+        if host::dup2_fd(host_old, new).is_none() {
+            return SyscallResult::err(name, EBADF);
+        }
+        return SyscallResult::ok(name, u64::try_from(new).unwrap_or(0));
+    }
+
+    let Some(host_new) = host::dup_fd(host_old) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if !process::fd_install(new, host_new) {
+        host::close_fd(host_new);
+        return SyscallResult::err(name, EBADF);
+    }
+    SyscallResult::ok(name, u64::try_from(new).unwrap_or(0))
+}
+
 /// `lseek` — fd `x0`, offset `x1`, whence `x2`.
 pub(crate) fn handle_lseek(args: SyscallArgs) -> SyscallResult {
     let name = "lseek";

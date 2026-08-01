@@ -2,6 +2,8 @@
 
 /// BSD `exit`.
 pub(crate) const SYS_EXIT: u32 = 1;
+/// BSD `fork`.
+pub(crate) const SYS_FORK: u32 = 2;
 /// BSD `read`.
 pub(crate) const SYS_READ: u32 = 3;
 /// BSD `write`.
@@ -10,8 +12,26 @@ pub(crate) const SYS_WRITE: u32 = 4;
 pub(crate) const SYS_OPEN: u32 = 5;
 /// BSD `close`.
 pub(crate) const SYS_CLOSE: u32 = 6;
+/// BSD `wait4` (also implements `waitpid`).
+pub(crate) const SYS_WAIT4: u32 = 7;
 /// BSD `fcntl`.
 pub(crate) const SYS_FCNTL: u32 = 92;
+/// BSD `dup2`.
+pub(crate) const SYS_DUP2: u32 = 90;
+/// BSD `dup`.
+pub(crate) const SYS_DUP: u32 = 41;
+/// BSD `execve`.
+pub(crate) const SYS_EXECVE: u32 = 59;
+/// BSD `vfork`.
+pub(crate) const SYS_VFORK: u32 = 66;
+/// BSD `setsid`.
+pub(crate) const SYS_SETSID: u32 = 147;
+/// BSD `setpgid`.
+pub(crate) const SYS_SETPGID: u32 = 82;
+/// BSD `getpgrp`.
+pub(crate) const SYS_GETPGRP: u32 = 81;
+/// BSD `kill`.
+pub(crate) const SYS_KILL: u32 = 37;
 /// BSD `unlink`.
 pub(crate) const SYS_UNLINK: u32 = 10;
 /// BSD `chdir`.

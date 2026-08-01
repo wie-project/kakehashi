@@ -873,6 +873,40 @@ pub(crate) unsafe extern "C" fn pthread_equal(t1: *mut c_void, t2: *mut c_void) 
     i32::from(t1 == t2)
 }
 
+/// C `pthread_setcancelstate` → nlist `_pthread_setcancelstate` (soft; no cancel).
+///
+/// Apple `git` `start_command` brackets `fork` with this. A missing import is
+/// bound to a noreturn trampoline and aborts the guest; always succeed.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_setcancelstate(
+    _state: c_int,
+    oldstate: *mut c_int,
+) -> c_int {
+    if !oldstate.is_null() {
+        // PTHREAD_CANCEL_ENABLE == 0 on Darwin.
+        // SAFETY: optional out-param from guest.
+        unsafe {
+            oldstate.write(0);
+        }
+    }
+    0
+}
+
+/// C `pthread_setcanceltype` → nlist `_pthread_setcanceltype` (soft).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_setcanceltype(
+    _type_: c_int,
+    oldtype: *mut c_int,
+) -> c_int {
+    if !oldtype.is_null() {
+        // SAFETY: optional out-param from guest.
+        unsafe {
+            oldtype.write(0);
+        }
+    }
+    0
+}
+
 /// C `pthread_exit` → nlist `_pthread_exit` (main: process exit).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn pthread_exit(retval: *mut c_void) -> ! {

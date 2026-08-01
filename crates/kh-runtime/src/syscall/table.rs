@@ -5,6 +5,24 @@
 pub enum BsdSyscall {
     /// `exit`.
     Exit,
+    /// `fork`.
+    Fork,
+    /// `vfork` (translator: same as `fork`).
+    Vfork,
+    /// `wait4` / `waitpid`.
+    Wait4,
+    /// `execve`.
+    Execve,
+    /// `dup2`.
+    Dup2,
+    /// `setsid`.
+    Setsid,
+    /// `setpgid`.
+    Setpgid,
+    /// `getpgrp`.
+    Getpgrp,
+    /// `kill`.
+    Kill,
     /// `read`.
     Read,
     /// `write`.
@@ -147,6 +165,15 @@ impl BsdSyscall {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Exit => "exit",
+            Self::Fork => "fork",
+            Self::Vfork => "vfork",
+            Self::Wait4 => "wait4",
+            Self::Execve => "execve",
+            Self::Dup2 => "dup2",
+            Self::Setsid => "setsid",
+            Self::Setpgid => "setpgid",
+            Self::Getpgrp => "getpgrp",
+            Self::Kill => "kill",
             Self::Read => "read",
             Self::Write => "write",
             Self::Open => "open",
@@ -222,11 +249,20 @@ impl BsdSyscall {
     pub const fn number(self) -> u32 {
         match self {
             Self::Exit => 1,
+            Self::Fork => 2,
             Self::Read => 3,
             Self::Write => 4,
             Self::Open => 5,
             Self::Close => 6,
+            Self::Wait4 => 7,
             Self::Unlink => 10,
+            Self::Execve => 59,
+            Self::Vfork => 66,
+            Self::Dup2 => 90,
+            Self::Setsid => 147,
+            Self::Setpgid => 82,
+            Self::Getpgrp => 81,
+            Self::Kill => 37,
             Self::Link => 9,
             Self::Getpid => 20,
             Self::Getuid => 24,
@@ -297,10 +333,12 @@ impl BsdSyscall {
 pub const fn lookup(number: u32) -> Option<BsdSyscall> {
     match number {
         1 => Some(BsdSyscall::Exit),
+        2 => Some(BsdSyscall::Fork),
         3 | 396 => Some(BsdSyscall::Read),
         4 | 397 => Some(BsdSyscall::Write),
         5 | 398 => Some(BsdSyscall::Open),
         6 | 399 => Some(BsdSyscall::Close),
+        7 | 400 => Some(BsdSyscall::Wait4), // wait4 / wait4_nocancel-ish
         9 => Some(BsdSyscall::Link),
         10 | 401 => Some(BsdSyscall::Unlink),
         12 => Some(BsdSyscall::Chdir),
@@ -308,9 +346,13 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         24 => Some(BsdSyscall::Getuid),
         25 => Some(BsdSyscall::Geteuid),
         33 => Some(BsdSyscall::Access),
+        37 => Some(BsdSyscall::Kill),
         39 => Some(BsdSyscall::Getppid),
         43 => Some(BsdSyscall::Getegid),
         47 => Some(BsdSyscall::Getgid),
+        81 => Some(BsdSyscall::Getpgrp),
+        82 => Some(BsdSyscall::Setpgid),
+        147 => Some(BsdSyscall::Setsid),
         27 | 402 => Some(BsdSyscall::Recvmsg),  // recvmsg / nocancel
         28 | 408 => Some(BsdSyscall::Sendmsg),  // sendmsg / nocancel-ish
         29 | 403 => Some(BsdSyscall::Recvfrom), // recvfrom / nocancel
@@ -323,9 +365,12 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         48 => Some(BsdSyscall::Sigprocmask),
         57 => Some(BsdSyscall::Symlink),
         58 => Some(BsdSyscall::Readlink),
+        59 => Some(BsdSyscall::Execve),
         65 => Some(BsdSyscall::Msync),
+        66 => Some(BsdSyscall::Vfork),
         73 => Some(BsdSyscall::Munmap),
         74 => Some(BsdSyscall::Mprotect),
+        90 => Some(BsdSyscall::Dup2),
         92 => Some(BsdSyscall::Fcntl),
         93 | 394 => Some(BsdSyscall::Select), // select / select_nocancel
         95 | 406 => Some(BsdSyscall::Fsync),
@@ -380,11 +425,16 @@ pub const fn name_of(number: u32) -> Option<&'static str> {
 pub fn known_syscalls() -> &'static [(u32, &'static str)] {
     &[
         (1, "exit"),
+        (2, "fork"),
         (3, "read"),
         (4, "write"),
         (5, "open"),
         (6, "close"),
+        (7, "wait4"),
         (20, "getpid"),
+        (59, "execve"),
+        (66, "vfork"),
+        (90, "dup2"),
         (24, "getuid"),
         (25, "geteuid"),
         (33, "access"),

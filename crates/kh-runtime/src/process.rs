@@ -119,6 +119,29 @@ pub fn fd_take(gfd: i32) -> Option<RawFd> {
     if v < 0 { None } else { Some(v) }
 }
 
+/// Installs `host_fd` into a **specific** guest FD slot (for `dup2`).
+///
+/// Closes any previous host mapping at `gfd` (except stdio 0–2 identity).
+/// Returns `false` if `gfd` is out of range.
+#[must_use]
+#[inline]
+pub fn fd_install(gfd: i32, host_fd: RawFd) -> bool {
+    if host_fd < 0 || gfd < 3 {
+        return false;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return false;
+    };
+    let Some(slot) = FD_HOST.get(idx) else {
+        return false;
+    };
+    let prev = slot.swap(host_fd, Ordering::AcqRel);
+    if prev >= 0 && prev != host_fd {
+        host::close_fd(prev);
+    }
+    true
+}
+
 /// Allocates a guest FD slot for `host_fd` (lock-free CAS scan).
 #[must_use]
 #[inline]

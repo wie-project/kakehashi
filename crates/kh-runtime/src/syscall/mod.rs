@@ -77,6 +77,13 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
 
     match lookup(args.number) {
         Some(BsdSyscall::Exit) => process::handle_exit(args),
+        Some(BsdSyscall::Fork | BsdSyscall::Vfork) => process::handle_fork(args),
+        Some(BsdSyscall::Wait4) => process::handle_wait4(args),
+        Some(BsdSyscall::Execve) => process::handle_execve(args),
+        Some(BsdSyscall::Setsid) => process::handle_setsid(),
+        Some(BsdSyscall::Setpgid) => process::handle_setpgid(args),
+        Some(BsdSyscall::Getpgrp) => process::handle_getpgrp(),
+        Some(BsdSyscall::Kill) => process::handle_kill(args),
         Some(BsdSyscall::Write) => io::handle_write(args),
         Some(BsdSyscall::Read) => io::handle_read(args),
         Some(BsdSyscall::Open) => fd::handle_open(args),
@@ -94,6 +101,7 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Mmap) => mem_sys::handle_mmap(args),
         Some(BsdSyscall::Msync) => mem_sys::handle_msync(args),
         Some(BsdSyscall::Dup) => fd::handle_dup(args),
+        Some(BsdSyscall::Dup2) => fd::handle_dup2(args),
         Some(BsdSyscall::Fcntl) => fd::handle_fcntl(args),
         Some(BsdSyscall::Lseek) => fd::handle_lseek(args),
         Some(BsdSyscall::Pread) => io::handle_pread(args),
