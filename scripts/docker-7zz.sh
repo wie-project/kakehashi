@@ -132,7 +132,7 @@ if [[ -x tests/clang-probe/7zz.bin ]]; then
 fi
 "$KH" install 7zip || true
 exec "$KH" run 7zz -- "$@"
-' -- "${GUEST_ARGS[@]}"
+' -- ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}
 
 # After success, if anything was written under KH_OUT, list it.
 if compgen -G "$KH_OUT/*" > /dev/null 2>&1; then
