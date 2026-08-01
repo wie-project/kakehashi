@@ -160,6 +160,29 @@ pub fn socket(domain: libc::c_int, ty: libc::c_int, protocol: libc::c_int) -> Op
     Some(rc)
 }
 
+/// `socketpair(domain, type, protocol, sv[2])`.
+pub fn socketpair(
+    domain: libc::c_int,
+    ty: libc::c_int,
+    protocol: libc::c_int,
+) -> Option<(RawFd, RawFd)> {
+    let mut sv = [0_i32; 2];
+    let ty_plain = ty & 0xf;
+    // SAFETY: stack pair for the kernel to fill.
+    let rc = unsafe { libc::socketpair(domain, ty_plain, protocol, sv.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    set_nonblock(sv[0]);
+    set_nonblock(sv[1]);
+    // SAFETY: freshly created sockets.
+    unsafe {
+        let _ = libc::fcntl(sv[0], libc::F_SETFD, libc::FD_CLOEXEC);
+        let _ = libc::fcntl(sv[1], libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Some((sv[0], sv[1]))
+}
+
 /// `connect(fd, sockaddr_bytes)`.
 pub fn connect(fd: RawFd, addr: &[u8]) -> Result<(), i32> {
     let Some(len) = socklen_of(addr.len()) else {

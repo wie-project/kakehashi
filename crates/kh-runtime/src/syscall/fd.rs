@@ -9,7 +9,7 @@ use crate::mem::registry_check_range;
 use crate::process;
 
 use super::common::{
-    EBADF, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, reg_as_i32, reg_as_i64,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, reg_as_i32, reg_as_i64,
 };
 
 /// Darwin `AT_FDCWD` for `openat`.
@@ -103,10 +103,44 @@ fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
     open_translated(&path, flags, name)
 }
 
+/// Map host `errno` after a failed `open`/`openat` to Darwin errno.
+///
+/// Important for curl `--no-clobber` (`O_CREAT|O_EXCL`): must surface `EEXIST`,
+/// not a blanket `ENOENT` (that made curl report write error 23).
+fn map_open_errno(host_err: i32) -> i64 {
+    if host_err == libc::ENOENT {
+        ENOENT
+    } else if host_err == libc::EEXIST {
+        EEXIST
+    } else if host_err == libc::EACCES || host_err == libc::EPERM {
+        EPERM
+    } else if host_err == libc::EINVAL
+        || host_err == libc::EISDIR
+        || host_err == libc::ENOTDIR
+    {
+        EINVAL
+    } else {
+        // Preserve positive host errno when it overlaps Darwin; else ENOENT.
+        i64::from(host_err).abs().max(1)
+    }
+}
+
+fn open_fail(name: &'static str, path: &str, why: &str) -> SyscallResult {
+    let host_err = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::ENOENT);
+    let darwin = map_open_errno(host_err);
+    log_open_fail(path, &format!("{why} host_errno={host_err} darwin={darwin}"));
+    SyscallResult::err(name, darwin)
+}
+
 fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult {
     let host_flags = darwin_to_host_open_flags(flags);
     let mode = 0o666_u32;
     let creat = host_flags & libc::O_CREAT != 0;
+    // O_EXCL alone is not useful; mkdir-retry only when create is requested and
+    // failure looks like missing parent (not EEXIST from --no-clobber).
+    let excl = host_flags & libc::O_EXCL != 0;
 
     // B1: bottle dirfd + relative path — no PathBuf join, shorter kernel walk.
     if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
@@ -116,9 +150,13 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
         if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
             return finish_open(name, rc);
         }
-        // curl `-o nested/file`: parent may not exist yet. With O_CREAT, make
-        // parents under the bottle (openat relative) and retry once.
+        let first_err = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT);
+        // curl `-o nested/file`: parent may not exist yet. With O_CREAT (and not
+        // a pure exclusivity race), make parents under the bottle and retry once.
         if creat
+            && first_err == libc::ENOENT
             && let Some(parent) = std::path::Path::new(rel).parent()
             && !parent.as_os_str().is_empty()
             && parent != std::path::Path::new(".")
@@ -128,8 +166,15 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
                 return finish_open(name, rc);
             }
         }
-        log_open_fail(path, "ENOENT(openat)");
-        return SyscallResult::err(name, ENOENT);
+        // Prefer the first errno (EEXIST from O_EXCL must not become ENOENT).
+        if first_err == libc::EEXIST || excl {
+            log_open_fail(
+                path,
+                &format!("openat host_errno={first_err} darwin={}", map_open_errno(first_err)),
+            );
+            return SyscallResult::err(name, map_open_errno(first_err));
+        }
+        return open_fail(name, path, "openat");
     }
 
     let Ok(host_path) = translate_path(path) else {
@@ -143,9 +188,13 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
         return finish_open(name, rc);
     }
+    let first_err = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::ENOENT);
     // Relative `-o .tmp/out/body` (host CWD) or absolute under bottle: create
     // missing parents when the guest asked for O_CREAT (fopen "w" / curl -o).
     if creat
+        && first_err == libc::ENOENT
         && let Some(parent) = host_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -154,8 +203,14 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
             return finish_open(name, rc);
         }
     }
-    log_open_fail(path, "ENOENT");
-    SyscallResult::err(name, ENOENT)
+    if first_err == libc::EEXIST || excl {
+        log_open_fail(
+            path,
+            &format!("open host_errno={first_err} darwin={}", map_open_errno(first_err)),
+        );
+        return SyscallResult::err(name, map_open_errno(first_err));
+    }
+    open_fail(name, path, "open")
 }
 
 fn log_open_fail(path: &str, why: &str) {

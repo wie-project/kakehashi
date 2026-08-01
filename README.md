@@ -94,6 +94,11 @@ ls -lh .tmp/kh-out/body .tmp/kh-out/https-body
 
 # Trace-first probe logs → .tmp/kh-curl-probe/
 ./scripts/docker-curl-probe.sh --version
+
+# Option matrix (large tiers) → .tmp/kh-curl-options/
+./scripts/docker-curl-options.sh tier1
+./scripts/docker-curl-options.sh tier9-10
+./scripts/docker-curl-options.sh all          # tier1..10
 ```
 
 Harmless noise on many runs:
@@ -278,6 +283,7 @@ Bottle bridges the Linux FS as `/Volumes/linux/…`:
 | `scripts/docker-7zz.sh` | Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
 | `scripts/docker-curl.sh` | Darwin `curl` under `kh` (same shape as `docker-7zz`) |
 | `scripts/docker-curl-probe.sh` | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`) |
+| `scripts/docker-curl-options.sh` | Tiered curl flag smoke (`tier1`…`tier10`, `tier9-10`, `all` → `.tmp/kh-curl-options`) |
 | `scripts/bench-fair-local.sh` | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`) |
 
 ## License

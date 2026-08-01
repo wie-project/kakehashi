@@ -26,6 +26,8 @@ pub(crate) const SYS_SYMLINK: u32 = 57;
 pub(crate) const SYS_READLINK: u32 = 58;
 /// BSD `munmap`.
 pub(crate) const SYS_MUNMAP: u32 = 73;
+/// BSD `mprotect`.
+pub(crate) const SYS_MPROTECT: u32 = 74;
 /// BSD `fsync`.
 pub(crate) const SYS_FSYNC: u32 = 95;
 /// BSD `gettimeofday`.
@@ -66,6 +68,8 @@ pub(crate) const SYS_OPENAT: u32 = 463;
 pub(crate) const SYS_PIPE: u32 = 42;
 /// BSD `socket`.
 pub(crate) const SYS_SOCKET: u32 = 97;
+/// BSD `socketpair`.
+pub(crate) const SYS_SOCKETPAIR: u32 = 135;
 /// BSD `connect`.
 pub(crate) const SYS_CONNECT: u32 = 98;
 /// BSD `bind`.
@@ -82,6 +86,10 @@ pub(crate) const SYS_SENDTO: u32 = 133;
 pub(crate) const SYS_SHUTDOWN: u32 = 134;
 /// BSD `recvfrom`.
 pub(crate) const SYS_RECVFROM: u32 = 29;
+/// BSD `recvmsg`.
+pub(crate) const SYS_RECVMSG: u32 = 27;
+/// BSD `sendmsg`.
+pub(crate) const SYS_SENDMSG: u32 = 28;
 /// BSD `accept`.
 pub(crate) const SYS_ACCEPT: u32 = 30;
 /// BSD `select`.

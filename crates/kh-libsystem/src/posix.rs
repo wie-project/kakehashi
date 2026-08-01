@@ -6,9 +6,9 @@ use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID,
-    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_OPEN,
-    SYS_OPENAT, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
-    SYS_SYSCTLBYNAME, SYS_UNLINK,
+    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR,
+    SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -401,6 +401,50 @@ pub(crate) unsafe extern "C" fn utimensat(
     0
 }
 
+/// C `utimes` → nlist `_utimes` (soft success; curl `-R` / `--remote-time`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn utimes(_path: *const c_char, _times: *const c_void) -> c_int {
+    0
+}
+
+/// C `futimes` → nlist `_futimes` (soft success).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn futimes(_fd: c_int, _times: *const c_void) -> c_int {
+    0
+}
+
+/// C `lutimes` → nlist `_lutimes` (soft success).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn lutimes(_path: *const c_char, _times: *const c_void) -> c_int {
+    0
+}
+
+/// C `fsetxattr` → nlist `_fsetxattr` (soft success; curl `--xattr`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fsetxattr(
+    _fd: c_int,
+    _name: *const c_char,
+    _value: *const c_void,
+    _size: usize,
+    _position: u32,
+    _options: c_int,
+) -> c_int {
+    0
+}
+
+/// C `setxattr` → nlist `_setxattr` (soft success).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setxattr(
+    _path: *const c_char,
+    _name: *const c_char,
+    _value: *const c_void,
+    _size: usize,
+    _position: u32,
+    _options: c_int,
+) -> c_int {
+    0
+}
+
 // ── dirent ──────────────────────────────────────────────────────────────────
 //
 // `opendir` opens the path as a directory FD. `readdir` fills a Darwin-shaped
@@ -778,6 +822,32 @@ pub(crate) unsafe extern "C" fn signal(_sig: c_int, _handler: *mut c_void) -> *m
     core::ptr::null_mut()
 }
 
+/// C `sigaction` → nlist `_sigaction` (soft no-op; enough for curl ignore handlers).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigaction(
+    _sig: c_int,
+    _act: *const c_void,
+    oact: *mut c_void,
+) -> c_int {
+    if !oact.is_null() {
+        unsafe {
+            crate::stdio::bzero(oact, 32);
+        }
+    }
+    0
+}
+
+/// Darwin `___darwin_check_fd_set_overflow` → safe for small FD_SET uses.
+#[unsafe(export_name = "__darwin_check_fd_set_overflow")]
+pub(crate) unsafe extern "C" fn __darwin_check_fd_set_overflow(
+    _fd: c_int,
+    _fdset: *const c_void,
+    _how: c_int,
+) -> c_int {
+    // 0 = OK (no overflow). curl select/poll path only.
+    0
+}
+
 /// C `setlocale` → nlist `_setlocale` (always "C").
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> *mut c_char {
@@ -950,6 +1020,119 @@ pub(crate) unsafe extern "C" fn getgrgid(_gid: u32) -> *mut c_void {
     core::ptr::null_mut()
 }
 
+/// C `getpwuid_r` → nlist `_getpwuid_r` (no passwd DB; return 0 with null result).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpwuid_r(
+    _uid: u32,
+    _pwd: *mut c_void,
+    _buf: *mut c_char,
+    _buflen: usize,
+    result: *mut *mut c_void,
+) -> c_int {
+    if !result.is_null() {
+        unsafe {
+            result.write(core::ptr::null_mut());
+        }
+    }
+    0
+}
+
+// ── mmap surface (OpenSSL / curl may map pages) ─────────────────────────────
+
+/// C `mmap` → nlist `_mmap`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mmap(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: i64,
+) -> *mut c_void {
+    if len == 0 {
+        errno::set_errno(EINVAL);
+        return core::ptr::with_exposed_provenance_mut::<c_void>(usize::MAX);
+    }
+    let ret = unsafe {
+        sys::syscall6(
+            SYS_MMAP,
+            ptr_u64(addr),
+            u64::try_from(len).unwrap_or(0),
+            u64::from(prot.cast_unsigned()),
+            u64::from(flags.cast_unsigned()),
+            u64::from(fd.cast_unsigned()),
+            offset.cast_unsigned(),
+        )
+    };
+    if ret < 0 {
+        apply_ret(ret);
+        // MAP_FAILED == (void *)-1
+        return core::ptr::with_exposed_provenance_mut::<c_void>(usize::MAX);
+    }
+    let a = usize::try_from(ret).unwrap_or(0);
+    core::ptr::with_exposed_provenance_mut::<c_void>(a)
+}
+
+/// C `munmap` → nlist `_munmap`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn munmap(addr: *mut c_void, len: usize) -> c_int {
+    if addr.is_null() || len == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let ret = unsafe { sys::syscall2(SYS_MUNMAP, ptr_u64(addr), u64::try_from(len).unwrap_or(0)) };
+    ret_c_int(ret)
+}
+
+/// C `mprotect` → nlist `_mprotect`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int {
+    if addr.is_null() || len == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_MPROTECT,
+            ptr_u64(addr),
+            u64::try_from(len).unwrap_or(0),
+            u64::from(prot.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
+}
+
+/// C `mlock` → nlist `_mlock` (soft success; pages stay resident on host).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mlock(_addr: *const c_void, _len: usize) -> c_int {
+    0
+}
+
+// ── PRNG ────────────────────────────────────────────────────────────────────
+
+static mut RAND_STATE: u32 = 1;
+
+/// C `srand` → nlist `_srand`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn srand(seed: u32) {
+    unsafe {
+        RAND_STATE = if seed == 0 { 1 } else { seed };
+    }
+}
+
+/// C `rand` → nlist `_rand` (LCG; not crypto).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn rand() -> c_int {
+    // SAFETY: single-threaded init paths; fine for curl scaffolding.
+    unsafe {
+        // Numerical Recipes LCG constants.
+        RAND_STATE = RAND_STATE
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        c_int::try_from(RAND_STATE >> 1).unwrap_or(0)
+    }
+}
+
 // ── time ────────────────────────────────────────────────────────────────────
 
 /// C `gettimeofday` → nlist `_gettimeofday`.
@@ -1055,29 +1238,205 @@ pub(crate) unsafe extern "C" fn localtime(clock: *const i64) -> *mut c_void {
     unsafe { fill_tm(clock).cast() }
 }
 
+/// C `gmtime_r` → nlist `_gmtime_r`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn gmtime_r(clock: *const i64, result: *mut c_void) -> *mut c_void {
+    if result.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        fill_tm_into(clock, result.cast());
+        result
+    }
+}
+
+/// C `localtime_r` → nlist `_localtime_r`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn localtime_r(clock: *const i64, result: *mut c_void) -> *mut c_void {
+    unsafe { gmtime_r(clock, result) }
+}
+
+/// C `difftime` → nlist `_difftime`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn difftime(time1: f64, time0: f64) -> f64 {
+    time1 - time0
+}
+
 unsafe fn fill_tm(clock: *const i64) -> *mut Tm {
+    unsafe {
+        fill_tm_into(clock, core::ptr::addr_of_mut!(TM_BUF));
+        core::ptr::addr_of_mut!(TM_BUF)
+    }
+}
+
+unsafe fn fill_tm_into(clock: *const i64, out: *mut Tm) {
     let t = if clock.is_null() {
         0
     } else {
         unsafe { clock.read() }
     };
-    // Very rough breakdown (enough for bind + trivial callers).
+    // Very rough breakdown (enough for bind + trivial callers / HTTP dates).
     let days = t.div_euclid(86_400);
     let sod = t.rem_euclid(86_400);
     unsafe {
-        TM_BUF.sec = trunc_i64_to_c_int(sod.rem_euclid(60));
-        TM_BUF.min = trunc_i64_to_c_int(sod.div_euclid(60).rem_euclid(60));
-        TM_BUF.hour = trunc_i64_to_c_int(sod.div_euclid(3_600));
-        TM_BUF.mday = trunc_i64_to_c_int(days.rem_euclid(28).saturating_add(1));
-        TM_BUF.mon = 0;
-        TM_BUF.year = trunc_i64_to_c_int(70_i64.saturating_add(days.div_euclid(365)));
-        TM_BUF.wday = trunc_i64_to_c_int(days.saturating_add(4).rem_euclid(7));
-        TM_BUF.yday = trunc_i64_to_c_int(days.rem_euclid(365));
-        TM_BUF.isdst = 0;
-        TM_BUF.gmtoff = 0;
-        TM_BUF.zone = core::ptr::addr_of!(ZONE).cast();
-        core::ptr::addr_of_mut!(TM_BUF)
+        (*out).sec = trunc_i64_to_c_int(sod.rem_euclid(60));
+        (*out).min = trunc_i64_to_c_int(sod.div_euclid(60).rem_euclid(60));
+        (*out).hour = trunc_i64_to_c_int(sod.div_euclid(3_600));
+        (*out).mday = trunc_i64_to_c_int(days.rem_euclid(28).saturating_add(1));
+        (*out).mon = 0;
+        (*out).year = trunc_i64_to_c_int(70_i64.saturating_add(days.div_euclid(365)));
+        (*out).wday = trunc_i64_to_c_int(days.saturating_add(4).rem_euclid(7));
+        (*out).yday = trunc_i64_to_c_int(days.rem_euclid(365));
+        (*out).isdst = 0;
+        (*out).gmtoff = 0;
+        (*out).zone = core::ptr::addr_of!(ZONE).cast();
     }
+}
+
+fn strftime_push(out: &mut [u8; 128], oi: &mut usize, b: u8) -> bool {
+    // Leave room for a trailing NUL when the buffer is later copied out.
+    if oi.saturating_add(1) >= out.len() {
+        return false;
+    }
+    let Some(slot) = out.get_mut(*oi) else {
+        return false;
+    };
+    *slot = b;
+    *oi = oi.saturating_add(1);
+    true
+}
+
+fn strftime_push_str(out: &mut [u8; 128], oi: &mut usize, bytes: &[u8]) -> bool {
+    for &b in bytes {
+        if b == 0 {
+            break;
+        }
+        if !strftime_push(out, oi, b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn strftime_push_u(out: &mut [u8; 128], oi: &mut usize, mut v: u32, width: usize) -> bool {
+    let mut buf = [b'0'; 8];
+    let mut i = 8_usize;
+    if v == 0 {
+        i = i.saturating_sub(1);
+    } else {
+        while v > 0 && i > 0 {
+            i = i.saturating_sub(1);
+            let digit = u8::try_from(v % 10).unwrap_or(0);
+            if let Some(slot) = buf.get_mut(i) {
+                *slot = b'0'.wrapping_add(digit);
+            }
+            v /= 10;
+        }
+    }
+    let digits = 8_usize.saturating_sub(i);
+    let pad = width.saturating_sub(digits);
+    for _ in 0..pad {
+        if !strftime_push(out, oi, b'0') {
+            return false;
+        }
+    }
+    let Some(slice) = buf.get(i..) else {
+        return false;
+    };
+    strftime_push_str(out, oi, slice)
+}
+
+/// C `strftime` → nlist `_strftime` (subset for HTTP / logs).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strftime(
+    s: *mut c_char,
+    max: usize,
+    format: *const c_char,
+    tm: *const c_void,
+) -> usize {
+    if s.is_null() || max == 0 || format.is_null() || tm.is_null() {
+        return 0;
+    }
+    let t = unsafe { &*tm.cast::<Tm>() };
+    let mut out = [0_u8; 128];
+    let mut oi = 0_usize;
+    let mut fi = 0_usize;
+    // SAFETY: format is a guest C string.
+    unsafe {
+        loop {
+            let c = format.add(fi).read().cast_unsigned();
+            if c == 0 {
+                break;
+            }
+            fi = fi.saturating_add(1);
+            if c != b'%' {
+                if !strftime_push(&mut out, &mut oi, c) {
+                    return 0;
+                }
+                continue;
+            }
+            let spec = format.add(fi).read().cast_unsigned();
+            if spec == 0 {
+                break;
+            }
+            fi = fi.saturating_add(1);
+            let ok = match spec {
+                b'%' => strftime_push(&mut out, &mut oi, b'%'),
+                b'Y' => strftime_push_u(
+                    &mut out,
+                    &mut oi,
+                    u32::try_from(t.year.saturating_add(1900)).unwrap_or(0),
+                    4,
+                ),
+                b'm' => strftime_push_u(
+                    &mut out,
+                    &mut oi,
+                    u32::try_from(t.mon.saturating_add(1)).unwrap_or(1),
+                    2,
+                ),
+                b'd' | b'e' => {
+                    strftime_push_u(&mut out, &mut oi, u32::try_from(t.mday).unwrap_or(1), 2)
+                }
+                b'H' => strftime_push_u(&mut out, &mut oi, u32::try_from(t.hour).unwrap_or(0), 2),
+                b'M' => strftime_push_u(&mut out, &mut oi, u32::try_from(t.min).unwrap_or(0), 2),
+                b'S' => strftime_push_u(&mut out, &mut oi, u32::try_from(t.sec).unwrap_or(0), 2),
+                b'a' => {
+                    let days = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+                    let idx = usize::try_from(t.wday.rem_euclid(7)).unwrap_or(0);
+                    strftime_push_str(&mut out, &mut oi, days.get(idx).copied().unwrap_or(b"???"))
+                }
+                b'b' | b'h' => {
+                    let mons = [
+                        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep",
+                        b"Oct", b"Nov", b"Dec",
+                    ];
+                    let idx = usize::try_from(t.mon.rem_euclid(12)).unwrap_or(0);
+                    strftime_push_str(&mut out, &mut oi, mons.get(idx).copied().unwrap_or(b"???"))
+                }
+                b'Z' => strftime_push_str(&mut out, &mut oi, b"UTC"),
+                b'z' => strftime_push_str(&mut out, &mut oi, b"+0000"),
+                b'T' => strftime_push_str(&mut out, &mut oi, b"T"),
+                _ => strftime_push(&mut out, &mut oi, spec),
+            };
+            if !ok {
+                return 0;
+            }
+        }
+    }
+    // Need room for NUL; POSIX: return 0 if result including NUL does not fit.
+    if oi.saturating_add(1) > max {
+        return 0;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < oi {
+            let b = out.get(i).copied().unwrap_or(0);
+            s.add(i).write(b.cast_signed());
+            i = i.saturating_add(1);
+        }
+        s.add(oi).write(0);
+    }
+    oi
 }
 
 /// C `mktime` → nlist `_mktime`.

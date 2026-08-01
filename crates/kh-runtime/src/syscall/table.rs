@@ -87,6 +87,8 @@ pub enum BsdSyscall {
     Pipe,
     /// `socket`.
     Socket,
+    /// `socketpair`.
+    Socketpair,
     /// `connect`.
     Connect,
     /// `bind`.
@@ -105,6 +107,10 @@ pub enum BsdSyscall {
     Sendto,
     /// `recvfrom`.
     Recvfrom,
+    /// `sendmsg`.
+    Sendmsg,
+    /// `recvmsg`.
+    Recvmsg,
     /// `send` (often libc → sendto).
     Send,
     /// `recv`.
@@ -166,6 +172,7 @@ impl BsdSyscall {
             Self::ThreadSelfid => "thread_selfid",
             Self::Pipe => "pipe",
             Self::Socket => "socket",
+            Self::Socketpair => "socketpair",
             Self::Connect => "connect",
             Self::Bind => "bind",
             Self::Listen => "listen",
@@ -175,6 +182,8 @@ impl BsdSyscall {
             Self::Shutdown => "shutdown",
             Self::Sendto => "sendto",
             Self::Recvfrom => "recvfrom",
+            Self::Sendmsg => "sendmsg",
+            Self::Recvmsg => "recvmsg",
             Self::Send => "send",
             Self::Recv => "recv",
             Self::Poll => "poll",
@@ -231,8 +240,11 @@ impl BsdSyscall {
             Self::Fstatat => 470,
             Self::Pipe => 42,
             Self::Accept => 30,
+            Self::Recvmsg => 27,
+            Self::Sendmsg => 28,
             Self::Recvfrom | Self::Recv => 29,
             Self::Socket => 97,
+            Self::Socketpair => 135,
             Self::Connect => 98,
             Self::Bind => 104,
             Self::Setsockopt => 105,
@@ -262,6 +274,8 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         20 => Some(BsdSyscall::Getpid),
         33 => Some(BsdSyscall::Access),
         39 => Some(BsdSyscall::Getppid),
+        27 | 402 => Some(BsdSyscall::Recvmsg),  // recvmsg / nocancel
+        28 | 408 => Some(BsdSyscall::Sendmsg),  // sendmsg / nocancel-ish
         29 | 403 => Some(BsdSyscall::Recvfrom), // recvfrom / nocancel
         30 | 404 => Some(BsdSyscall::Accept),   // accept / nocancel
         31 => Some(BsdSyscall::Getpeername),
@@ -279,6 +293,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         93 | 394 => Some(BsdSyscall::Select), // select / select_nocancel
         95 | 406 => Some(BsdSyscall::Fsync),
         97 => Some(BsdSyscall::Socket),
+        135 => Some(BsdSyscall::Socketpair),
         98 => Some(BsdSyscall::Connect),
         104 => Some(BsdSyscall::Bind),
         105 => Some(BsdSyscall::Setsockopt),

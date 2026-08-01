@@ -36,6 +36,7 @@
 mod apple_stubs;
 mod cxxabi;
 mod errno;
+mod extra_stubs;
 mod heap;
 mod locale;
 mod net;

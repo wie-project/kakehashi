@@ -166,7 +166,9 @@ fn copy_range(dst: &mut [u8], dst_off: usize, src: &[u8]) {
 }
 
 /// Translate Darwin sockaddr bytes for host libc (AF rewrite).
-fn darwin_sockaddr_to_host(buf: &mut [u8]) -> Result<(), i64> {
+///
+/// May **grow** `buf` for `AF_UNIX` so bottle path translation is not truncated.
+fn darwin_sockaddr_to_host(buf: &mut Vec<u8>) -> Result<(), i64> {
     if buf.len() < 2 {
         return Err(EINVAL);
     }
@@ -222,10 +224,57 @@ fn darwin_sockaddr_to_host(buf: &mut [u8]) -> Result<(), i64> {
             copy_range(buf, 24, &scope);
             Ok(())
         }
-        DARWIN_AF_UNIX | 0 => Ok(()),
+        DARWIN_AF_UNIX | 0 => {
+            // Darwin: sa_len @0, sa_family @1, sun_path @2…
+            // Linux:  sa_family u16 @0, sun_path @2…
+            // Note: some guests leave sun_len=0 and pass the real size as
+            // connect()'s addrlen only — prefer buffer length then.
+            let sa_len = usize::from(*buf.first().unwrap_or(&0));
+            let path_end = if sa_len > 2 {
+                sa_len.min(buf.len())
+            } else {
+                buf.len()
+            };
+            let path_bytes = buf.get(2..path_end).unwrap_or(&[]).to_vec();
+            // NUL-terminated guest path (may be abstract if first byte is 0).
+            let is_abstract = path_bytes.first().copied() == Some(0);
+            let host_path = if is_abstract {
+                path_bytes
+            } else {
+                let cstr_end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                let guest = String::from_utf8_lossy(path_bytes.get(..cstr_end).unwrap_or(&[]));
+                if let Ok(p) = crate::bottle::translate_path(guest.as_ref()) {
+                    let mut b = p.into_os_string().into_encoded_bytes();
+                    b.push(0);
+                    b
+                } else {
+                    let mut b = path_bytes;
+                    if !b.ends_with(&[0]) {
+                        b.push(0);
+                    }
+                    b
+                }
+            };
+            // Linux sockaddr_un is typically 110 bytes; **grow** the buffer so
+            // translated bottle paths are not truncated to Darwin sa_len.
+            let need = 2usize.saturating_add(host_path.len()).max(buf.len()).min(110);
+            let mut out = vec![0_u8; need];
+            let fam = u16::try_from(libc::AF_UNIX).unwrap_or(1).to_ne_bytes();
+            put_u8(&mut out, 0, *fam.first().unwrap_or(&0));
+            put_u8(&mut out, 1, *fam.get(1).unwrap_or(&0));
+            let copy_n = host_path.len().min(out.len().saturating_sub(2));
+            if let Some(dst) = out.get_mut(2..2usize.saturating_add(copy_n)) {
+                dst.copy_from_slice(host_path.get(..copy_n).unwrap_or(&[]));
+            }
+            *buf = out;
+            Ok(())
+        }
         _ => Err(EPERM),
     }
 }
+
+// Keep a thin wrapper for call sites that still pass a fixed guest slice
+// through a temporary Vec (connect/bind/sendmsg).
 
 fn host_sockaddr_to_darwin(buf: &mut [u8]) {
     if buf.len() < 2 {
@@ -355,6 +404,43 @@ pub(crate) fn handle_pipe(args: SyscallArgs) -> SyscallResult {
     guest_write_u32(args.x0, gr.cast_unsigned());
     guest_write_u32(args.x0.wrapping_add(4), gw.cast_unsigned());
     net_log(&format!("pipe -> gfd {gr},{gw}"));
+    SyscallResult::ok(name, 0)
+}
+
+/// `socketpair` — domain, type, protocol, int sv[2] out.
+pub(crate) fn handle_socketpair(args: SyscallArgs) -> SyscallResult {
+    let name = "socketpair";
+    let domain = reg_as_i32(args.x0);
+    let ty = reg_as_i32(args.x1);
+    let protocol = reg_as_i32(args.x2);
+    net_log(&format!(
+        "socketpair domain={domain} ty={ty} proto={protocol}"
+    ));
+    if args.x3 == 0 || !registry_check_range(args.x3, 8, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(host_af) = darwin_af_to_host(domain) else {
+        return SyscallResult::err(name, DARWIN_EAFNOSUPPORT);
+    };
+    let Some(host_ty) = darwin_socktype_to_host(ty) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let Some((a, b)) = host::socketpair(host_af, host_ty, protocol) else {
+        return SyscallResult::err(name, EPERM);
+    };
+    let Some(ga) = alloc_guest_fd(a) else {
+        host::close_fd(a);
+        host::close_fd(b);
+        return SyscallResult::err(name, ENOMEM);
+    };
+    let Some(gb) = alloc_guest_fd(b) else {
+        host::close_fd(b);
+        process_close_orphan(ga, a);
+        return SyscallResult::err(name, ENOMEM);
+    };
+    guest_write_u32(args.x3, ga.cast_unsigned());
+    guest_write_u32(args.x3.wrapping_add(4), gb.cast_unsigned());
+    net_log(&format!("socketpair -> gfd {ga},{gb}"));
     SyscallResult::ok(name, 0)
 }
 
@@ -731,6 +817,233 @@ pub(crate) fn handle_recvfrom(args: SyscallArgs) -> SyscallResult {
                 net_log(&format!("recvfrom err={e}"));
                 SyscallResult::err(name, host_errno_to_darwin(e))
             }
+        }
+    }
+}
+
+/// Darwin arm64 `struct msghdr` size / field offsets (LP64).
+const MSGHDR_SIZE: usize = 48;
+const MSG_NAME_OFF: usize = 0;
+const MSG_NAMELEN_OFF: usize = 8;
+const MSG_IOV_OFF: usize = 16;
+const MSG_IOVLEN_OFF: usize = 24;
+// control / flags reserved for later ancillary support
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    let b = buf.get(off..off.saturating_add(4)).unwrap_or(&[0; 4]);
+    u32::from_le_bytes(b.try_into().unwrap_or([0; 4]))
+}
+
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    let b = buf.get(off..off.saturating_add(8)).unwrap_or(&[0; 8]);
+    u64::from_le_bytes(b.try_into().unwrap_or([0; 8]))
+}
+
+fn read_i32_le(buf: &[u8], off: usize) -> i32 {
+    let b = buf.get(off..off.saturating_add(4)).unwrap_or(&[0; 4]);
+    i32::from_le_bytes(b.try_into().unwrap_or([0; 4]))
+}
+
+/// Gather guest iovec into a host buffer (cap 256 KiB for HTTP/3 datagrams).
+fn gather_iov(iov_ptr: u64, iovlen: i32) -> Result<Vec<u8>, i64> {
+    if iovlen < 0 {
+        return Err(EINVAL);
+    }
+    if iovlen == 0 || iov_ptr == 0 {
+        return Ok(Vec::new());
+    }
+    let n = usize::try_from(iovlen).unwrap_or(0);
+    let bytes = n.saturating_mul(16);
+    if !registry_check_range(iov_ptr, bytes, false) {
+        return Err(EFAULT);
+    }
+    let iov = guest_slice(iov_ptr, bytes);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let base_off = i.saturating_mul(16);
+        let base = read_u64_le(iov, base_off);
+        let len = read_u64_le(iov, base_off.saturating_add(8));
+        let Ok(l) = usize::try_from(len) else {
+            return Err(EINVAL);
+        };
+        if l == 0 {
+            continue;
+        }
+        if out.len().saturating_add(l) > 256 * 1024 {
+            return Err(ENOMEM);
+        }
+        if base == 0 || !registry_check_range(base, l, false) {
+            return Err(EFAULT);
+        }
+        out.extend_from_slice(guest_slice(base, l));
+    }
+    Ok(out)
+}
+
+/// Scatter host buffer into guest iovec; returns bytes written.
+fn scatter_iov(iov_ptr: u64, iovlen: i32, data: &[u8]) -> Result<usize, i64> {
+    if iovlen < 0 {
+        return Err(EINVAL);
+    }
+    if iovlen == 0 || iov_ptr == 0 || data.is_empty() {
+        return Ok(0);
+    }
+    let n = usize::try_from(iovlen).unwrap_or(0);
+    let bytes = n.saturating_mul(16);
+    if !registry_check_range(iov_ptr, bytes, false) {
+        return Err(EFAULT);
+    }
+    let iov = guest_slice(iov_ptr, bytes);
+    let mut copied = 0_usize;
+    for i in 0..n {
+        if copied >= data.len() {
+            break;
+        }
+        let base_off = i.saturating_mul(16);
+        let base = read_u64_le(iov, base_off);
+        let len = read_u64_le(iov, base_off.saturating_add(8));
+        let Ok(l) = usize::try_from(len) else {
+            return Err(EINVAL);
+        };
+        if l == 0 || base == 0 {
+            continue;
+        }
+        if !registry_check_range(base, l, true) {
+            return Err(EFAULT);
+        }
+        let take = l.min(data.len().saturating_sub(copied));
+        if let Some(chunk) = data.get(copied..copied.saturating_add(take)) {
+            guest_write(base, chunk);
+            copied = copied.saturating_add(take);
+        }
+    }
+    Ok(copied)
+}
+
+/// `sendmsg` — gather iov, optional name → host `sendto` (ancillary ignored).
+pub(crate) fn handle_sendmsg(args: SyscallArgs) -> SyscallResult {
+    let name = "sendmsg";
+    net_log(&format!("sendmsg gfd={}", reg_as_i32(args.x0)));
+    let Some(hfd) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if args.x1 == 0 || !registry_check_range(args.x1, MSGHDR_SIZE, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let hdr = guest_slice(args.x1, MSGHDR_SIZE);
+    let msg_name = read_u64_le(hdr, MSG_NAME_OFF);
+    let msg_namelen = read_u32_le(hdr, MSG_NAMELEN_OFF);
+    let msg_iov = read_u64_le(hdr, MSG_IOV_OFF);
+    let msg_iovlen = read_i32_le(hdr, MSG_IOVLEN_OFF);
+    let flags = reg_as_i32(args.x2) & !0x0008_0000;
+
+    let body = match gather_iov(msg_iov, msg_iovlen) {
+        Ok(b) => b,
+        Err(e) => return SyscallResult::err(name, e),
+    };
+
+    let result = if msg_name != 0 && msg_namelen > 0 {
+        let Ok(alen) = usize::try_from(msg_namelen) else {
+            return SyscallResult::err(name, EINVAL);
+        };
+        if !registry_check_range(msg_name, alen, false) {
+            return SyscallResult::err(name, EFAULT);
+        }
+        let mut abuf = guest_slice(msg_name, alen).to_vec();
+        if let Err(e) = darwin_sockaddr_to_host(&mut abuf) {
+            return SyscallResult::err(name, e);
+        }
+        host::sendto(hfd, &body, flags, Some(abuf.as_slice()))
+    } else {
+        host::sendto(hfd, &body, flags, None)
+    };
+    match result {
+        Ok(n) => {
+            net_log(&format!("sendmsg -> n={n}"));
+            SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
+        }
+        Err(e) => {
+            net_log(&format!("sendmsg err={e}"));
+            SyscallResult::err(name, host_errno_to_darwin(e))
+        }
+    }
+}
+
+/// `recvmsg` — host `recvfrom` into gather buffer, scatter to iov, optional name.
+pub(crate) fn handle_recvmsg(args: SyscallArgs) -> SyscallResult {
+    let name = "recvmsg";
+    net_log(&format!("recvmsg gfd={}", reg_as_i32(args.x0)));
+    let Some(hfd) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if args.x1 == 0 || !registry_check_range(args.x1, MSGHDR_SIZE, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let hdr = guest_slice(args.x1, MSGHDR_SIZE);
+    let msg_name = read_u64_le(hdr, MSG_NAME_OFF);
+    let msg_namelen = read_u32_le(hdr, MSG_NAMELEN_OFF);
+    let msg_iov = read_u64_le(hdr, MSG_IOV_OFF);
+    let msg_iovlen = read_i32_le(hdr, MSG_IOVLEN_OFF);
+    let flags = reg_as_i32(args.x2);
+
+    // Total capacity from iov (cap 256 KiB).
+    let mut cap = 0_usize;
+    if msg_iovlen > 0 && msg_iov != 0 {
+        let n = usize::try_from(msg_iovlen).unwrap_or(0);
+        let bytes = n.saturating_mul(16);
+        if registry_check_range(msg_iov, bytes, false) {
+            let iov = guest_slice(msg_iov, bytes);
+            for i in 0..n {
+                let l = read_u64_le(iov, i.saturating_mul(16).saturating_add(8));
+                cap = cap.saturating_add(usize::try_from(l).unwrap_or(0));
+            }
+        }
+    }
+    cap = cap.clamp(1, 256 * 1024);
+    let mut buf = vec![0_u8; cap];
+    let namelen_addr = args
+        .x1
+        .saturating_add(u64::try_from(MSG_NAMELEN_OFF).unwrap_or(0));
+
+    let result = if msg_name != 0 && msg_namelen > 0 {
+        let Ok(alen) = usize::try_from(msg_namelen) else {
+            return SyscallResult::err(name, EINVAL);
+        };
+        if !registry_check_range(msg_name, alen, true) {
+            return SyscallResult::err(name, EFAULT);
+        }
+        let mut abuf = vec![0_u8; alen.min(128)];
+        match host::recvfrom(hfd, &mut buf, flags, Some(abuf.as_mut_slice())) {
+            Ok((n, naddr)) => {
+                let naddr = naddr.min(abuf.len()).min(alen);
+                if let Some(slice) = abuf.get_mut(..naddr) {
+                    host_sockaddr_to_darwin(slice);
+                    guest_write(msg_name, slice);
+                }
+                // Update msg_namelen in guest msghdr.
+                guest_write_u32(namelen_addr, u32::try_from(naddr).unwrap_or(0));
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        host::recvfrom(hfd, &mut buf, flags, None).map(|(n, _)| n)
+    };
+
+    match result {
+        Ok(n) => {
+            let data = buf.get(..n).unwrap_or(&[]);
+            match scatter_iov(msg_iov, msg_iovlen, data) {
+                Ok(_) => {
+                    net_log(&format!("recvmsg -> n={n}"));
+                    SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
+                }
+                Err(e) => SyscallResult::err(name, e),
+            }
+        }
+        Err(e) => {
+            net_log(&format!("recvmsg err={e}"));
+            SyscallResult::err(name, host_errno_to_darwin(e))
         }
     }
 }

@@ -7,11 +7,13 @@ use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_ACCEPT, SYS_BIND, SYS_CONNECT, SYS_GETPEERNAME, SYS_GETSOCKNAME, SYS_GETSOCKOPT,
-    SYS_LISTEN, SYS_PIPE, SYS_POLL, SYS_RECVFROM, SYS_SELECT, SYS_SENDTO, SYS_SETSOCKOPT,
-    SYS_SHUTDOWN, SYS_SOCKET,
+    SYS_LISTEN, SYS_PIPE, SYS_POLL, SYS_RECVFROM, SYS_RECVMSG, SYS_SELECT, SYS_SENDMSG, SYS_SENDTO,
+    SYS_SETSOCKOPT, SYS_SHUTDOWN, SYS_SOCKET, SYS_SOCKETPAIR,
 };
 
 const EFAULT: i32 = 14;
+const EINVAL: i32 = 22;
+const ENOMEM: i32 = 12;
 const EAI_FAIL: i32 = 4;
 const EAI_MEMORY: i32 = 6;
 const EAI_NONAME: i32 = 8;
@@ -136,6 +138,32 @@ pub(crate) unsafe extern "C" fn socket(domain: c_int, ty: c_int, protocol: c_int
             u64::from(domain.cast_unsigned()),
             u64::from(ty.cast_unsigned()),
             u64::from(protocol.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
+}
+
+/// C `socketpair`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn socketpair(
+    domain: c_int,
+    ty: c_int,
+    protocol: c_int,
+    sv: *mut c_int,
+) -> c_int {
+    if sv.is_null() {
+        errno::set_errno(EFAULT);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall6(
+            SYS_SOCKETPAIR,
+            u64::from(domain.cast_unsigned()),
+            u64::from(ty.cast_unsigned()),
+            u64::from(protocol.cast_unsigned()),
+            ptr_u64(sv.cast()),
+            0,
+            0,
         )
     };
     ret_c_int(ret)
@@ -340,6 +368,232 @@ pub(crate) unsafe extern "C" fn send(
     flags: c_int,
 ) -> isize {
     unsafe { sendto(sockfd, buf, len, flags, core::ptr::null(), 0) }
+}
+
+/// C `sendmsg` → nlist `_sendmsg` (HTTP/3 / UDP paths).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sendmsg(
+    sockfd: c_int,
+    msg: *const c_void,
+    flags: c_int,
+) -> isize {
+    if msg.is_null() {
+        errno::set_errno(EFAULT);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_SENDMSG,
+            u64::from(sockfd.cast_unsigned()),
+            ptr_u64(msg),
+            u64::from(flags.cast_unsigned()),
+        )
+    };
+    apply_ret(ret)
+}
+
+/// C `recvmsg` → nlist `_recvmsg`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn recvmsg(sockfd: c_int, msg: *mut c_void, flags: c_int) -> isize {
+    if msg.is_null() {
+        errno::set_errno(EFAULT);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_RECVMSG,
+            u64::from(sockfd.cast_unsigned()),
+            ptr_u64(msg),
+            u64::from(flags.cast_unsigned()),
+        )
+    };
+    apply_ret(ret)
+}
+
+/// Darwin `connectx` → fall back to `connect` on the destination endpoint.
+///
+/// Used by TCP Fast Open / multipath paths; enough for curl `--tcp-fastopen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn connectx(
+    socket: c_int,
+    endpoints: *const c_void,
+    _associd: u32,
+    _flags: u32,
+    _iov: *const c_void,
+    _iovcnt: u32,
+    len: *mut usize,
+    _connid: *mut u32,
+) -> c_int {
+    if endpoints.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // Darwin sa_endpoints_t (arm64 LP64):
+    //   u32 sae_srcif; pad; sockaddr* sae_srcaddr; u32 sae_srcaddrlen; pad;
+    //   sockaddr* sae_dstaddr; u32 sae_dstaddrlen; pad;
+    // Offsets: dstaddr @ 24, dstlen @ 32.
+    let base = endpoints.cast::<u8>();
+    // SAFETY: guest endpoints buffer; read unaligned pointer + length.
+    let dst = unsafe {
+        let mut raw = [0_u8; 8];
+        core::ptr::copy_nonoverlapping(base.add(24), raw.as_mut_ptr(), 8);
+        let addr = usize::from_le_bytes(raw);
+        core::ptr::with_exposed_provenance::<c_void>(addr)
+    };
+    let dstlen = unsafe {
+        let mut raw = [0_u8; 4];
+        core::ptr::copy_nonoverlapping(base.add(32), raw.as_mut_ptr(), 4);
+        u32::from_le_bytes(raw)
+    };
+    if dst.is_null() || dstlen == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let rc = unsafe { connect(socket, dst, dstlen) };
+    if rc == 0 && !len.is_null() {
+        unsafe {
+            len.write(0);
+        }
+    }
+    rc
+}
+
+// getifaddrs: one lo0 node + name + sockaddr_in + netmask.
+const IFADDRS_NODE: usize = 56;
+const IFADDRS_NAME: &[u8] = b"lo0\0";
+
+/// C `getifaddrs` → nlist `_getifaddrs` (single loopback entry for `--interface`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getifaddrs(ifap: *mut *mut c_void) -> c_int {
+    if ifap.is_null() {
+        errno::set_errno(EFAULT);
+        return -1;
+    }
+    // sockaddr_in: len=16, family=2, port=0, addr=127.0.0.1
+    let mut sin = [0_u8; 16];
+    if let Some(s) = sin.get_mut(0) {
+        *s = 16;
+    }
+    if let Some(s) = sin.get_mut(1) {
+        *s = 2; // AF_INET
+    }
+    if let Some(s) = sin.get_mut(4) {
+        *s = 127;
+    }
+    if let Some(s) = sin.get_mut(7) {
+        *s = 1;
+    }
+    let mut mask = [0_u8; 16];
+    if let Some(s) = mask.get_mut(0) {
+        *s = 16;
+    }
+    if let Some(s) = mask.get_mut(1) {
+        *s = 2;
+    }
+    if let Some(s) = mask.get_mut(4) {
+        *s = 255;
+    }
+    let total = IFADDRS_NODE
+        .saturating_add(IFADDRS_NAME.len())
+        .saturating_add(sin.len())
+        .saturating_add(mask.len());
+    let raw = unsafe { malloc(total) };
+    if raw.is_null() {
+        errno::set_errno(ENOMEM);
+        return -1;
+    }
+    unsafe {
+        crate::stdio::bzero(raw, total);
+        let base = raw.cast::<u8>();
+        let name_off = IFADDRS_NODE;
+        let addr_off = name_off.saturating_add(IFADDRS_NAME.len());
+        let mask_off = addr_off.saturating_add(sin.len());
+        let mut i = 0_usize;
+        while i < IFADDRS_NAME.len() {
+            if let Some(&b) = IFADDRS_NAME.get(i) {
+                base.add(name_off.saturating_add(i)).write(b);
+            }
+            i = i.saturating_add(1);
+        }
+        i = 0;
+        while i < sin.len() {
+            if let Some(&b) = sin.get(i) {
+                base.add(addr_off.saturating_add(i)).write(b);
+            }
+            if let Some(&b) = mask.get(i) {
+                base.add(mask_off.saturating_add(i)).write(b);
+            }
+            i = i.saturating_add(1);
+        }
+        write_ptr_field(base, 8, base.add(name_off));
+        // ifa_flags = IFF_UP|IFF_LOOPBACK|IFF_RUNNING (0x1|0x8|0x40)
+        write_u32_field(base, 16, 0x49);
+        write_ptr_field(base, 24, base.add(addr_off));
+        write_ptr_field(base, 32, base.add(mask_off));
+        ifap.write(raw);
+    }
+    0
+}
+
+#[inline]
+unsafe fn write_ptr_field(base: *mut u8, off: usize, ptr: *mut u8) {
+    let bytes = ptr.addr().to_le_bytes();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(off), 8);
+    }
+}
+
+#[inline]
+unsafe fn write_u32_field(base: *mut u8, off: usize, v: u32) {
+    let bytes = v.to_le_bytes();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(off), 4);
+    }
+}
+
+/// C `freeifaddrs`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn freeifaddrs(ifa: *mut c_void) {
+    if !ifa.is_null() {
+        unsafe {
+            free(ifa);
+        }
+    }
+}
+
+/// C `if_nametoindex` → nlist `_if_nametoindex` (lo0 → 1).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn if_nametoindex(name: *const c_char) -> u32 {
+    if name.is_null() {
+        return 0;
+    }
+    // Match "lo0" / "lo"
+    unsafe {
+        let b0 = name.read().cast_unsigned();
+        let b1 = name.add(1).read().cast_unsigned();
+        if b0 == b'l' && b1 == b'o' {
+            return 1;
+        }
+    }
+    0
+}
+
+/// C `if_indextoname` → nlist `_if_indextoname`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn if_indextoname(ifindex: u32, ifname: *mut c_char) -> *mut c_char {
+    if ifname.is_null() || ifindex == 0 {
+        return core::ptr::null_mut();
+    }
+    if ifindex == 1 {
+        unsafe {
+            ifname.write(b'l'.cast_signed());
+            ifname.add(1).write(b'o'.cast_signed());
+            ifname.add(2).write(b'0'.cast_signed());
+            ifname.add(3).write(0);
+        }
+        return ifname;
+    }
+    core::ptr::null_mut()
 }
 
 /// C `recvfrom`.

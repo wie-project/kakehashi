@@ -586,6 +586,113 @@ pub(crate) unsafe extern "C" fn fwrite(
     got.checked_div(size).unwrap_or(0)
 }
 
+/// C `fseek` → nlist `_fseek`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fseek(stream: *mut c_void, offset: i64, whence: c_int) -> c_int {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    let fd = unsafe { (*f).fd };
+    let pos = unsafe { crate::posix::lseek(fd, offset, whence) };
+    if pos < 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+        }
+        return -1;
+    }
+    unsafe {
+        (*f).flags &= !FILE_EOF;
+    }
+    0
+}
+
+/// C `fseeko` → nlist `_fseeko` (off_t is i64 on Darwin arm64).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fseeko(stream: *mut c_void, offset: i64, whence: c_int) -> c_int {
+    unsafe { fseek(stream, offset, whence) }
+}
+
+/// C `ftell` → nlist `_ftell`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ftell(stream: *mut c_void) -> i64 {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    let fd = unsafe { (*f).fd };
+    // SEEK_CUR = 1
+    unsafe { crate::posix::lseek(fd, 0, 1) }
+}
+
+/// C `ftello` → nlist `_ftello`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ftello(stream: *mut c_void) -> i64 {
+    unsafe { ftell(stream) }
+}
+
+/// C `rewind` → nlist `_rewind`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn rewind(stream: *mut c_void) {
+    if stream.is_null() {
+        return;
+    }
+    let _ = unsafe { fseek(stream, 0, 0) };
+    unsafe {
+        (*as_file(stream)).flags &= !(FILE_EOF | FILE_ERR);
+        (*as_file(stream)).err = 0;
+    }
+}
+
+/// C `getc` → nlist `_getc` (same as fgetc).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getc(stream: *mut c_void) -> c_int {
+    unsafe { fgetc(stream) }
+}
+
+/// C `freopen` → nlist `_freopen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn freopen(
+    path: *const c_char,
+    mode: *const c_char,
+    stream: *mut c_void,
+) -> *mut c_void {
+    if stream.is_null() {
+        errno::set_errno(9);
+        return core::ptr::null_mut();
+    }
+    let Some((flags, creat_mode)) = open_flags_from_mode(mode) else {
+        errno::set_errno(22);
+        return core::ptr::null_mut();
+    };
+    if path.is_null() {
+        errno::set_errno(14);
+        return core::ptr::null_mut();
+    }
+    let f = unsafe { as_file(stream) };
+    let old_fd = unsafe { (*f).fd };
+    let is_std = core::ptr::eq(f, core::ptr::addr_of_mut!(STDIN_FILE))
+        || core::ptr::eq(f, core::ptr::addr_of_mut!(STDOUT_FILE))
+        || core::ptr::eq(f, core::ptr::addr_of_mut!(STDERR_FILE));
+    // Close previous fd except for the three std streams' original slots when
+    // guests freopen stdio onto a path (still close the prior open if non-std).
+    if !is_std && old_fd >= 0 {
+        let _ = unsafe { crate::posix::close(old_fd) };
+    }
+    let new_fd = unsafe { crate::posix::open(path, flags, creat_mode) };
+    if new_fd < 0 {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        (*f).fd = new_fd;
+        (*f).flags = 0;
+        (*f).err = 0;
+    }
+    stream
+}
+
 #[inline]
 fn usize_to_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(0)

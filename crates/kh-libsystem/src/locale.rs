@@ -3,7 +3,7 @@
 //! Driven by curl probe G1: `unresolved symbol __DefaultRuneLocale` before any
 //! BSD syscall. ASCII-only; enough for ctype macros and `setlocale("C")` guests.
 
-use core::ffi::c_int;
+use core::ffi::{c_char, c_int};
 
 /// Cached rune table width (`_CACHED_RUNES` in Darwin `runetype.h`).
 const CACHED_RUNES: usize = 256;
@@ -217,4 +217,164 @@ pub(crate) unsafe extern "C" fn __maskrune(c: c_int, f: usize) -> c_int {
 #[unsafe(export_name = "___mb_cur_max_l")]
 pub(crate) unsafe extern "C" fn ___mb_cur_max_l(_locale: *mut core::ffi::c_void) -> c_int {
     1
+}
+
+// Darwin `nl_item` values from public `<langinfo.h>` / `<_langinfo.h>`.
+const CODESET: c_int = 0;
+const D_T_FMT: c_int = 1;
+const D_FMT: c_int = 2;
+const T_FMT: c_int = 3;
+const T_FMT_AMPM: c_int = 4;
+const AM_STR: c_int = 5;
+const PM_STR: c_int = 6;
+const DAY_1: c_int = 7;
+const ABDAY_1: c_int = 14;
+const MON_1: c_int = 21;
+const ABMON_1: c_int = 33;
+const ERA: c_int = 45;
+const ERA_D_FMT: c_int = 46;
+const ERA_D_T_FMT: c_int = 47;
+const ERA_T_FMT: c_int = 48;
+const ALT_DIGITS: c_int = 49;
+const RADIXCHAR: c_int = 50;
+const THOUSEP: c_int = 51;
+const YESEXPR: c_int = 52;
+const NOEXPR: c_int = 53;
+const YESSTR: c_int = 54;
+const NOSTR: c_int = 55;
+const CRNCYSTR: c_int = 56;
+const D_MD_ORDER: c_int = 57;
+
+const EMPTY: &[u8] = b"\0";
+const CODESET_C: &[u8] = b"US-ASCII\0";
+const DT_FMT: &[u8] = b"%a %b %e %H:%M:%S %Y\0";
+const DATE_FMT: &[u8] = b"%m/%d/%y\0";
+const TIME_FMT: &[u8] = b"%H:%M:%S\0";
+const TIME_AMPM_FMT: &[u8] = b"%I:%M:%S %p\0";
+const AM: &[u8] = b"AM\0";
+const PM: &[u8] = b"PM\0";
+const RADIX: &[u8] = b".\0";
+const THOU: &[u8] = b"\0";
+const YES_EXPR: &[u8] = b"^[yY]\0";
+const NO_EXPR: &[u8] = b"^[nN]\0";
+const YES_STR: &[u8] = b"yes\0";
+const NO_STR: &[u8] = b"no\0";
+const CURRENCY: &[u8] = b"\0";
+const MD_ORDER: &[u8] = b"md\0";
+
+const DAYS: [&[u8]; 7] = [
+    b"Sunday\0",
+    b"Monday\0",
+    b"Tuesday\0",
+    b"Wednesday\0",
+    b"Thursday\0",
+    b"Friday\0",
+    b"Saturday\0",
+];
+const ABDAYS: [&[u8]; 7] = [
+    b"Sun\0", b"Mon\0", b"Tue\0", b"Wed\0", b"Thu\0", b"Fri\0", b"Sat\0",
+];
+const MONTHS: [&[u8]; 12] = [
+    b"January\0",
+    b"February\0",
+    b"March\0",
+    b"April\0",
+    b"May\0",
+    b"June\0",
+    b"July\0",
+    b"August\0",
+    b"September\0",
+    b"October\0",
+    b"November\0",
+    b"December\0",
+];
+const ABMONTHS: [&[u8]; 12] = [
+    b"Jan\0", b"Feb\0", b"Mar\0", b"Apr\0", b"May\0", b"Jun\0", b"Jul\0", b"Aug\0", b"Sep\0",
+    b"Oct\0", b"Nov\0", b"Dec\0",
+];
+
+fn c_locale_nl(item: c_int) -> &'static [u8] {
+    if item == CODESET {
+        return CODESET_C;
+    }
+    if item == D_T_FMT {
+        return DT_FMT;
+    }
+    if item == D_FMT {
+        return DATE_FMT;
+    }
+    if item == T_FMT {
+        return TIME_FMT;
+    }
+    if item == T_FMT_AMPM {
+        return TIME_AMPM_FMT;
+    }
+    if item == AM_STR {
+        return AM;
+    }
+    if item == PM_STR {
+        return PM;
+    }
+    if (DAY_1..DAY_1 + 7).contains(&item) {
+        let idx = usize::try_from(item.wrapping_sub(DAY_1)).unwrap_or(0);
+        return DAYS.get(idx).copied().unwrap_or(EMPTY);
+    }
+    if (ABDAY_1..ABDAY_1 + 7).contains(&item) {
+        let idx = usize::try_from(item.wrapping_sub(ABDAY_1)).unwrap_or(0);
+        return ABDAYS.get(idx).copied().unwrap_or(EMPTY);
+    }
+    if (MON_1..MON_1 + 12).contains(&item) {
+        let idx = usize::try_from(item.wrapping_sub(MON_1)).unwrap_or(0);
+        return MONTHS.get(idx).copied().unwrap_or(EMPTY);
+    }
+    if (ABMON_1..ABMON_1 + 12).contains(&item) {
+        let idx = usize::try_from(item.wrapping_sub(ABMON_1)).unwrap_or(0);
+        return ABMONTHS.get(idx).copied().unwrap_or(EMPTY);
+    }
+    if item == ERA || item == ERA_D_FMT || item == ERA_D_T_FMT || item == ERA_T_FMT || item == ALT_DIGITS
+    {
+        return EMPTY;
+    }
+    if item == RADIXCHAR {
+        return RADIX;
+    }
+    if item == THOUSEP {
+        return THOU;
+    }
+    if item == YESEXPR {
+        return YES_EXPR;
+    }
+    if item == NOEXPR {
+        return NO_EXPR;
+    }
+    if item == YESSTR {
+        return YES_STR;
+    }
+    if item == NOSTR {
+        return NO_STR;
+    }
+    if item == CRNCYSTR {
+        return CURRENCY;
+    }
+    if item == D_MD_ORDER {
+        return MD_ORDER;
+    }
+    EMPTY
+}
+
+/// C `nl_langinfo` → nlist `_nl_langinfo` ("C" locale static strings).
+///
+/// curl hits this after the first network poll (codeset / date formats).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn nl_langinfo(item: c_int) -> *mut c_char {
+    c_locale_nl(item).as_ptr().cast_mut().cast()
+}
+
+/// C `nl_langinfo_l` → nlist `_nl_langinfo_l` (ignore locale; same as "C").
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn nl_langinfo_l(
+    item: c_int,
+    _locale: *mut core::ffi::c_void,
+) -> *mut c_char {
+    unsafe { nl_langinfo(item) }
 }

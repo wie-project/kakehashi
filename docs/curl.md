@@ -39,10 +39,28 @@ Docker, and HTTP GET under UTM.
 | --- | --- |
 | HTTPS on UTM smoke | Same commands as G4; confirm after `bottle ensure` on bare metal |
 | Self-signed / badssl negative | Docker: expect non-zero; re-check on UTM if TLS path changes |
-| Stub surface called later | e.g. `freopen`, more time/string APIs when a flag path hits them |
+| Stub surface called later | full `msg_control` ancillary, rich `sscanf` formats, real `setjmp` restore — only if a path hits them hard |
 | Real Security.framework | Out of scope; soft SecTrust remains for AppleSecTrust feature bit |
 | `/etc/ssl/openssl.cnf` seed | Optional quieting of OpenSSL probe |
 | Broader curl CLI | POST, auth, proxies, HTTP/2–3 end-to-end, FTP — implement trace-first only when a gate needs them |
+
+### Recent freestanding polish (UTM crash fix)
+
+UTM log showed `[kh-libsystem] missing symbol called: _nl_langinfo` mid HTTP GET
+(after first `poll`/`EAGAIN`). Added "C" locale `nl_langinfo` / `nl_langinfo_l`
+plus related surface hit on the same unresolved-bind list:
+
+| Area | Symbols |
+| --- | --- |
+| Locale | `nl_langinfo`, `nl_langinfo_l` |
+| stdio | `fseek`/`fseeko`, `ftell`/`ftello`, `getc`, `freopen`, `rewind` |
+| Time | `gmtime_r`, `localtime_r`, `difftime`, `strftime` (subset) |
+| String | `strpbrk`, `memmem`, `memset_s`, `basename` |
+| Mem | `mmap`, `munmap`, `mprotect`, `mlock` (soft) |
+| Misc | `rand`/`srand`, `sigaction` (soft), `getpwuid_r`, `__darwin_check_fd_set_overflow` |
+
+After freestanding changes: rebuild dylib → `./scripts/stage-libsystem.sh` →
+`kh bottle ensure` (or Docker helpers, which stage when a built dylib is present).
 
 Next **product** surface after curl: **git** ([roadmap](roadmap.md)).
 
@@ -117,12 +135,61 @@ Relative `-o` paths use the **host CWD** of `kh`. Missing parents for
 # Trace-first expansion
 ./scripts/docker-curl-probe.sh --version
 # → .tmp/kh-curl-probe/
+
+# CLI option matrix (tier1 HTTP polish; tier2 cookies/http2/…)
+./scripts/docker-curl-options.sh tier1
+./scripts/docker-curl-options.sh tier2
+# → .tmp/kh-curl-options/summary.txt
 ```
 
 | Guest | Host (Docker) |
 | --- | --- |
 | `/Volumes/linux/out/…` | `<repo>/.tmp/kh-out/…` |
 | `/usr/local/bin/curl` | `.kh/data/bottle/usr/local/bin/curl` |
+
+### Option smoke (Docker)
+
+Not a claim that every curl flag works end-to-end — only the cases in
+`scripts/docker-curl-options.sh`. Exit 0 (or expected non-zero) and no
+`missing symbol called:`.
+
+```bash
+./scripts/docker-curl-options.sh tier1
+./scripts/docker-curl-options.sh tier9-10
+./scripts/docker-curl-options.sh all          # tier1..10
+```
+
+| Tier | Focus | Result |
+| --- | --- | --- |
+| **1** | Core HTTP/HTTPS polish | **pass** |
+| **2** | cookies, compressed, range, http2, json, retry | **pass** |
+| **3** | output/FS/trace/`-R`/url helpers/form data | **pass** |
+| **4** | transfer control | **pass** |
+| **5** | TLS surface | **pass** |
+| **6** | auth soft + dead proxy/socks | **pass** |
+| **7** | multi-URL / parallel / resolve / connect-to | **pass** |
+| **8** | HTTP/3, DoH, HSTS/alt-svc, TFO, xattr | **pass** |
+| **9** | `file://`, upload, FTP/SSH/SMTP/… soft, `--manual` | **pass** |
+| **10** | live local HTTP + HTTP proxy + unix socket + DNS leftovers | **pass** |
+
+**tier9–10** Docker: **pass=42 fail=0**. Notable green hard paths:
+
+- `file://` + `-T` upload  
+- live **HTTP proxy** (plain + CONNECT HTTPS)  
+- live **`--unix-socket`** (AF_UNIX + bottle path translation)  
+- FTP to `ftp.gnu.org` (soft success), gopher/dict soft success  
+- `--manual` exits without missing-symbol  
+
+Freestanding leftovers closed: `setjmp`/`longjmp`, `sscanf`, `fnmatch`,
+`realpath`, `socketpair`, `getnameinfo`, `getservby*`, `gethostbyname`,
+`kqueue`/`kevent` soft, `tcgetattr`/`tcsetattr`, `notify_*`.
+
+Runtime: AF_UNIX sockaddr layout + `translate_path` (sun_len=0 uses connect
+addrlen).
+
+Not claimed: real 401 Digest/NTLM challenge servers, full FTP feature matrix,
+production-grade client cert PKI. Further flags → extend the script
+**trace-first**.
 
 ## Trace-first progress (summary)
 

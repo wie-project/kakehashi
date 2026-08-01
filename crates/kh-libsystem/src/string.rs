@@ -237,7 +237,8 @@ pub(crate) unsafe extern "C" fn strerror_r(
             let n = buflen.saturating_sub(1);
             let mut i = 0_usize;
             while i < n {
-                buf.add(i).write(msg.get(i).copied().unwrap_or(0).cast_signed());
+                buf.add(i)
+                    .write(msg.get(i).copied().unwrap_or(0).cast_signed());
                 i = i.saturating_add(1);
             }
             buf.add(n).write(0);
@@ -807,13 +808,10 @@ unsafe fn strto_i64(s: *const c_char, endp: *mut *mut c_char, base: c_int) -> i6
             } else {
                 radix = 10;
             }
-        } else if radix == 16
-            && p.read().cast_unsigned() == b'0'
-            && {
-                let n = p.add(1).read().cast_unsigned();
-                n == b'x' || n == b'X'
-            }
-        {
+        } else if radix == 16 && p.read().cast_unsigned() == b'0' && {
+            let n = p.add(1).read().cast_unsigned();
+            n == b'x' || n == b'X'
+        } {
             p = p.add(2);
         }
         if !(2..=36).contains(&radix) {
@@ -896,6 +894,119 @@ pub(crate) unsafe extern "C" fn strspn(s: *const c_char, accept: *const c_char) 
             }
             n = n.saturating_add(1);
         }
+    }
+}
+
+/// C `strpbrk` → nlist `_strpbrk`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strpbrk(s: *const c_char, accept: *const c_char) -> *mut c_char {
+    if s.is_null() || accept.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let mut p = s;
+        loop {
+            let b = p.read();
+            if b == 0 {
+                return core::ptr::null_mut();
+            }
+            if !strchr(accept, c_int::from(b.cast_unsigned())).is_null() {
+                return p.cast_mut();
+            }
+            p = p.add(1);
+        }
+    }
+}
+
+/// C `memmem` → nlist `_memmem`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn memmem(
+    haystack: *const c_void,
+    haystacklen: usize,
+    needle: *const c_void,
+    needlelen: usize,
+) -> *mut c_void {
+    if needlelen == 0 {
+        return haystack.cast_mut();
+    }
+    if haystack.is_null() || needle.is_null() || haystacklen < needlelen {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let h = haystack.cast::<u8>();
+        let n = needle.cast::<u8>();
+        let last = haystacklen.saturating_sub(needlelen);
+        let mut i = 0_usize;
+        while i <= last {
+            if memcmp(h.add(i).cast(), n.cast(), needlelen) == 0 {
+                return h.add(i).cast::<c_void>().cast_mut();
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// C11 `memset_s` → nlist `_memset_s` (returns 0 / EINVAL).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn memset_s(s: *mut c_void, smax: usize, c: c_int, n: usize) -> c_int {
+    if s.is_null() && (smax > 0 || n > 0) {
+        return 22; // EINVAL
+    }
+    if n > smax {
+        if !s.is_null() && smax > 0 {
+            let _ = unsafe { crate::stdio::memset(s, c, smax) };
+        }
+        return 22;
+    }
+    if n > 0 && !s.is_null() {
+        let _ = unsafe { crate::stdio::memset(s, c, n) };
+    }
+    0
+}
+
+/// C `basename` → nlist `_basename` (may mutate path; POSIX/GNU-ish).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn basename(path: *mut c_char) -> *mut c_char {
+    static mut DOT: [u8; 2] = *b".\0";
+    if path.is_null() {
+        return core::ptr::addr_of_mut!(DOT).cast();
+    }
+    unsafe {
+        // Empty → "."
+        if path.read() == 0 {
+            return core::ptr::addr_of_mut!(DOT).cast();
+        }
+        // Walk to end.
+        let mut end = path;
+        while end.read() != 0 {
+            end = end.add(1);
+        }
+        // Strip trailing slashes (but keep a single "/" root).
+        while end > path {
+            let prev = end.sub(1);
+            if prev.read() != b'/'.cast_signed() {
+                break;
+            }
+            end = prev;
+            end.write(0);
+        }
+        if path.read() == 0 {
+            // Was all slashes.
+            path.write(b'/'.cast_signed());
+            path.add(1).write(0);
+            return path;
+        }
+        // Find last slash.
+        let mut p = end;
+        while p > path {
+            let prev = p.sub(1);
+            if prev.read() == b'/'.cast_signed() {
+                return p;
+            }
+            p = prev;
+        }
+        path
     }
 }
 
