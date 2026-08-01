@@ -62,7 +62,7 @@ plus related surface hit on the same unresolved-bind list:
 After freestanding changes: rebuild dylib → `./scripts/stage-libsystem.sh` →
 `kh bottle ensure` (or Docker helpers, which stage when a built dylib is present).
 
-Next **product** surface after curl: **git** ([roadmap](roadmap.md)).
+Next **product** surface after curl: **git** / CLT — [git.md](git.md), [roadmap](roadmap.md).
 
 ## Where the binary lives
 

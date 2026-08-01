@@ -246,6 +246,38 @@ int fprintf(void *stream, const char *fmt, ...) {
   return n;
 }
 
+/* Apple git --version: printf("git version %s\n", git_version_string); */
+int printf(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  char buf[4096];
+  int n = vsnprintf_impl(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n < 0)
+    return -1;
+  size_t len = (size_t)n;
+  if (len >= sizeof(buf))
+    len = sizeof(buf) - 1;
+  ssize_t w = write(1, buf, len);
+  if (w < 0)
+    return -1;
+  return (int)w;
+}
+
+int vprintf(const char *fmt, va_list ap) {
+  char buf[4096];
+  int n = vsnprintf_impl(buf, sizeof(buf), fmt, ap);
+  if (n < 0)
+    return -1;
+  size_t len = (size_t)n;
+  if (len >= sizeof(buf))
+    len = sizeof(buf) - 1;
+  ssize_t w = write(1, buf, len);
+  if (w < 0)
+    return -1;
+  return (int)w;
+}
+
 int putchar(int c) {
   unsigned char b = (unsigned char)(c & 0xff);
   if (write(1, &b, 1) < 0)

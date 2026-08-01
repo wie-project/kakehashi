@@ -11,6 +11,7 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
 | [Roadmap](roadmap.md) | Perf status, next work, process |
 | [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |
+| [Git / CLT milestone](git.md) | Apple `git` via `kh install xcode-tools`, public swscan + cache |
 
 User-facing install, **what works** (7zz + curl recipes), and CI economics:
 root [`README.md`](../README.md).

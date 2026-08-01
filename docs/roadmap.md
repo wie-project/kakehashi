@@ -58,7 +58,7 @@ Priority is **guest surface**, not another ×5→×4 micro-pass:
 | Priority | Direction | Notes |
 | --- | --- | --- |
 | 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| 2 | **git** | **Next product slice.** Process/spawn, more pipes/FS; remotes reuse curl network |
+| 2 | **git** / **xcode-tools** | **In progress.** Install: [git.md](git.md). G0 swscan (no Apple ID); G1+ trace-first |
 | — | Optional polish | `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen; not gates |
 
 Rationale: curl was the smaller vertical slice that forced network ABI on top

@@ -5,10 +5,11 @@ use core::ffi::{c_char, c_int, c_void};
 use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
-    self, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETPID,
-    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP,
+    self, SYS_ACCESS, SYS_CLOSE, SYS_FCNTL, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE,
+    SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP,
     SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_OPENAT, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR,
-    SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME, SYS_UNLINK,
+    SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL, SYS_SYSCTLBYNAME,
+    SYS_UNLINK,
 };
 use crate::trace;
 use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
@@ -822,19 +823,139 @@ pub(crate) unsafe extern "C" fn signal(_sig: c_int, _handler: *mut c_void) -> *m
     core::ptr::null_mut()
 }
 
-/// C `sigaction` → nlist `_sigaction` (soft no-op; enough for curl ignore handlers).
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn sigaction(
-    _sig: c_int,
-    _act: *const c_void,
-    oact: *mut c_void,
+/// Darwin `_NSGetExecutablePath` → Mach-O nlist `__NSGetExecutablePath`.
+///
+/// On Darwin the C name is `_NSGetExecutablePath`; the object export is
+/// `__NSGetExecutablePath` after the leading-underscore convention. We set
+/// `export_name = "_NSGetExecutablePath"` so the linker emits the double-
+/// underscore form guests import.
+///
+/// Soft path: bottle CLT layout. Enough for Apple `git --version`. Host may
+/// refine later via a helper if a guest needs the true argv0 path.
+///
+/// Returns 0 on success, −1 if `*bufsize` was too small (then updates size).
+#[unsafe(export_name = "_NSGetExecutablePath")]
+pub(crate) unsafe extern "C" fn ns_get_executable_path(
+    buf: *mut c_char,
+    bufsize: *mut u32,
 ) -> c_int {
-    if !oact.is_null() {
+    // Prefer a CLT-style path (matches `kh install xcode-tools` layout).
+    const PATH: &[u8] = b"/Library/Developer/CommandLineTools/usr/bin/git\0";
+    // Include trailing NUL in required size (Darwin semantics).
+    let need = u32::try_from(PATH.len()).unwrap_or(u32::MAX);
+    if bufsize.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let have = unsafe { *bufsize };
+    if have < need || buf.is_null() {
         unsafe {
-            crate::stdio::bzero(oact, 32);
+            *bufsize = need;
         }
+        return -1;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(PATH.as_ptr(), buf.cast::<u8>(), PATH.len());
+        *bufsize = need;
     }
     0
+}
+
+/// C `getpagesize` → nlist `_getpagesize` (guest page size; 16 KiB default policy).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpagesize() -> c_int {
+    16_384
+}
+
+/// C `access` → nlist `_access` (BSD #33).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn access(path: *const c_char, amode: c_int) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall2(
+            SYS_ACCESS,
+            ptr_u64(path.cast()),
+            u64::from(amode.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
+}
+
+/// C `strlcpy` → nlist `_strlcpy` (BSD string copy; returns strlen(src)).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strlcpy(
+    dst: *mut c_char,
+    src: *const c_char,
+    size: usize,
+) -> usize {
+    if src.is_null() {
+        return 0;
+    }
+    let src_len = unsafe { crate::stdio::strlen(src) };
+    if dst.is_null() || size == 0 {
+        return src_len;
+    }
+    let copy = src_len.min(size.saturating_sub(1));
+    unsafe {
+        if copy > 0 {
+            core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), copy);
+        }
+        *dst.add(copy) = 0;
+    }
+    src_len
+}
+
+/// C `sigprocmask` → nlist `_sigprocmask` (BSD #48; soft mask in runtime).
+///
+/// Hit by Apple `git` early in `main` (`git --version`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigprocmask(
+    how: c_int,
+    set: *const c_void,
+    oset: *mut c_void,
+) -> c_int {
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_SIGPROCMASK,
+            u64::from(how.cast_unsigned()),
+            ptr_u64(set),
+            ptr_u64(oset.cast_const().cast()),
+        )
+    };
+    ret_c_int(ret)
+}
+
+/// C `pthread_sigmask` → nlist `_pthread_sigmask` (same soft mask as sigprocmask).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_sigmask(
+    how: c_int,
+    set: *const c_void,
+    oset: *mut c_void,
+) -> c_int {
+    // Darwin returns 0 / errno as int (not pthread-error style for this wrapper
+    // when implemented via sigprocmask in libSystem).
+    unsafe { sigprocmask(how, set, oset) }
+}
+
+/// C `sigaction` → nlist `_sigaction` (BSD #46; soft state in runtime).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigaction(
+    sig: c_int,
+    act: *const c_void,
+    oact: *mut c_void,
+) -> c_int {
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_SIGACTION,
+            u64::from(sig.cast_unsigned()),
+            ptr_u64(act),
+            ptr_u64(oact.cast_const().cast()),
+        )
+    };
+    ret_c_int(ret)
 }
 
 /// Darwin `___darwin_check_fd_set_overflow` → safe for small FD_SET uses.
@@ -855,10 +976,196 @@ pub(crate) unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_ch
     core::ptr::addr_of_mut!(C_LOCALE).cast()
 }
 
-/// C `getenv` → nlist `_getenv` (no environ yet; always null).
+// ── Soft process environment (`getenv` / `setenv` / `unsetenv`) ─────────────
+//
+// Guests still receive initial `environ` on the stack from the loader, but many
+// CLIs (Apple `git`) call `setenv`/`getenv` on the C ABI. Keep a small fixed
+// table independent of the stack block.
+
+const SOFT_ENV_SLOTS: usize = 48;
+const SOFT_ENV_WIDTH: usize = 384;
+
+/// `KEY=VALUE\0` slots (freestanding; single guest process).
+static mut SOFT_ENV: [[u8; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS] =
+    [[0; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS];
+static mut SOFT_ENV_LIVE: [bool; SOFT_ENV_SLOTS] = [false; SOFT_ENV_SLOTS];
+
+fn soft_env_c_str_len(p: *const c_char) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let mut n = 0_usize;
+    while n < SOFT_ENV_WIDTH {
+        // SAFETY: NUL-terminated C string from guest, bounded scan.
+        let b = unsafe { *p.add(n) };
+        if b == 0 {
+            break;
+        }
+        n = n.saturating_add(1);
+    }
+    n
+}
+
+fn soft_env_key_eq(entry: &[u8], key: *const c_char, key_len: usize) -> bool {
+    if key.is_null() || key_len == 0 {
+        return false;
+    }
+    if entry.len() <= key_len {
+        return false;
+    }
+    // entry must be KEY=…
+    if entry.get(key_len).copied() != Some(b'=') {
+        return false;
+    }
+    for i in 0..key_len {
+        let eb = entry.get(i).copied().unwrap_or(0);
+        // SAFETY: key has at least key_len bytes before NUL (caller).
+        let kb = unsafe { (*key.add(i)).cast_unsigned() };
+        if eb != kb {
+            return false;
+        }
+    }
+    true
+}
+
+fn soft_env_write_kv(entry: &mut [u8; SOFT_ENV_WIDTH], name: *const c_char, key_len: usize, value: *const c_char, val_len: usize) {
+    entry.fill(0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.cast::<u8>(), entry.as_mut_ptr(), key_len);
+        if let Some(eq) = entry.get_mut(key_len) {
+            *eq = b'=';
+        }
+        core::ptr::copy_nonoverlapping(
+            value.cast::<u8>(),
+            entry.as_mut_ptr().add(key_len.saturating_add(1)),
+            val_len,
+        );
+    }
+}
+
+/// C `getenv` → nlist `_getenv` (soft table; null if unset).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
+pub(crate) unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
+    if name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let key_len = soft_env_c_str_len(name);
+    if key_len == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: process-wide soft env; single guest process.
+    let live = unsafe { &*core::ptr::addr_of!(SOFT_ENV_LIVE) };
+    let table = unsafe { &*core::ptr::addr_of!(SOFT_ENV) };
+    for i in 0..SOFT_ENV_SLOTS {
+        if !live.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entry) = table.get(i) else {
+            continue;
+        };
+        if soft_env_key_eq(entry, name, key_len) {
+            let val_off = key_len.saturating_add(1);
+            return unsafe { entry.as_ptr().add(val_off).cast_mut().cast() };
+        }
+    }
     core::ptr::null_mut()
+}
+
+/// C `setenv` → nlist `_setenv`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setenv(
+    name: *const c_char,
+    value: *const c_char,
+    overwrite: c_int,
+) -> c_int {
+    if name.is_null() || value.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let key_len = soft_env_c_str_len(name);
+    let val_len = soft_env_c_str_len(value);
+    if key_len == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let need = key_len
+        .saturating_add(1)
+        .saturating_add(val_len)
+        .saturating_add(1);
+    if need > SOFT_ENV_WIDTH {
+        errno::set_errno(ENOMEM);
+        return -1;
+    }
+
+    let live = unsafe { &mut *core::ptr::addr_of_mut!(SOFT_ENV_LIVE) };
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(SOFT_ENV) };
+
+    let mut free_slot: Option<usize> = None;
+    for i in 0..SOFT_ENV_SLOTS {
+        let is_live = live.get(i).copied().unwrap_or(false);
+        if !is_live {
+            if free_slot.is_none() {
+                free_slot = Some(i);
+            }
+            continue;
+        }
+        let Some(entry) = table.get_mut(i) else {
+            continue;
+        };
+        if soft_env_key_eq(entry, name, key_len) {
+            if overwrite == 0 {
+                return 0;
+            }
+            soft_env_write_kv(entry, name, key_len, value, val_len);
+            return 0;
+        }
+    }
+
+    let Some(i) = free_slot else {
+        errno::set_errno(ENOMEM);
+        return -1;
+    };
+    let Some(entry) = table.get_mut(i) else {
+        errno::set_errno(ENOMEM);
+        return -1;
+    };
+    soft_env_write_kv(entry, name, key_len, value, val_len);
+    if let Some(slot) = live.get_mut(i) {
+        *slot = true;
+    }
+    0
+}
+
+/// C `unsetenv` → nlist `_unsetenv`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn unsetenv(name: *const c_char) -> c_int {
+    if name.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let key_len = soft_env_c_str_len(name);
+    if key_len == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let live = unsafe { &mut *core::ptr::addr_of_mut!(SOFT_ENV_LIVE) };
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(SOFT_ENV) };
+    for i in 0..SOFT_ENV_SLOTS {
+        if !live.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(entry) = table.get_mut(i) else {
+            continue;
+        };
+        if soft_env_key_eq(entry, name, key_len) {
+            entry.fill(0);
+            if let Some(slot) = live.get_mut(i) {
+                *slot = false;
+            }
+            return 0;
+        }
+    }
+    0
 }
 
 /// C `uselocale` → nlist `_uselocale` (no thread locales; return null).

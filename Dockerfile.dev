@@ -8,6 +8,10 @@ RUN apt-get update \
         pkg-config \
         curl \
         xz-utils \
+        p7zip-full \
+        libarchive-tools \
+        cpio \
+        gzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add clippy rustfmt

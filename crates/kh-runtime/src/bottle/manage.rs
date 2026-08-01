@@ -284,6 +284,7 @@ pub fn ensure(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
 
 fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
     layout::ensure_libcxx_symlink(path)?;
+    layout::ensure_dev_nodes(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {

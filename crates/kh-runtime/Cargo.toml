@@ -21,6 +21,11 @@ categories = ["emulators", "os"]
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+plist = { workspace = true }
+flate2 = { workspace = true }
+liblzma = { workspace = true }
 
 [lints]
 workspace = true

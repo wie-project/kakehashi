@@ -100,6 +100,12 @@ pub(crate) const SYS_POLL: u32 = 230;
 pub(crate) const SYS_GETPEERNAME: u32 = 31;
 /// BSD `getsockname`.
 pub(crate) const SYS_GETSOCKNAME: u32 = 32;
+/// BSD `access`.
+pub(crate) const SYS_ACCESS: u32 = 33;
+/// BSD `sigaction`.
+pub(crate) const SYS_SIGACTION: u32 = 46;
+/// BSD `sigprocmask`.
+pub(crate) const SYS_SIGPROCMASK: u32 = 48;
 
 /// Invokes a Darwin BSD syscall with zero arguments.
 ///

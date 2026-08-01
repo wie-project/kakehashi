@@ -3,15 +3,20 @@
 //! Example: Darwin `7zz` → `{bottle}/usr/local/bin/7zz`, which is guest path
 //! `/usr/local/bin/7zz` — the same place a real Mac would keep a CLI install.
 //! Kakehashi is not a 7-Zip product; packages are opt-in via `kh install`.
+//!
+//! Downloads go through [`super::download_cache`] so Docker/Colima re-runs
+//! (bind-mounted `KAKEHASHI_DATA_DIR`) do not re-fetch archives. Install is
+//! **idempotent** when the guest binary is already present in the bottle.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::download_cache;
 use super::layout::is_bottle_root;
 use super::manage;
-use super::registry;
+use super::xcode_tools;
 
 /// Env override: host path of a Darwin `7zz` binary (skip download).
 pub const ENV_7ZZ: &str = "KAKEHASHI_7ZZ";
@@ -33,6 +38,10 @@ pub const DARWIN_7ZZ_URL: &str =
 /// frameworks for TLS — probe will surface that; see `docs/curl.md`.
 pub const DARWIN_CURL_URL: &str = "https://github.com/stunnel/static-curl/releases/download/8.21.0/curl-macos-arm64-8.21.0.tar.xz";
 
+/// Cache object names under `data/cache/downloads/`.
+const CACHE_7ZZ_ARCHIVE: &str = "7z2602-mac.tar.xz";
+const CACHE_CURL_ARCHIVE: &str = "curl-macos-arm64-8.21.0.tar.xz";
+
 /// Guest-relative install path for Darwin 7zz (under bottle root).
 ///
 /// On a real Mac this is `/usr/local/bin/7zz`.
@@ -50,6 +59,8 @@ pub enum InstallPackage {
     SevenZip,
     /// Darwin `curl` (downloaded arm64 Mach-O; see `docs/curl.md`).
     Curl,
+    /// Apple Command Line Tools (includes Apple `git`; see `docs/git.md`).
+    XcodeTools,
 }
 
 impl InstallPackage {
@@ -59,6 +70,8 @@ impl InstallPackage {
         match name.to_ascii_lowercase().as_str() {
             "7zip" | "7zz" | "sevenzip" | "p7zip" => Some(Self::SevenZip),
             "curl" => Some(Self::Curl),
+            "xcode-tools" | "xcodetools" | "clt" | "command-line-tools"
+            | "commandlinetools" | "git" => Some(Self::XcodeTools),
             _ => None,
         }
     }
@@ -69,6 +82,7 @@ impl InstallPackage {
         match self {
             Self::SevenZip => "7zip",
             Self::Curl => "curl",
+            Self::XcodeTools => "xcode-tools",
         }
     }
 
@@ -78,6 +92,7 @@ impl InstallPackage {
         match self {
             Self::SevenZip => "/usr/local/bin/7zz",
             Self::Curl => "/usr/local/bin/curl",
+            Self::XcodeTools => xcode_tools::GUEST_GIT_PATH,
         }
     }
 }
@@ -98,7 +113,7 @@ pub enum ToolError {
     #[error("expected binary not found in downloaded archive")]
     MissingBinary,
     /// Unknown package name.
-    #[error("unknown package `{0}` (known: 7zip, curl)")]
+    #[error("unknown package `{0}` (known: 7zip, curl, xcode-tools)")]
     UnknownPackage(String),
 }
 
@@ -108,6 +123,7 @@ pub fn package_host_path(bottle: &Path, package: InstallPackage) -> PathBuf {
     match package {
         InstallPackage::SevenZip => bottle.join(GUEST_7ZZ_REL),
         InstallPackage::Curl => bottle.join(GUEST_CURL_REL),
+        InstallPackage::XcodeTools => bottle.join(xcode_tools::GUEST_GIT_REL),
     }
 }
 
@@ -165,6 +181,7 @@ pub fn install_package(name: &str) -> Result<InstallReport, ToolError> {
     match package {
         InstallPackage::SevenZip => install_sevenzip(),
         InstallPackage::Curl => install_curl(),
+        InstallPackage::XcodeTools => xcode_tools::install_xcode_tools(),
     }
 }
 
@@ -218,11 +235,26 @@ fn install_sevenzip() -> Result<InstallReport, ToolError> {
         }
     }
 
-    let tmp_root = registry::data_dir()?.join(".kh-dl");
+    // Idempotent: bottle already has the binary (Docker re-run).
+    if !download_cache::force_download() && dest.is_file() {
+        return Ok(InstallReport {
+            package: InstallPackage::SevenZip.as_str(),
+            host_path: dest,
+            guest_path: InstallPackage::SevenZip.guest_path(),
+            bottle,
+        });
+    }
+
+    let archive =
+        download_cache::ensure_named_url(DARWIN_7ZZ_URL, CACHE_7ZZ_ARCHIVE).map_err(|e| {
+            ToolError::Command(e.to_string())
+        })?;
+
+    let tmp_root = download_cache::cache_dir()
+        .map_err(ToolError::Io)?
+        .join("tmp-extract-7zz");
     drop(fs::remove_dir_all(&tmp_root));
     fs::create_dir_all(&tmp_root)?;
-    let archive = tmp_root.join("7z-mac.tar.xz");
-    download_url(DARWIN_7ZZ_URL, &archive)?;
 
     let status = Command::new("tar")
         .args(["-xJf"])
@@ -282,11 +314,26 @@ fn install_curl() -> Result<InstallReport, ToolError> {
         }
     }
 
-    let tmp_root = registry::data_dir()?.join(".kh-dl-curl");
+    // Idempotent: bottle already has the binary (Docker re-run).
+    if !download_cache::force_download() && dest.is_file() {
+        return Ok(InstallReport {
+            package: InstallPackage::Curl.as_str(),
+            host_path: dest,
+            guest_path: InstallPackage::Curl.guest_path(),
+            bottle,
+        });
+    }
+
+    let archive =
+        download_cache::ensure_named_url(DARWIN_CURL_URL, CACHE_CURL_ARCHIVE).map_err(|e| {
+            ToolError::Command(e.to_string())
+        })?;
+
+    let tmp_root = download_cache::cache_dir()
+        .map_err(ToolError::Io)?
+        .join("tmp-extract-curl");
     drop(fs::remove_dir_all(&tmp_root));
     fs::create_dir_all(&tmp_root)?;
-    let archive = tmp_root.join("curl-macos-arm64.tar.xz");
-    download_url(DARWIN_CURL_URL, &archive)?;
 
     let status = Command::new("tar")
         .args(["-xJf"])
@@ -363,34 +410,6 @@ fn set_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn download_url(url: &str, dest: &Path) -> Result<(), ToolError> {
-    let curl = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status();
-    match curl {
-        Ok(st) if st.success() => return Ok(()),
-        Ok(_) | Err(_) => {}
-    }
-    let wget = Command::new("wget")
-        .args(["-q", "-O"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .map_err(|e| {
-            ToolError::Command(format!(
-                "download failed: need curl or wget ({e}); url={url}"
-            ))
-        })?;
-    if !wget.success() {
-        return Err(ToolError::Command(format!(
-            "download failed (curl/wget); url={url}"
-        )));
-    }
-    Ok(())
-}
-
 fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -408,7 +427,14 @@ fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Default guest `PATH` components (macOS-like) used when resolving bare names.
-pub const GUEST_PATH_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+pub const GUEST_PATH_DIRS: &[&str] = &[
+    "/usr/local/bin",
+    "/Library/Developer/CommandLineTools/usr/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
 
 /// Resolve a program path for `kh run`.
 ///
@@ -469,6 +495,12 @@ mod tests {
         assert_eq!(InstallPackage::parse("7ZZ"), Some(InstallPackage::SevenZip));
         assert_eq!(InstallPackage::parse("curl"), Some(InstallPackage::Curl));
         assert_eq!(InstallPackage::parse("CURL"), Some(InstallPackage::Curl));
+        assert_eq!(
+            InstallPackage::parse("xcode-tools"),
+            Some(InstallPackage::XcodeTools)
+        );
+        assert_eq!(InstallPackage::parse("clt"), Some(InstallPackage::XcodeTools));
+        assert_eq!(InstallPackage::parse("git"), Some(InstallPackage::XcodeTools));
         assert!(InstallPackage::parse("foo").is_none());
     }
 

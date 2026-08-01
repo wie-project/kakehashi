@@ -5,7 +5,7 @@ use core::ffi::{c_char, c_int, c_void};
 use crate::errno;
 use crate::sys::{self, SYS_READ, SYS_WRITE};
 use crate::trace;
-use crate::{KH_HELPER_PRINTF, KH_HELPER_PUTS};
+use crate::KH_HELPER_PUTS;
 
 /// C `write` → nlist `_write`.
 #[unsafe(no_mangle)]
@@ -43,22 +43,8 @@ pub unsafe extern "C" fn puts(s: *const c_char) -> c_int {
     c_int::try_from(ret).unwrap_or(0)
 }
 
-/// C `printf` → nlist `_printf` (literal format only for now).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn printf(fmt: *const c_char) -> c_int {
-    trace::note(b"[kh-libsystem] printf()\n");
-    if fmt.is_null() {
-        errno::set_errno(14);
-        return -1;
-    }
-    // SAFETY: helper reads format; no `%` yet.
-    let ret = unsafe { sys::helper1(KH_HELPER_PRINTF, ptr_to_u64(fmt.cast())) };
-    if ret < 0 {
-        errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
-        return -1;
-    }
-    c_int::try_from(ret).unwrap_or(0)
-}
+// Variadic *printf lives in `printf_fmt.c` (stable Rust has no c_variadic):
+// `printf`, `fprintf`, `vprintf`, `vfprintf`, `snprintf`, …
 
 /// C `strlen` → nlist `_strlen`.
 #[unsafe(no_mangle)]
@@ -236,6 +222,79 @@ static mut STDOUTP: *mut FileStub = core::ptr::addr_of_mut!(STDOUT_FILE);
 #[unsafe(export_name = "__stderrp")]
 #[used]
 static mut STDERRP: *mut FileStub = core::ptr::addr_of_mut!(STDERR_FILE);
+
+/// C `flockfile` → nlist `_flockfile` (stdio per-FILE lock).
+///
+/// Freestanding single-guest-thread model: no-op. Real Darwin locks the
+/// `FILE*`; git only needs the symbol present for `--version` / early boot.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn flockfile(_stream: *mut c_void) {}
+
+/// C `funlockfile` → nlist `_funlockfile`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn funlockfile(_stream: *mut c_void) {}
+
+/// C `ftrylockfile` → nlist `_ftrylockfile` (0 = locked).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ftrylockfile(_stream: *mut c_void) -> c_int {
+    0
+}
+
+/// Darwin `___srget` — refill/`getc` helper used by stdio macros.
+///
+/// Soft path: one-byte `read` from the stub fd. Returns the byte or `EOF` (−1).
+// Darwin prepends `_` to `export_name`, so `__srget` → Mach-O `___srget`.
+#[unsafe(export_name = "__srget")]
+pub(crate) unsafe extern "C" fn srget(stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        return -1;
+    }
+    // SAFETY: guest FILE* is our FileStub.
+    let f = unsafe { as_file(stream) };
+    if f.is_null() {
+        return -1;
+    }
+    let fd = unsafe { (*f).fd };
+    let mut b = 0_u8;
+    let ptr = ptr_to_u64(core::ptr::from_mut(&mut b).cast::<c_void>());
+    let ret = unsafe {
+        sys::syscall3(SYS_READ, u64::from(fd.cast_unsigned()), ptr, 1)
+    };
+    if ret <= 0 {
+        unsafe {
+            (*f).flags |= FILE_EOF;
+        }
+        return -1;
+    }
+    c_int::from(b)
+}
+
+/// Darwin `___swbuf` — putc/flush helper used by stdio macros.
+///
+/// Soft path: one-byte `write` to the stub fd. Returns `c` or `EOF`.
+#[unsafe(export_name = "__swbuf")]
+pub(crate) unsafe extern "C" fn swbuf(c: c_int, stream: *mut c_void) -> c_int {
+    if stream.is_null() {
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    if f.is_null() {
+        return -1;
+    }
+    let fd = unsafe { (*f).fd };
+    let b = u8::try_from(c & 0xff).unwrap_or(0);
+    let ptr = ptr_to_u64(core::ptr::from_ref(&b).cast::<c_void>());
+    let ret = unsafe {
+        sys::syscall3(SYS_WRITE, u64::from(fd.cast_unsigned()), ptr, 1)
+    };
+    if ret <= 0 {
+        unsafe {
+            (*f).flags |= FILE_ERR;
+        }
+        return -1;
+    }
+    c & 0xff
+}
 
 #[inline]
 unsafe fn as_file(stream: *mut c_void) -> *mut FileStub {

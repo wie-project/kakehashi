@@ -17,7 +17,9 @@ Userspace macOS translation layer for Linux ARM64 (no JIT).\n\
 \n\
 Commands: inspect | run | trace | bottle | install.\n\
 Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR,\n\
-     KAKEHASHI_LIBSYSTEM, KAKEHASHI_7ZZ, KAKEHASHI_CURL.\
+     KAKEHASHI_CACHE_DIR, KAKEHASHI_FORCE_DOWNLOAD,\n\
+     KAKEHASHI_LIBSYSTEM, KAKEHASHI_7ZZ, KAKEHASHI_CURL,\n\
+     KAKEHASHI_XCODE_TOOLS_VERSION.\
 ")]
 struct Cli {
     /// Increase log verbosity (repeatable). Overrides `KAKEHASHI_LOG` when set.
@@ -128,8 +130,9 @@ enum Command {
     /// Example: `kh install 7zip` → bottle `/usr/local/bin/7zz`, then
     /// `kh run 7zz -- a /tmp/out.7z ./file` (or `kh run /usr/local/bin/7zz -- …`).
     /// `kh install curl` → downloads Darwin arm64 curl → `/usr/local/bin/curl`.
+    /// `kh install xcode-tools` → Apple CLT (public swscan) → Apple `git`.
     Install {
-        /// Package name (`7zip`, `curl`) or `list`.
+        /// Package name (`7zip`, `curl`, `xcode-tools` / `clt` / `git`) or `list`.
         package: String,
     },
 }

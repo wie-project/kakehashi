@@ -50,6 +50,13 @@ pub(crate) fn run(args: &InstallArgs<'_>) -> Result<()> {
                 "  (override binary: KAKEHASHI_CURL=/path/to/darwin-curl)"
             )?;
         }
+        "xcode-tools" => {
+            writeln!(out, "  kh run git -- --version")?;
+            writeln!(
+                out,
+                "  (source: public Software Update catalog; pin: KAKEHASHI_XCODE_TOOLS_VERSION=…)"
+            )?;
+        }
         _ => {
             writeln!(out, "  kh run 7zz -- a /tmp/out.7z ./file")?;
         }
@@ -69,6 +76,11 @@ fn list_packages(json: bool) -> Result<()> {
             "/usr/local/bin/curl",
             "Darwin arm64 curl (download; override with KAKEHASHI_CURL)",
         ),
+        (
+            "xcode-tools",
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+            "Apple Command Line Tools via swscan (aliases: clt, git)",
+        ),
     ];
     if json {
         let arr: Vec<_> = items
@@ -86,12 +98,13 @@ fn list_packages(json: bool) -> Result<()> {
         "Installable packages (into the bottle at macOS paths):"
     )?;
     for (name, path, desc) in items {
-        writeln!(out, "  {name:8} → {path}")?;
-        writeln!(out, "           {desc}")?;
+        writeln!(out, "  {name:12} → {path}")?;
+        writeln!(out, "               {desc}")?;
     }
     writeln!(out)?;
     writeln!(out, "  kh install 7zip")?;
     writeln!(out, "  kh install curl")?;
+    writeln!(out, "  kh install xcode-tools   # public swscan download")?;
     Ok(())
 }
 

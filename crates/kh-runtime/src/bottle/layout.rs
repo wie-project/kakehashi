@@ -114,7 +114,34 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     }
     std::os::unix::fs::symlink("/", &volumes_linux)?;
 
+    // Classic device nodes: symlink through the host bridge so open/read/write
+    // work without mknod (containers often lack CAP_MKNOD). Needed by Apple
+    // `git` (`/dev/null`) and many other CLI tools.
+    ensure_dev_nodes(root)?;
+
     fs::write(root.join(MARKER_NAME), format!("{MARKER_MAGIC}\n"))?;
+    Ok(())
+}
+
+/// Host device basenames exposed under bottle `dev/` via `Volumes/linux`.
+const DEV_HOST_NODES: &[&str] = &["null", "zero", "urandom", "random", "tty", "stdin", "stdout", "stderr"];
+
+/// Ensure guest `/dev/{null,zero,…}` exist as symlinks to the host devices.
+///
+/// Target is relative: `../Volumes/linux/dev/<name>` so the bottle stays
+/// relocatable. Idempotent; does not replace an existing non-symlink node.
+pub fn ensure_dev_nodes(root: &Path) -> io::Result<()> {
+    let dev_dir = root.join("dev");
+    fs::create_dir_all(&dev_dir)?;
+    for name in DEV_HOST_NODES {
+        let link_path = dev_dir.join(name);
+        if link_path.exists() || link_path.symlink_metadata().is_ok() {
+            continue;
+        }
+        // From `dev/X` → `../Volumes/linux/dev/X` → host `/dev/X`.
+        let target = format!("../{VOLUMES_LINUX}/dev/{name}");
+        std::os::unix::fs::symlink(target, &link_path)?;
+    }
     Ok(())
 }
 
@@ -215,8 +242,15 @@ mod tests {
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));
 
+        let null = fs::read_link(root.join("dev/null")).expect("dev/null");
+        assert_eq!(
+            null,
+            Path::new(&format!("../{VOLUMES_LINUX}/dev/null"))
+        );
+
         // Idempotent ensure after materialize.
         ensure_libcxx_symlink(&root).expect("ensure again");
+        ensure_dev_nodes(&root).expect("dev nodes again");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

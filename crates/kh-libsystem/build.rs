@@ -44,6 +44,8 @@ fn main() {
     // rustc cdylib uses -exported_symbols_list (Rust-only). Explicitly export
     // freestanding C *printf symbols pulled from the archive.
     for sym in [
+        "_printf",
+        "_vprintf",
         "_snprintf",
         "_vsnprintf",
         "_fprintf",

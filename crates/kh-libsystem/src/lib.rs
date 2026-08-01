@@ -52,7 +52,7 @@ mod trace;
 pub use errno::__error;
 pub use heap::{calloc, free, malloc, realloc};
 pub use process::{exit, exit_now, kh_bottle_mark};
-pub use stdio::{bzero, memcpy, memmove, memset, printf, puts, strlen, write};
+pub use stdio::{bzero, memcpy, memmove, memset, puts, strlen, write};
 
 /// Return value of [`kh_bottle_mark`] (fixture / smoke probe).
 pub const KH_BOTTLE_MARK_VALUE: i32 = 77;

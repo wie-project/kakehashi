@@ -121,8 +121,8 @@ Details and gates: [`docs/curl.md`](docs/curl.md).
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, `git`, GUI, codesign. Next product slice after
-curl polish: **git** — see [`docs/roadmap.md`](docs/roadmap.md).
+real Apple Security.framework, `git` / CLT, GUI, codesign. Next product slice:
+**git** via `kh install xcode-tools` — see [`docs/git.md`](docs/git.md).
 
 ## Crates
 
@@ -284,6 +284,7 @@ Bottle bridges the Linux FS as `/Volumes/linux/…`:
 | `scripts/docker-curl.sh` | Darwin `curl` under `kh` (same shape as `docker-7zz`) |
 | `scripts/docker-curl-probe.sh` | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`) |
 | `scripts/docker-curl-options.sh` | Tiered curl flag smoke (`tier1`…`tier10`, `tier9-10`, `all` → `.tmp/kh-curl-options`) |
+| `scripts/docker-git.sh` | Apple `git` from CLT under `kh` (swscan + `.kh/data` cache) |
 | `scripts/bench-fair-local.sh` | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`) |
 
 ## License
