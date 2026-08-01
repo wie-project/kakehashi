@@ -6,11 +6,11 @@ Load Darwin Mach-O on Linux aarch64, map a freestanding `libSystem`, translate
 BSD syscalls, and run real guests (clang probes, **7-Zip `7zz`**, **curl**,
 threads).
 
-| | |
-| --- | --- |
-| Live execution | **Linux aarch64** (bare metal, VM, Colima/Docker) |
-| Dry-load / inspect | Any host (including macOS) |
-| Design reference | [`docs/`](docs/README.md) |
+|                    |                                                   |
+| ------------------ | ------------------------------------------------- |
+| Live execution     | **Linux aarch64** (bare metal, VM, Colima/Docker) |
+| Dry-load / inspect | Any host (including macOS)                        |
+| Design reference   | [`docs/`](docs/README.md)                         |
 
 ## What works
 
@@ -111,12 +111,12 @@ Details and gates: [`docs/curl.md`](docs/curl.md).
 
 ### Also green
 
-| Surface | Notes |
-| --- | --- |
-| Clang / fixture probes | `tests/clang-probe/`, `tests/fixtures/` |
-| Multi-thread `7zz -mmt=4` | Docker + UTM |
-| Bottle + freestanding `libSystem` | `kh bottle ensure` embeds dylib |
-| Unit tests + clippy | `cargo test` / `clippy` workspace (excl. `kh-libsystem`) |
+| Surface                           | Notes                                                    |
+| --------------------------------- | -------------------------------------------------------- |
+| Clang / fixture probes            | `tests/clang-probe/`, `tests/fixtures/`                  |
+| Multi-thread `7zz -mmt=4`         | Docker + UTM                                             |
+| Bottle + freestanding `libSystem` | `kh bottle ensure` embeds dylib                          |
+| Unit tests + clippy               | `cargo test` / `clippy` workspace (excl. `kh-libsystem`) |
 
 ### Not a product claim (yet)
 
@@ -126,12 +126,12 @@ real Apple Security.framework, `git` / CLT, GUI, codesign. Next product slice:
 
 ## Crates
 
-| Crate | Role |
-| --- | --- |
-| **`kakehashi`** | Binary `kh` (install this) |
-| `kh-loader` | Mach-O parse, map, execute |
-| `kh-runtime` | Memory, traps, BSD syscalls, bottle; embeds freestanding `libSystem.B.dylib` |
-| `kh-libsystem` | Source for that dylib (`aarch64-apple-darwin` only; not a Linux host crate) |
+| Crate           | Role                                                                         |
+| --------------- | ---------------------------------------------------------------------------- |
+| **`kakehashi`** | Binary `kh` (install this)                                                   |
+| `kh-loader`     | Mach-O parse, map, execute                                                   |
+| `kh-runtime`    | Memory, traps, BSD syscalls, bottle; embeds freestanding `libSystem.B.dylib` |
+| `kh-libsystem`  | Source for that dylib (`aarch64-apple-darwin` only; not a Linux host crate)  |
 
 The guest dylib is vendored at `crates/kh-runtime/resources/libSystem.B.dylib`
 and compiled into the runtime with `include_bytes!`. Publishing `kh-runtime`
@@ -139,7 +139,7 @@ ships the dylib; end users do not need a separate download.
 
 ## Requirements
 
-- Rust 1.97+
+- Rust 1.92+
 - **Linux aarch64** for live `kh run` / `kh trace`
 - Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
 - Optional: `curl`/`wget` + `tar` for `kh install 7zip` / `kh install curl`
@@ -160,14 +160,14 @@ kh install curl
 Default root: `~/.local/share/kakehashi/bottle/` (override with
 `KAKEHASHI_DATA_DIR` / `KAKEHASHI_ROOT`).
 
-| Host | Guest |
-| --- | --- |
-| `…/bottle/` | `/` |
-| `…/usr/local/bin/7zz` | `/usr/local/bin/7zz` |
-| `…/usr/local/bin/curl` | `/usr/local/bin/curl` |
-| `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib` |
-| `…/private/etc/ssl/cert.pem` | `/etc/ssl/cert.pem` (host CA or downloaded Mozilla) |
-| `…/Volumes/linux/…` | `/Volumes/linux/…` → host FS |
+| Host                          | Guest                                               |
+| ----------------------------- | --------------------------------------------------- |
+| `…/bottle/`                   | `/`                                                 |
+| `…/usr/local/bin/7zz`         | `/usr/local/bin/7zz`                                |
+| `…/usr/local/bin/curl`        | `/usr/local/bin/curl`                               |
+| `…/usr/lib/libSystem.B.dylib` | `/usr/lib/libSystem.B.dylib`                        |
+| `…/private/etc/ssl/cert.pem`  | `/etc/ssl/cert.pem` (host CA or downloaded Mozilla) |
+| `…/Volumes/linux/…`           | `/Volumes/linux/…` → host FS                        |
 
 ## Performance (honest)
 
@@ -180,9 +180,9 @@ chatty the guest is — not an instruction emulator.
 On Ubuntu aarch64 bare-metal (UTM), multi-file `7zz` archive
 (`-t7z -m0=lzma2 -mx=5 -mmt=4`, ~8k files / ~240 MiB tree):
 
-| | native Linux `7zz` | Darwin `7zz` under `kh` | ratio |
-| --- | ---: | ---: | ---: |
-| wall | ~22.5 s | ~118 s | **~×5.2** |
+|      | native Linux `7zz` | Darwin `7zz` under `kh` |     ratio |
+| ---- | -----------------: | ----------------------: | --------: |
+| wall |            ~22.5 s |                  ~118 s | **~×5.2** |
 
 On compression-heavy, few-file samples the gap is often much smaller
 (~×1.1–1.2). The large multi-file gap is dominated by **path walk + per-syscall
@@ -200,12 +200,12 @@ macOS capacity.
 **GitHub Actions hosted runners** (private-repo overage rates, USD per
 minute; see [Actions runner pricing](https://docs.github.com/en/billing/reference/actions-runner-pricing)):
 
-| Runner | Per-minute rate |
-| --- | ---: |
-| Linux 2-core arm64 | **$0.005** |
-| Linux 2-core x64 | $0.006 |
-| macOS 3–4 core (M1/Intel) | **$0.062** |
-| macOS larger (e.g. 12-core / M2 Pro) | $0.077–$0.102 |
+| Runner                               | Per-minute rate |
+| ------------------------------------ | --------------: |
+| Linux 2-core arm64                   |      **$0.005** |
+| Linux 2-core x64                     |          $0.006 |
+| macOS 3–4 core (M1/Intel)            |      **$0.062** |
+| macOS larger (e.g. 12-core / M2 Pro) |   $0.077–$0.102 |
 
 macOS standard is roughly **×10–×12** the Linux arm64 minute rate before any
 wall-time difference. Even if a job runs **×5 slower** under `kh` on Linux
@@ -251,15 +251,15 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 
 ## Testing map
 
-| Goal | Command | Artifacts |
-| --- | --- | --- |
-| Unit tests | `cargo test --workspace --exclude kh-libsystem` | terminal |
-| Docker smoke | `./scripts/docker-smoke.sh` | ends with `smoke ok` |
-| Fixtures | `kh run --expect-code … tests/fixtures/…` | see `tests/fixtures/README.md` |
-| Clang probes | `kh run --root tests/fixtures/bottle tests/clang-probe/puts_hello` | stdout `hello` |
-| Real Darwin `7zz` | `./scripts/docker-7zz.sh …` | host `.tmp/kh-out/` |
-| Real Darwin `curl` | `./scripts/docker-curl.sh …` | host `.tmp/kh-out/`; probe → `.tmp/kh-curl-probe/` |
-| Fair CPU bench | `./scripts/bench-fair-local.sh` | host `.tmp/kh-bench-fair/` |
+| Goal               | Command                                                            | Artifacts                                          |
+| ------------------ | ------------------------------------------------------------------ | -------------------------------------------------- |
+| Unit tests         | `cargo test --workspace --exclude kh-libsystem`                    | terminal                                           |
+| Docker smoke       | `./scripts/docker-smoke.sh`                                        | ends with `smoke ok`                               |
+| Fixtures           | `kh run --expect-code … tests/fixtures/…`                          | see `tests/fixtures/README.md`                     |
+| Clang probes       | `kh run --root tests/fixtures/bottle tests/clang-probe/puts_hello` | stdout `hello`                                     |
+| Real Darwin `7zz`  | `./scripts/docker-7zz.sh …`                                        | host `.tmp/kh-out/`                                |
+| Real Darwin `curl` | `./scripts/docker-curl.sh …`                                       | host `.tmp/kh-out/`; probe → `.tmp/kh-curl-probe/` |
+| Fair CPU bench     | `./scripts/bench-fair-local.sh`                                    | host `.tmp/kh-bench-fair/`                         |
 
 `.tmp/`, `.kh/`, and `target/` are gitignored.
 
@@ -267,25 +267,25 @@ cargo build -p kh-libsystem --release --target aarch64-apple-darwin
 
 Bottle bridges the Linux FS as `/Volumes/linux/…`:
 
-| Guest path | Host |
-| --- | --- |
-| `/Volumes/linux/src/README.md` | `<repo>/README.md` |
-| `/Volumes/linux/out/demo.7z` | `<repo>/.tmp/kh-out/demo.7z` (durable; default for `docker-7zz.sh`) |
-| `/Volumes/linux/tmp/…` | container `/tmp/…` — **gone** after `docker run --rm` |
+| Guest path                     | Host                                                                |
+| ------------------------------ | ------------------------------------------------------------------- |
+| `/Volumes/linux/src/README.md` | `<repo>/README.md`                                                  |
+| `/Volumes/linux/out/demo.7z`   | `<repo>/.tmp/kh-out/demo.7z` (durable; default for `docker-7zz.sh`) |
+| `/Volumes/linux/tmp/…`         | container `/tmp/…` — **gone** after `docker run --rm`               |
 
 ## Scripts
 
-| Script | Purpose |
-| --- | --- |
-| `scripts/stage-libsystem.sh` | Build product → `crates/kh-runtime/resources/` |
-| `scripts/install-linux.sh` | Local build + install `kh` + `bottle ensure` |
-| `scripts/docker-smoke.sh` | Smoke suite inside `Dockerfile` image |
-| `scripts/docker-7zz.sh` | Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`) |
-| `scripts/docker-curl.sh` | Darwin `curl` under `kh` (same shape as `docker-7zz`) |
-| `scripts/docker-curl-probe.sh` | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`) |
+| Script                           | Purpose                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------- |
+| `scripts/stage-libsystem.sh`     | Build product → `crates/kh-runtime/resources/`                                        |
+| `scripts/install-linux.sh`       | Local build + install `kh` + `bottle ensure`                                          |
+| `scripts/docker-smoke.sh`        | Smoke suite inside `Dockerfile` image                                                 |
+| `scripts/docker-7zz.sh`          | Darwin `7zz` under `kh` (outputs → `.tmp/kh-out`)                                     |
+| `scripts/docker-curl.sh`         | Darwin `curl` under `kh` (same shape as `docker-7zz`)                                 |
+| `scripts/docker-curl-probe.sh`   | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`)                               |
 | `scripts/docker-curl-options.sh` | Tiered curl flag smoke (`tier1`…`tier10`, `tier9-10`, `all` → `.tmp/kh-curl-options`) |
-| `scripts/docker-git.sh` | Apple `git` from CLT under `kh` (swscan + `.kh/data` cache) |
-| `scripts/bench-fair-local.sh` | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`) |
+| `scripts/docker-git.sh`          | Apple `git` from CLT under `kh` (swscan + `.kh/data` cache)                           |
+| `scripts/bench-fair-local.sh`    | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`)                              |
 
 ## License
 

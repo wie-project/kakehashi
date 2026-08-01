@@ -1,9 +1,9 @@
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        pkg-config \
+    build-essential \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
