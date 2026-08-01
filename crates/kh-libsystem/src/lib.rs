@@ -107,6 +107,8 @@ pub const KH_HELPER_WAKE: u32 = 0x4B48_0007;
 pub const KH_HELPER_GETADDRINFO: u32 = 0x4B48_0008;
 /// Host-helper id: TLS cert chain verify against bottle CA bundle.
 pub const KH_HELPER_VERIFY_CERT: u32 = 0x4B48_0009;
+/// Host-helper id: guest HOME path (`/Volumes/linux…` or `/var/root`) into buffer.
+pub const KH_HELPER_GUEST_HOME: u32 = 0x4B48_000A;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

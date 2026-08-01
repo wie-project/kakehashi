@@ -60,6 +60,10 @@ rm -rf /tmp/kh-g3 && mkdir -p /tmp/kh-g3 && cd /tmp/kh-g3
 kh run git -- init
 printf 'hi\n' > README
 kh run git -- add README
+# Identity: host `git config --global` works when HOME bridges via
+# /Volumes/linux$HOME (default). Or pass -c / write config under kh:
+#   kh run git -- config user.email t@t
+#   kh run git -- config user.name t
 kh run git -- -c user.email=t@t -c user.name=t commit -m init
 kh run git -- log --oneline   # e.g. 7cdb95d init
 kh run git -- status          # clean on main

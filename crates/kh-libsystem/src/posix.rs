@@ -14,7 +14,7 @@ use crate::sys::{
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::trace;
-use crate::{KH_HELPER_NCPU, KH_HELPER_READDIR};
+use crate::{KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR};
 
 const ENOSYS: i32 = 78;
 const ENOMEM: i32 = 12;
@@ -1422,13 +1422,29 @@ fn soft_env_seed_defaults() {
         }
         SOFT_ENV_SEEDED = true;
     }
-    // Use setenv body without re-entering seed.
-    let pairs: [(&[u8], &[u8]); 3] = [
-        (b"PATH\0", b"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0"),
-        (b"HOME\0", b"/var/root\0"),
-        (b"TMPDIR\0", b"/tmp\0"),
-    ];
-    for (name, val) in pairs {
+    let path = b"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0";
+    let tmp = b"/tmp\0";
+    // HOME via host helper → `/Volumes/linux{host $HOME}` so host
+    // `git config --global` / `~/.gitconfig` is visible under `kh run`.
+    let mut home_buf = [0_u8; 512];
+    let home_len = unsafe {
+        sys::helper2(
+            KH_HELPER_GUEST_HOME,
+            u64::try_from(home_buf.as_mut_ptr().addr()).unwrap_or(0),
+            u64::try_from(home_buf.len()).unwrap_or(0),
+        )
+    };
+    let home: &[u8] = if home_len > 1 {
+        let n = usize::try_from(home_len).unwrap_or(1).min(home_buf.len());
+        home_buf.get(..n).unwrap_or(b"/var/root\0")
+    } else {
+        b"/var/root\0"
+    };
+    for (name, val) in [
+        (b"PATH\0".as_slice(), path.as_slice()),
+        (b"HOME\0".as_slice(), home),
+        (b"TMPDIR\0".as_slice(), tmp.as_slice()),
+    ] {
         let _ = unsafe {
             soft_env_set(
                 name.as_ptr().cast(),

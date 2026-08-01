@@ -109,9 +109,13 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     argv_owned.extend(opts.guest_args.iter().cloned());
     let argv_refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
     // Minimal macOS-like environment so guests see a real PATH under the bottle.
+    // HOME bridges the host home via `/Volumes/linux…` so host
+    // `git config --global` (and `~/.gitconfig`) is visible to Apple git under
+    // `kh run`. Fall back to bottle `/var/root` when host HOME is unset/odd.
+    let home = guest_home_env();
     let env_owned = [
         "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
-        "HOME=/var/root".to_owned(),
+        home,
         "TMPDIR=/tmp".to_owned(),
     ];
     let env_refs: Vec<&str> = env_owned.iter().map(String::as_str).collect();
@@ -209,6 +213,20 @@ fn stack_err_static(err: &kh_runtime::StackError) -> &'static str {
     match err {
         kh_runtime::StackError::TooSmall { .. } => "guest stack too small",
         kh_runtime::StackError::InvalidString => "invalid stack string",
+    }
+}
+
+/// Guest `HOME=…` for the bootstrap env block.
+///
+/// Prefer host `$HOME` under the `/Volumes/linux` bridge so tools that honour
+/// global config (Apple `git` → `~/.gitconfig`) see the same files as host CLI
+/// config commands. Falls back to bottle `/var/root`.
+fn guest_home_env() -> String {
+    match std::env::var("HOME") {
+        Ok(h) if h.starts_with('/') && !h.contains('\0') => {
+            format!("HOME=/Volumes/linux{h}")
+        }
+        _ => "HOME=/var/root".to_owned(),
     }
 }
 

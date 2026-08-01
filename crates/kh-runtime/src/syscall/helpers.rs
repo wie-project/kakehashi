@@ -202,6 +202,13 @@ pub(super) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
 /// soft verify failure (maps to SecTrust false), other negative as errno-ish.
 pub(super) const KH_HELPER_VERIFY_CERT: u32 = KH_HELPER_BASE | 9;
 
+/// Guest HOME path for freestanding `getenv` / soft env seed.
+///
+/// `x0` = out buffer VA, `x1` = capacity (incl. NUL). Writes
+/// `/Volumes/linux{host $HOME}` when host HOME is absolute, else `/var/root`.
+/// Returns byte length **including** NUL, or error via carry/`EINVAL`.
+pub(super) const KH_HELPER_GUEST_HOME: u32 = KH_HELPER_BASE | 0x0A;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -227,8 +234,38 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_WAKE => handle_wake(args),
         KH_HELPER_GETADDRINFO => handle_getaddrinfo(args),
         KH_HELPER_VERIFY_CERT => handle_verify_cert(args),
+        KH_HELPER_GUEST_HOME => handle_guest_home(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
+}
+
+fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_guest_home";
+    let ptr = args.x0;
+    let Ok(cap) = usize::try_from(args.x1) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if ptr == 0 || cap == 0 || !registry_check_range(ptr, cap, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let path = match std::env::var("HOME") {
+        Ok(h) if h.starts_with('/') && !h.contains('\0') => format!("/Volumes/linux{h}"),
+        _ => "/var/root".to_owned(),
+    };
+    let bytes = path.as_bytes();
+    // Need room for path + NUL.
+    if bytes.len().saturating_add(1) > cap {
+        return SyscallResult::err(name, EINVAL);
+    }
+    let mut out = vec![0_u8; bytes.len().saturating_add(1)];
+    if let Some(dst) = out.get_mut(..bytes.len()) {
+        dst.copy_from_slice(bytes);
+    }
+    guest_write(ptr, &out);
+    SyscallResult::ok(
+        name,
+        u64::try_from(out.len()).unwrap_or(0),
+    )
 }
 
 fn handle_verify_cert(args: SyscallArgs) -> SyscallResult {
