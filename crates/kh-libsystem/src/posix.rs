@@ -534,6 +534,15 @@ pub(crate) unsafe extern "C" fn umask(cmask: c_int) -> c_int {
     }
 }
 
+/// C `utime` → nlist `_utime` (soft success; Apple `git add` index refresh).
+///
+/// Older libc API (`struct utimbuf *`); siblings `utimes` / `utimensat` already
+/// soft-succeed. Without this export, dyld binds a missing trampoline → exit 127.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn utime(_path: *const c_char, _times: *const c_void) -> c_int {
+    0
+}
+
 /// C `utimensat` → nlist `_utimensat` (soft success; mtime not applied).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn utimensat(
