@@ -184,16 +184,42 @@ fn inject_kh_env(envp: &[String]) -> Vec<CString> {
             out.push(c);
         }
     }
-    for (flag, key) in [
-        (have_data, "KAKEHASHI_DATA_DIR"),
-        (have_config, "KAKEHASHI_CONFIG_DIR"),
-        (have_root, "KAKEHASHI_ROOT"),
-    ] {
-        if flag {
-            continue;
+    // Nested `kh run` inherits the *guest* env (HOME=/Volumes/linux…). Host
+    // `kh` then resolves config/data via $HOME and misses the real registry →
+    // no bottle → hard unresolved CoreServices symbols. Always inject host
+    // paths resolved in *this* process (still has the real host HOME / env).
+    if !have_config {
+        let cfg = std::env::var("KAKEHASHI_CONFIG_DIR")
+            .ok()
+            .or_else(|| bottle::config_dir().ok().map(|p| p.display().to_string()));
+        if let Some(v) = cfg
+            && let Ok(c) = CString::new(format!("KAKEHASHI_CONFIG_DIR={v}"))
+        {
+            out.push(c);
         }
-        if let Ok(v) = std::env::var(key)
-            && let Ok(c) = CString::new(format!("{key}={v}"))
+    }
+    if !have_data {
+        let data = std::env::var("KAKEHASHI_DATA_DIR")
+            .ok()
+            .or_else(|| bottle::data_dir().ok().map(|p| p.display().to_string()));
+        if let Some(v) = data
+            && let Ok(c) = CString::new(format!("KAKEHASHI_DATA_DIR={v}"))
+        {
+            out.push(c);
+        }
+    }
+    if !have_root {
+        let root = std::env::var("KAKEHASHI_ROOT")
+            .ok()
+            .or_else(|| bottle::bottle_root().map(|p| p.display().to_string()))
+            .or_else(|| {
+                bottle::active_root()
+                    .ok()
+                    .flatten()
+                    .map(|p| p.display().to_string())
+            });
+        if let Some(v) = root
+            && let Ok(c) = CString::new(format!("KAKEHASHI_ROOT={v}"))
         {
             out.push(c);
         }

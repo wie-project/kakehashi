@@ -72,9 +72,9 @@ kh run git -- status                  # clean on main
 
 | Note | Detail |
 | --- | --- |
-| Spawn | Host `fork` + `waitpid` + `dup2`; `execve` of Mach-O re-execs `kh run <path> -- args` (injects `KAKEHASHI_*`). Shell scripts use host `/bin/sh` etc. Post-commit `git maintenance` runs as a nested guest. |
+| Spawn | Host `fork` + `waitpid` + `dup2`; `execve` of Mach-O re-execs `kh run <path> -- args`. Nested injects host `KAKEHASHI_ROOT` / `CONFIG_DIR` / `DATA_DIR` (resolved in the parent) so guest `HOME=/Volumes/linux…` does not break bottle discovery. |
 | HOME | Guest `HOME=/Volumes/linux{host $HOME}` so host `~/.gitconfig` is readable. Confirm: `kh run git -- config user.name`. |
-| FSEvents | Soft stubs in freestanding libSystem (`FSEventStreamCreate` → null). Stale bottle dylib → nested `micro run failed: unresolved symbol _FSEventStreamCreate` (commit still durable). Fix: rebuild libsystem → `stage-libsystem.sh` → rebuild `kh` → `kh bottle ensure`. Verify: `nm -gU $BOTTLE/usr/lib/libSystem.B.dylib \| grep FSEvent`. |
+| FSEvents | Soft stubs in freestanding libSystem (`FSEventStreamCreate` → null). Nested post-commit `git maintenance --detach` used to fail load when bottle was lost under guest HOME (`unresolved symbol _FSEventStreamCreate`); fixed by always injecting host KAKEHASHI_* paths on re-exec. |
 | `_environ` | Must be a **data** export. Binding a missing-function trampoline here made git walk trampoline bytes as `char **` and SIGSEGV after `pipe` in `start_command`. |
 | Pipe | Darwin-like **blocking** `pipe(2)` (no default `O_NONBLOCK`); git’s notify pipe does a blocking `read` after `fork`. |
 | Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates, attributes) |
