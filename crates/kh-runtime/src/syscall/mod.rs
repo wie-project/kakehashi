@@ -150,11 +150,7 @@ fn log_unknown_syscall(number: u32, x0: u64, x1: u64, x2: u64) {
     if n >= 32 {
         return;
     }
-    let msg = format!("kh: unknown BSD syscall #{number} x0={x0:#x} x1={x1:#x} x2={x2:#x}\n");
-    drop(std::io::Write::write_all(
-        &mut std::io::stderr(),
-        msg.as_bytes(),
-    ));
+    tracing::warn!(number, x0 = format_args!("{x0:#x}"), x1 = format_args!("{x1:#x}"), x2 = format_args!("{x2:#x}"), "unknown BSD syscall");
 }
 
 #[cfg(test)]

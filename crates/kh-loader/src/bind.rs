@@ -103,7 +103,8 @@ fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, Load
     if let Some(handler) = named {
         match crate::missing_stub::trampoline_for(name, handler) {
             Ok(va) => {
-                tracing::warn!(
+                // Expected for incomplete libSystem; list at debug, not every run.
+                tracing::debug!(
                     name = %name,
                     stub = format_args!("{va:#x}"),
                     "unresolved strong symbol; bound to named missing trampoline"
@@ -120,7 +121,7 @@ fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, Load
         }
     }
     if let Some(stub) = anon {
-        tracing::warn!(
+        tracing::debug!(
             name = %name,
             "unresolved strong symbol; bound to _kh_missing_symbol"
         );
@@ -128,7 +129,7 @@ fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, Load
     }
     if let Some(handler) = named {
         // No trampoline path; still better than hard fail for load.
-        tracing::warn!(
+        tracing::debug!(
             name = %name,
             "unresolved strong symbol; bound to _kh_missing_symbol_named (no trampoline)"
         );

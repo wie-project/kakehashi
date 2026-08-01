@@ -249,7 +249,7 @@ fn handle_verify_cert(args: SyscallArgs) -> SyscallResult {
             p.is_file().then_some(p)
         })
     }) else {
-        drop(io::stderr().write_all(b"kh: tls verify: no bottle CA bundle\n"));
+        tracing::warn!("tls verify: no bottle CA bundle");
         return SyscallResult::ok(name, 1);
     };
 
@@ -301,11 +301,7 @@ fn handle_verify_cert(args: SyscallArgs) -> SyscallResult {
     match crate::tls_verify::verify_der_chain(&ca, hostname, leaf, &inters) {
         Ok(()) => SyscallResult::ok(name, 0),
         Err(msg) => {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                let line = format!("kh: tls verify fail: {msg}\n");
-                drop(io::stderr().write_all(line.as_bytes()));
-            }
+            tracing::warn!(%msg, "tls verify fail");
             SyscallResult::ok(name, 1)
         }
     }
@@ -361,15 +357,12 @@ fn handle_getaddrinfo(args: SyscallArgs) -> SyscallResult {
             None => return SyscallResult::err(name, EFAULT),
         }
     };
-    {
-        let msg = format!(
-            "kh: getaddrinfo node={:?} service={:?} family={}\n",
-            node.as_deref(),
-            service.as_deref(),
-            reg_as_i32(args.x2)
-        );
-        drop(io::stderr().write_all(msg.as_bytes()));
-    }
+    tracing::debug!(
+        node = ?node.as_deref(),
+        service = ?service.as_deref(),
+        family = reg_as_i32(args.x2),
+        "getaddrinfo"
+    );
     let family = reg_as_i32(args.x2);
     let out = args.x3;
     let Ok(cap) = usize::try_from(args.x4) else {

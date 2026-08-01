@@ -214,16 +214,7 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
 }
 
 fn log_open_fail(path: &str, why: &str) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) >= 24 {
-        return;
-    }
-    let msg = format!("kh: open fail {why} path={path}\n");
-    drop(std::io::Write::write_all(
-        &mut std::io::stderr(),
-        msg.as_bytes(),
-    ));
+    tracing::warn!(path, why, "open fail");
 }
 
 /// Create intermediate directories for a bottle-relative path (`a/b` → `mkdirat a`).
@@ -347,16 +338,7 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
 }
 
 fn log_fcntl_cmd(cmd: i32) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    if SEEN.fetch_add(1, Ordering::Relaxed) >= 16 {
-        return;
-    }
-    let msg = format!("kh: soft-ok fcntl cmd={cmd}\n");
-    drop(std::io::Write::write_all(
-        &mut std::io::stderr(),
-        msg.as_bytes(),
-    ));
+    tracing::debug!(cmd, "fcntl soft-ok (unknown cmd)");
 }
 
 fn host_fl_to_darwin(rc: i32) -> u64 {

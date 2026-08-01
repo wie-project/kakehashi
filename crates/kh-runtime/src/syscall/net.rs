@@ -4,8 +4,6 @@
 //! `sa_family_t` (u16) at offset 0. AF_INET6 numbers also differ (Darwin 30 vs
 //! Linux 10). Option numbers are translated for the common curl set.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use crate::host;
 use crate::mem::registry_check_range;
 
@@ -49,16 +47,8 @@ const DARWIN_IP_TOS: i32 = 3;
 const DARWIN_IPV6_TCLASS: i32 = 36;
 
 fn net_log(msg: &str) {
-    static N: AtomicU32 = AtomicU32::new(0);
-    // Enough for one GET transfer + a little headroom; not unlimited.
-    if N.fetch_add(1, Ordering::Relaxed) >= 256 {
-        return;
-    }
-    let line = format!("kh: net {msg}\n");
-    drop(std::io::Write::write_all(
-        &mut std::io::stderr(),
-        line.as_bytes(),
-    ));
+    // Success-path chatter only at debug (`kh -vv` / `KAKEHASHI_LOG=debug`).
+    tracing::debug!(target: "kh_runtime::syscall::net", "{msg}");
 }
 
 /// Soft Darwin errno constants we return for network failures.

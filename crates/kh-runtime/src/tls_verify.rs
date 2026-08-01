@@ -181,10 +181,7 @@ fn cleanup(dir: &Path) {
 fn note_ok_once() {
     static N: AtomicU32 = AtomicU32::new(0);
     if N.fetch_add(1, Ordering::Relaxed) == 0 {
-        drop(std::io::Write::write_all(
-            &mut std::io::stderr(),
-            b"kh: tls verify ok (openssl + bottle CA bundle)\n",
-        ));
+        tracing::info!("tls verify ok (openssl + bottle CA bundle)");
     }
 }
 
