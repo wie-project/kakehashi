@@ -139,7 +139,7 @@ ships the dylib; end users do not need a separate download.
 
 ## Requirements
 
-- Rust 1.92+
+- Rust 1.88+
 - **Linux aarch64** for live `kh run` / `kh trace`
 - Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
 - Optional: `curl`/`wget` + `tar` for `kh install 7zip` / `kh install curl`
