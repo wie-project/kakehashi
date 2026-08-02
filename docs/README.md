@@ -10,6 +10,7 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
 | [Roadmap](roadmap.md) | Perf status, next work, process |
+| [Optimization options](roadmap2.md) | Safe/unsafe speedups ranked by expected gain |
 | [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |
 | [Git / CLT milestone](git.md) | Apple `git` via `kh install xcode-tools`, public swscan + cache |
 
