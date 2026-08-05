@@ -32,6 +32,22 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     }
 
     let slice = guest_slice(args.x1, len);
+    // TLS-wrapped guest FD: plaintext app data via rustls (path B freestanding curl).
+    if crate::tls_fd::is_tls_fd(gfd) {
+        let guest_blocking = !crate::process::fd_guest_nonblock(gfd);
+        return match crate::tls_fd::write(gfd, host_fd, slice, guest_blocking) {
+            Ok(n) => SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
+            Err(e) => {
+                let os = e.raw_os_error().unwrap_or(0);
+                if os == libc::EAGAIN || os == libc::EWOULDBLOCK || e.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    return SyscallResult::err(name, DARWIN_EAGAIN);
+                }
+                tracing::warn!(gfd, error = %e, "tls write fail");
+                SyscallResult::err(name, EPERM)
+            }
+        };
+    }
     // Host pipes are O_NONBLOCK; emulate Darwin blocking write until the guest
     // sets O_NONBLOCK (curl multi) or the pipe drains.
     loop {
@@ -146,6 +162,26 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     // Read straight into guest memory (identity map) — no intermediate heap
     // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
     let buf = guest_slice_mut(args.x1, len);
+    // TLS-wrapped guest FD: plaintext from rustls (path B freestanding curl).
+    if crate::tls_fd::is_tls_fd(gfd) {
+        let guest_blocking = !crate::process::fd_guest_nonblock(gfd);
+        return match crate::tls_fd::read(gfd, host_fd, buf, guest_blocking) {
+            Ok(nread) => {
+                tracing::debug!(gfd, nread, "tls read ok");
+                SyscallResult::ok(name, u64::try_from(nread).unwrap_or(0))
+            }
+            Err(e) => {
+                let os = e.raw_os_error().unwrap_or(0);
+                if os == libc::EAGAIN || os == libc::EWOULDBLOCK || e.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    tracing::debug!(gfd, "tls read EAGAIN");
+                    return SyscallResult::err(name, DARWIN_EAGAIN);
+                }
+                tracing::warn!(gfd, error = %e, "tls read fail");
+                SyscallResult::err(name, EPERM)
+            }
+        };
+    }
     // Host pipes/sockets are O_NONBLOCK (curl multi). Darwin guests expect
     // blocking reads until they fcntl O_NONBLOCK — wait on EAGAIN when the
     // guest flag is clear (git notify-pipe, helper stdin). When the guest set

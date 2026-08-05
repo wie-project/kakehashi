@@ -9,13 +9,18 @@
 # Usage:
 #   ./scripts/docker-git.sh --version
 #   ./scripts/docker-git.sh status
+#   ./scripts/docker-git.sh clone https://github.com/torvalds/linux.git
+#     → writes to guest /Volumes/linux/out/linux  ↔  host <repo>/.tmp/kh-out/linux
 #
 # Env:
 #   KAKEHASHI_XCODE_TOOLS_VERSION  pin catalog title substring (e.g. 26.6)
 #   KAKEHASHI_FORCE_DOWNLOAD=1     re-fetch even if bottle/cache present
 #   KAKEHASHI_SMOKE_IMAGE          docker image (default: kakehashi:dev)
-#   KH_EXTRA_CARGO_ARGS            e.g. --release
+#   KH_EXTRA_CARGO_ARGS            cargo flags for kh (default: --release)
+#                                  Debug rustls is multi‑× slower on HTTPS packs;
+#                                  set empty for an unoptimized kh: KH_EXTRA_CARGO_ARGS=
 #   KH_OUT                         durable guest /out (default: <repo>/.tmp/kh-out)
+#   KH_CLONE_IN_SRC=1              do not rewrite bare `clone <url>` into /out
 
 set -euo pipefail
 
@@ -24,7 +29,32 @@ cd "$ROOT"
 
 IMAGE="${KAKEHASHI_SMOKE_IMAGE:-kakehashi:dev}"
 KH_OUT="${KH_OUT:-$ROOT/.tmp/kh-out}"
+# Default release: host rustls on the TLS FD path is a real bottleneck in debug.
+# Override with empty for unoptimized kh: `KH_EXTRA_CARGO_ARGS= ./scripts/docker-git.sh …`
+# (bash 3.2-safe: `-v` is not available on stock macOS /bin/bash)
+if [ "${KH_EXTRA_CARGO_ARGS+set}" != "set" ]; then
+  KH_EXTRA_CARGO_ARGS=--release
+fi
 GUEST_ARGS=("$@")
+
+# Bare `clone <url>` (no destination) would land under guest CWD → host <repo>/linux
+# on the bind mount (easy to miss / slow on large trees). Prefer durable /out.
+if [[ "${KH_CLONE_IN_SRC:-}" != "1" ]] \
+  && [[ ${#GUEST_ARGS[@]} -eq 2 ]] \
+  && [[ "${GUEST_ARGS[0]}" == "clone" ]] \
+  && [[ "${GUEST_ARGS[1]}" == https://* || "${GUEST_ARGS[1]}" == http://* || "${GUEST_ARGS[1]}" == git@* ]]; then
+  url="${GUEST_ARGS[1]}"
+  base="${url%/}"
+  base="${base%.git}"
+  base="${base##*/}"
+  if [[ -z "$base" || "$base" == "*" ]]; then
+    base="repo"
+  fi
+  GUEST_ARGS=(clone --progress "$url" "/Volumes/linux/out/${base}")
+  echo "==> clone dest: guest /Volumes/linux/out/${base}"
+  echo "                host  ${KH_OUT}/${base}"
+  echo "    (during receive only .git/ exists; worktree appears after pack)"
+fi
 
 mkdir -p "$KH_OUT" "$ROOT/.kh"
 
@@ -57,6 +87,7 @@ for e in KAKEHASHI_XCODE_TOOLS_VERSION KAKEHASHI_FORCE_DOWNLOAD; do
 done
 
 echo "==> guest git via kh  (bottle+cache: $ROOT/.kh/data)"
+echo "==> durable /out:     $KH_OUT  ↔  guest /Volumes/linux/out"
 echo "==> args: ${GUEST_ARGS[*]:-<none>}"
 
 set +e
@@ -67,7 +98,7 @@ docker run --rm \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
   -e CARGO_TARGET_DIR=/src/target \
-  -e "KH_EXTRA_CARGO_ARGS=${KH_EXTRA_CARGO_ARGS:-}" \
+  -e "KH_EXTRA_CARGO_ARGS=${KH_EXTRA_CARGO_ARGS}" \
   "${IMAGE}" \
   bash -c '
 set -euo pipefail
@@ -82,6 +113,12 @@ fi
 
 "$KH" run git -- config --global user.email "kh@test.io"
 "$KH" run git -- config --global user.name "Vladislav"
+# Prefer protocol v1 until freestanding libcurl implements v2 stateless-connect.
+"$KH" run git -- config --global protocol.version 1
+# Large want-lists (full monorepo clones) exceed the default ~1 MiB buffer and
+# switch git remote-curl to CURLOPT_READFUNCTION + chunked POST. Freestanding
+# gathers that path; a high postBuffer keeps the simpler POSTFIELDS path too.
+"$KH" run git -- config --global http.postBuffer 524288000
 
 exec "$KH" run git -- "$@"
 ' -- ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}

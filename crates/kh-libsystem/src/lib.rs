@@ -123,6 +123,8 @@ pub const KH_HELPER_REGCOMP: u32 = 0x4B48_000E;
 pub const KH_HELPER_REGEXEC: u32 = 0x4B48_000F;
 /// Host-helper id: POSIX `regfree` (handle).
 pub const KH_HELPER_REGFREE: u32 = 0x4B48_0010;
+/// Host-helper id: TLS connect (TCP + rustls) → guest FD for freestanding libcurl.
+pub const KH_HELPER_TLS_CONNECT: u32 = 0x4B48_0011;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

@@ -2,7 +2,8 @@
 //!
 //! Bottle install name `/usr/lib/libcurl.4.dylib` is a **symlink** to freestanding
 //! `libSystem.B.dylib` (same pattern as `libc++.1.dylib`). Symbols live here;
-//! HTTP(S) is performed via host [`crate::KH_HELPER_HTTP`] (host `curl` + bottle CA).
+//! HTTPS uses host [`crate::KH_HELPER_TLS_CONNECT`] (TCP + rustls) and streams
+//! HTTP/1.1 over the TLS guest FD (plaintext `read`/`write`).
 //!
 //! Clean-room: public curl man-page contracts + observed git usage.
 
@@ -29,9 +30,10 @@ use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use crate::KH_HELPER_HTTP;
+use crate::KH_HELPER_TLS_CONNECT;
 use crate::heap::{free, malloc, realloc};
-use crate::stdio::{memcpy, strlen};
+use crate::posix::{close, read};
+use crate::stdio::{memcpy, strlen, write};
 use crate::sys;
 
 // ── result codes ─────────────────────────────────────────────────────────────
@@ -97,38 +99,32 @@ type ReadCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> us
 const MAGIC_EASY: u32 = 0x4B48_4359; // KHCY
 const MAGIC_MULTI: u32 = 0x4B48_434D; // KHCM
 const MAGIC_SLIST: u32 = 0x4B48_4353; // KHCS
-const KHHTTP_MAGIC: u32 = 0x4B48_4854; // KHHT
-const KHHTTP_FLAG_SSL_VERIFY: u32 = 1;
+/// Host TLS connect request (`KH_HELPER_TLS_CONNECT`); LE, 64 bytes.
+const KHTLS_MAGIC: u32 = 0x4B48_544C; // KHTL
+const TLS_FLAG_VERIFY: u32 = 1;
 
 const MAX_HDR_BLOB: usize = 8 * 1024;
-/// Cap for one host-fetched response body (G4 shallow packs fit; grow later).
-const MAX_BODY_OUT: usize = 4 * 1024 * 1024;
+/// Streaming I/O chunk for HTTP body (multi‑GiB packs never fully buffered).
+const IO_CHUNK: usize = 64 * 1024;
+/// Max HTTP response header block before body.
+const MAX_RESP_HDR: usize = 64 * 1024;
+/// Cap for gathered POST bodies (want-lists / READFUNCTION / after inflate).
+const MAX_POST_GATHER: usize = 64 * 1024 * 1024;
 const ERRBUF_LEN: usize = 256;
 
-/// Guest↔host HTTP request (must match `kh-runtime` helpers).
-///
-/// Layout: 4×u32 + 14×u64 = 128 bytes (v2 adds content-type out slot).
+/// Packed request for host rustls TCP+TLS connect → guest FD.
 #[repr(C)]
-struct KhHttpReq {
+struct KhTlsConnect {
     magic: u32,
     version: u32,
-    method: u32,
     flags: u32,
-    url: u64,
-    headers: u64,
-    headers_len: u64,
-    body: u64,
-    body_len: u64,
+    port: u32,
+    hostname: u64,
+    hostname_len: u64,
     ca_path: u64,
-    out_body: u64,
-    out_body_cap: u64,
-    out_body_len: u64,
-    out_code: u64,
+    out_fd: u64,
     errbuf: u64,
     errbuf_cap: u64,
-    /// Guest buffer for NUL-terminated `Content-Type` value (no header name).
-    out_ctype: u64,
-    out_ctype_cap: u64,
 }
 
 #[repr(C)]
@@ -200,7 +196,7 @@ static GLOBAL_INITS: AtomicI32 = AtomicI32::new(0);
 
 static VERSION_STR: &[u8] = b"8.21.0-kakehashi\0";
 static HOST_STR: &[u8] = b"aarch64-apple-darwin-kakehashi\0";
-static SSL_STR: &[u8] = b"OpenSSL/host\0";
+static SSL_STR: &[u8] = b"rustls/host\0";
 static LIBZ_STR: &[u8] = b"1.2.11-kh\0";
 static PROTO_HTTP: &[u8] = b"http\0";
 static PROTO_HTTPS: &[u8] = b"https\0";
@@ -284,22 +280,27 @@ fn ensure_version_info() {
 }
 
 fn easy_from(p: *mut c_void) -> Option<&'static mut Easy> {
-    // Reject PAGEZERO / unrebased pointers before deref.
-    let addr = p.addr();
-    if addr < crate::stdio::PAGEZERO_END {
+    if p.is_null() || p.addr() < crate::stdio::PAGEZERO_END {
         return None;
     }
-    let e = unsafe { &mut *p.cast::<Easy>() };
-    if e.magic != MAGIC_EASY {
+
+    let e_ptr = p.cast::<Easy>();
+
+    let magic = unsafe { core::ptr::addr_of!((*e_ptr).magic).read_unaligned() };
+    if magic != MAGIC_EASY {
         return None;
     }
+
+    let e = unsafe { &mut *e_ptr };
     Some(e)
 }
 
 fn multi_from(p: *mut c_void) -> Option<&'static mut Multi> {
+    // Same barrier shape as easy_from (null + PAGEZERO + magic).
     if p.is_null() || p.addr() < crate::stdio::PAGEZERO_END {
         return None;
     }
+    // SAFETY: null + PAGEZERO rejected; only curl_multi_init writes MAGIC_MULTI.
     let m = unsafe { &mut *p.cast::<Multi>() };
     if m.magic != MAGIC_MULTI {
         return None;
@@ -403,6 +404,280 @@ unsafe extern "C" fn default_write(
     size.saturating_mul(nmemb)
 }
 
+/// Parsed `https://host[:port]/path` (http:// also accepted for local tests).
+struct ParsedUrl {
+    https: bool,
+    host: [u8; 256],
+    host_len: usize,
+    port: u16,
+    /// Path beginning with `/` (default `/`).
+    path: [u8; 2048],
+    path_len: usize,
+}
+
+fn parse_url(url: *const c_char) -> Option<ParsedUrl> {
+    if url.is_null() || !ptr_live(url.cast()) {
+        return None;
+    }
+    let n = unsafe { strlen(url) };
+    if n == 0 || n > 4096 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(url.cast::<u8>(), n) };
+    let (https, rest) = if bytes.starts_with(b"https://") {
+        (true, bytes.get(8..)?)
+    } else if bytes.starts_with(b"http://") {
+        (false, bytes.get(7..)?)
+    } else {
+        return None;
+    };
+    let slash = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
+    let authority = rest.get(..slash)?;
+    let path_raw = rest.get(slash..).unwrap_or(b"/");
+    if authority.is_empty() {
+        return None;
+    }
+    // host[:port] — no userinfo for git remotes.
+    let (host_s, port) = if let Some(colon) = authority.iter().rposition(|&b| b == b':') {
+        let h = authority.get(..colon)?;
+        let p = authority.get(colon.saturating_add(1)..)?;
+        if h.is_empty() || p.is_empty() {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for &c in p {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+            if v > 65535 {
+                return None;
+            }
+        }
+        (h, v as u16)
+    } else {
+        (authority, 0)
+    };
+    if host_s.len() >= 256 {
+        return None;
+    }
+    let mut out = ParsedUrl {
+        https,
+        host: [0; 256],
+        host_len: host_s.len(),
+        port: if port == 0 {
+            if https { 443 } else { 80 }
+        } else {
+            port
+        },
+        path: [0; 2048],
+        path_len: 0,
+    };
+    out.host[..host_s.len()].copy_from_slice(host_s);
+    let path = if path_raw.is_empty() { b"/" } else { path_raw };
+    if path.len() >= out.path.len() {
+        return None;
+    }
+    out.path[..path.len()].copy_from_slice(path);
+    out.path_len = path.len();
+    Some(out)
+}
+
+fn append_bytes(dst: &mut [u8], off: &mut usize, src: &[u8]) -> bool {
+    let end = off.saturating_add(src.len());
+    if end > dst.len() {
+        return false;
+    }
+    dst[*off..end].copy_from_slice(src);
+    *off = end;
+    true
+}
+
+fn append_u64(dst: &mut [u8], off: &mut usize, mut v: u64) -> bool {
+    let mut tmp = [0_u8; 20];
+    let mut i = tmp.len();
+    if v == 0 {
+        i = i.saturating_sub(1);
+        tmp[i] = b'0';
+    } else {
+        while v > 0 && i > 0 {
+            i = i.saturating_sub(1);
+            tmp[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+    append_bytes(dst, off, &tmp[i..])
+}
+
+fn header_line_has_name(line: &[u8], name: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let n = line.get(..colon).unwrap_or(&[]);
+    if n.len() != name.len() {
+        return false;
+    }
+    n.eq_ignore_ascii_case(name)
+}
+
+fn headers_contain(blob: &[u8], name: &[u8]) -> bool {
+    for line in blob.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if header_line_has_name(line, name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn tls_connect_fd(easy: &Easy, host: &[u8], port: u16) -> Result<c_int, c_int> {
+    let mut err_local = [0_u8; ERRBUF_LEN];
+    let mut out_fd: i32 = -1;
+    let mut flags = 0_u32;
+    if easy.flags & EF_SSL_VERIFY != 0 {
+        flags |= TLS_FLAG_VERIFY;
+    }
+    let req = KhTlsConnect {
+        magic: KHTLS_MAGIC,
+        version: 1,
+        flags,
+        port: u32::from(port),
+        hostname: host.as_ptr() as u64,
+        hostname_len: host.len() as u64,
+        ca_path: if ptr_live(easy.ca_info.cast()) {
+            easy.ca_info as u64
+        } else {
+            0
+        },
+        out_fd: core::ptr::from_mut(&mut out_fd) as u64,
+        errbuf: err_local.as_mut_ptr() as u64,
+        errbuf_cap: ERRBUF_LEN as u64,
+    };
+    let rc = unsafe { sys::helper1(KH_HELPER_TLS_CONNECT, core::ptr::from_ref(&req) as u64) };
+    if rc < 0 {
+        let msg: &[u8] = if err_local[0] != 0 {
+            &err_local
+        } else {
+            b"tls connect failed\0"
+        };
+        set_err(easy, msg);
+        return Err(match (-rc) as i32 {
+            28 => CURLE_OPERATION_TIMEDOUT,
+            35 => CURLE_SSL_CONNECT_ERROR,
+            _ => CURLE_COULDNT_CONNECT,
+        });
+    }
+    if out_fd < 0 {
+        set_err(easy, b"tls connect bad fd\0");
+        return Err(CURLE_COULDNT_CONNECT);
+    }
+    Ok(out_fd)
+}
+
+fn write_all_fd(fd: c_int, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let n = unsafe { write(fd, data.as_ptr().cast(), data.len()) };
+        if n <= 0 {
+            return false;
+        }
+        let nu = n as usize;
+        if nu > data.len() {
+            return false;
+        }
+        data = data.get(nu..).unwrap_or(&[]);
+    }
+    true
+}
+
+fn read_some_fd(fd: c_int, buf: &mut [u8]) -> isize {
+    unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) }
+}
+
+fn feed_write_cb(easy: &Easy, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    let write_cb = easy.write_fn.unwrap_or(default_write);
+    let mut off = 0_usize;
+    while off < data.len() {
+        let chunk = data.len().saturating_sub(off).min(16 * 1024);
+        let p = unsafe { data.as_ptr().add(off) };
+        let n = unsafe { write_cb(p.cast_mut().cast(), 1, chunk, easy.write_data) };
+        if n != chunk {
+            return false;
+        }
+        off = off.saturating_add(chunk);
+    }
+    true
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i.saturating_add(4))
+}
+
+fn parse_status_code(hdr: &[u8]) -> u32 {
+    // HTTP/1.x NNN
+    let line = hdr.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut parts = line.split(|&b| b == b' ');
+    let _ = parts.next();
+    let code = parts.next().unwrap_or(&[]);
+    let mut v: u32 = 0;
+    for &c in code {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+    }
+    v
+}
+
+fn header_value<'a>(hdr: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    for line in hdr.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if !header_line_has_name(line, name) {
+            continue;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let mut v = line.get(colon.saturating_add(1)..)?;
+        while v.first() == Some(&b' ') || v.first() == Some(&b'\t') {
+            v = v.get(1..)?;
+        }
+        // Trim parameters for Content-Type (`type/sub; charset`).
+        if name.eq_ignore_ascii_case(b"content-type") {
+            if let Some(semi) = v.iter().position(|&b| b == b';') {
+                v = v.get(..semi)?;
+            }
+            while v.last() == Some(&b' ') {
+                v = v.get(..v.len().saturating_sub(1))?;
+            }
+        }
+        return Some(v);
+    }
+    None
+}
+
+fn parse_content_length(hdr: &[u8]) -> Option<u64> {
+    let v = header_value(hdr, b"content-length")?;
+    let mut n: u64 = 0;
+    for &c in v {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        n = n.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+    }
+    Some(n)
+}
+
+fn is_chunked(hdr: &[u8]) -> bool {
+    header_value(hdr, b"transfer-encoding")
+        .is_some_and(|v| v.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")))
+}
+
 fn perform_easy(easy: &mut Easy) -> c_int {
     if easy.url.is_null() || !ptr_live(easy.url.cast()) {
         set_err(easy, b"no URL set\0");
@@ -411,136 +686,611 @@ fn perform_easy(easy: &mut Easy) -> c_int {
         return easy.result;
     }
 
-    let body_cap = MAX_BODY_OUT;
-    let body_buf = unsafe { malloc(body_cap) }.cast::<u8>();
-    if body_buf.is_null() {
-        set_err(easy, b"oom body\0");
-        easy.result = CURLE_OUT_OF_MEMORY;
+    let Some(url) = parse_url(easy.url) else {
+        set_err(easy, b"URL malformat\0");
+        easy.result = CURLE_URL_MALFORMAT;
+        easy.flags |= EF_DONE;
+        return easy.result;
+    };
+
+    // Path B: HTTPS over host rustls + guest FD. Plain HTTP is rare for git remotes.
+    if !url.https {
+        set_err(easy, b"only https supported on socket TLS path\0");
+        easy.result = CURLE_UNSUPPORTED_PROTOCOL;
         easy.flags |= EF_DONE;
         return easy.result;
     }
 
-    let mut hdr_storage = [0_u8; MAX_HDR_BLOB];
-    let hdr_len = headers_blob(easy.headers, &mut hdr_storage);
+    let host = &url.host[..url.host_len];
+    let fd = match tls_connect_fd(easy, host, url.port) {
+        Ok(f) => f,
+        Err(code) => {
+            easy.result = code;
+            easy.flags |= EF_DONE;
+            return easy.result;
+        }
+    };
 
-    let mut out_len: u64 = 0;
-    let mut http_code: u32 = 0;
-    let mut err_local = [0_u8; ERRBUF_LEN];
-    let mut ctype_local = [0_u8; 128];
+    let result = perform_http_on_fd(easy, fd, &url);
+    let _ = unsafe { close(fd) };
+    easy.result = result;
+    easy.flags |= EF_DONE;
+    if result == CURLE_OK {
+        free_cstr(easy.effective_url);
+        easy.effective_url = dup_cstr(easy.url).unwrap_or(ptr::null_mut());
+    }
+    result
+}
 
-    let post_len = if easy.post_field_size >= 0 {
-        easy.post_field_size as u64
-    } else if ptr_live(easy.post_fields) {
-        unsafe { strlen(easy.post_fields.cast()) as u64 }
+const CURLE_UNSUPPORTED_PROTOCOL: c_int = 1;
+
+/// Gathered POST/PUT body: optional freestanding-owned buffer.
+struct PostBody {
+    ptr: *const u8,
+    len: usize,
+    /// When true, `ptr` was allocated with freestanding `malloc` and must be freed.
+    owned: bool,
+}
+
+impl PostBody {
+    fn empty() -> Self {
+        Self {
+            ptr: ptr::null(),
+            len: 0,
+            owned: false,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn free_owned(&mut self) {
+        if self.owned && !self.ptr.is_null() {
+            unsafe {
+                free(self.ptr.cast_mut().cast());
+            }
+        }
+        self.ptr = ptr::null();
+        self.len = 0;
+        self.owned = false;
+    }
+}
+
+/// Collect POSTFIELDS or READFUNCTION into a contiguous buffer.
+fn gather_post_body(easy: &Easy) -> Result<PostBody, c_int> {
+    if ptr_live(easy.post_fields) {
+        let len = if easy.post_field_size >= 0 {
+            usize::try_from(easy.post_field_size).unwrap_or(0)
+        } else {
+            unsafe { strlen(easy.post_fields.cast()) }
+        };
+        if len > MAX_POST_GATHER {
+            return Err(CURLE_OUT_OF_MEMORY);
+        }
+        return Ok(PostBody {
+            ptr: easy.post_fields.cast::<u8>(),
+            len,
+            owned: false,
+        });
+    }
+
+    let Some(read_cb) = easy.read_fn else {
+        // POST with empty body is allowed (Content-Length: 0).
+        return Ok(PostBody::empty());
+    };
+
+    // READFUNCTION path (git large want-lists when postBuffer is exceeded).
+    let known = if easy.post_field_size >= 0 {
+        usize::try_from(easy.post_field_size).unwrap_or(0)
     } else {
         0
     };
-
-    let mut flags = 0_u32;
-    if easy.flags & EF_SSL_VERIFY != 0 {
-        flags |= KHHTTP_FLAG_SSL_VERIFY;
+    if known > MAX_POST_GATHER {
+        return Err(CURLE_OUT_OF_MEMORY);
     }
 
-    let req = KhHttpReq {
-        magic: KHHTTP_MAGIC,
-        version: 2,
-        method: method_of(easy),
-        flags,
-        url: easy.url as u64,
-        headers: if hdr_len == 0 {
-            0
+    let mut cap = if known > 0 {
+        known
+    } else {
+        64 * 1024
+    };
+    cap = cap.clamp(1, MAX_POST_GATHER);
+    let mut buf = unsafe { malloc(cap) }.cast::<u8>();
+    if buf.is_null() {
+        return Err(CURLE_OUT_OF_MEMORY);
+    }
+    let mut filled = 0_usize;
+    loop {
+        if known > 0 && filled >= known {
+            break;
+        }
+        if filled >= cap {
+            if known > 0 || cap >= MAX_POST_GATHER {
+                unsafe {
+                    free(buf.cast());
+                }
+                return Err(CURLE_OUT_OF_MEMORY);
+            }
+            let new_cap = cap.saturating_mul(2).min(MAX_POST_GATHER).max(cap.saturating_add(1));
+            let nbuf = unsafe { realloc(buf.cast(), new_cap) }.cast::<u8>();
+            if nbuf.is_null() {
+                unsafe {
+                    free(buf.cast());
+                }
+                return Err(CURLE_OUT_OF_MEMORY);
+            }
+            buf = nbuf;
+            cap = new_cap;
+        }
+        let space = if known > 0 {
+            known.saturating_sub(filled).min(cap.saturating_sub(filled))
         } else {
-            hdr_storage.as_ptr() as u64
-        },
-        headers_len: hdr_len as u64,
-        body: if post_len == 0 {
-            0
-        } else {
-            easy.post_fields as u64
-        },
-        body_len: post_len,
-        ca_path: if ptr_live(easy.ca_info.cast()) {
-            easy.ca_info as u64
-        } else {
-            0
-        },
-        out_body: body_buf as u64,
-        out_body_cap: body_cap as u64,
-        out_body_len: core::ptr::from_mut(&mut out_len) as u64,
-        out_code: core::ptr::from_mut(&mut http_code) as u64,
-        errbuf: err_local.as_mut_ptr() as u64,
-        errbuf_cap: ERRBUF_LEN as u64,
-        out_ctype: ctype_local.as_mut_ptr() as u64,
-        out_ctype_cap: ctype_local.len() as u64,
+            cap.saturating_sub(filled)
+        };
+        if space == 0 {
+            break;
+        }
+        let dest = unsafe { buf.add(filled) };
+        let n = unsafe { read_cb(dest.cast(), 1, space, easy.read_data) };
+        if n == 0 {
+            break;
+        }
+        if n > space {
+            unsafe {
+                free(buf.cast());
+            }
+            return Err(CURLE_BAD_FUNCTION_ARGUMENT);
+        }
+        filled = filled.saturating_add(n);
+    }
+    if filled == 0 {
+        unsafe {
+            free(buf.cast());
+        }
+        return Ok(PostBody::empty());
+    }
+    Ok(PostBody {
+        ptr: buf.cast_const(),
+        len: filled,
+        owned: true,
+    })
+}
+
+/// If guest claims `Content-Encoding: gzip` but body is zlib (Apple git), decode
+/// and strip the header so GitHub accepts the upload-pack POST.
+fn maybe_decode_claim_gzip(user_hdrs: &[u8], body: &mut PostBody) -> bool {
+    let Some(ce) = header_value(user_hdrs, b"content-encoding") else {
+        return false;
+    };
+    if !ce.eq_ignore_ascii_case(b"gzip") {
+        return false;
+    }
+    let src = body.as_slice();
+    if src.is_empty() {
+        return true; // still strip empty CE
+    }
+    let Some((p, n)) = crate::zlib::inflate_to_malloc(src) else {
+        // Keep wire body but still strip CE — better than advertising false gzip.
+        return true;
+    };
+    body.free_owned();
+    body.ptr = p.cast_const();
+    body.len = n;
+    body.owned = true;
+    true
+}
+
+fn perform_http_on_fd(easy: &mut Easy, fd: c_int, url: &ParsedUrl) -> c_int {
+    let mut body = match gather_post_body(easy) {
+        Ok(b) => b,
+        Err(code) => {
+            set_err(easy, b"post body gather failed\0");
+            return code;
+        }
     };
 
-    let rc = unsafe { sys::helper1(KH_HELPER_HTTP, core::ptr::from_ref(&req) as u64) };
-    if rc < 0 {
-        let msg: &[u8] = if err_local[0] != 0 {
-            &err_local
-        } else {
-            b"http helper failed\0"
-        };
-        set_err(easy, msg);
+    let mut hdr_storage = [0_u8; MAX_HDR_BLOB];
+    let hdr_len = headers_blob(easy.headers, &mut hdr_storage);
+    let user_hdrs = &hdr_storage[..hdr_len];
+    let strip_ce = maybe_decode_claim_gzip(user_hdrs, &mut body);
+    let post_len = body.len as u64;
+
+    // Build request line + headers + body into one buffer when body is small;
+    // large POST bodies are rare for git want-lists (usually <1 MiB).
+    let method: &[u8] = match method_of(easy) {
+        1 => b"POST",
+        2 => b"HEAD",
+        3 => b"PUT",
+        _ => b"GET",
+    };
+
+    // Request buffer: method SP path SP HTTP/1.1 CRLF + headers + CRLF + optional body.
+    let est = method
+        .len()
+        .saturating_add(1)
+        .saturating_add(url.path_len)
+        .saturating_add(16)
+        .saturating_add(hdr_len)
+        .saturating_add(256)
+        .saturating_add(body.len);
+    let req_cap = est.saturating_add(64);
+    let req_buf = unsafe { malloc(req_cap) }.cast::<u8>();
+    if req_buf.is_null() {
+        body.free_owned();
+        set_err(easy, b"oom request\0");
+        return CURLE_OUT_OF_MEMORY;
+    }
+    let req_slice = unsafe { core::slice::from_raw_parts_mut(req_buf, req_cap) };
+    let mut off = 0_usize;
+    let ok = append_bytes(req_slice, &mut off, method)
+        && append_bytes(req_slice, &mut off, b" ")
+        && append_bytes(req_slice, &mut off, &url.path[..url.path_len])
+        && append_bytes(req_slice, &mut off, b" HTTP/1.1\r\n");
+    if !ok {
         unsafe {
-            free(body_buf.cast());
+            free(req_buf.cast());
         }
-        easy.result = match (-rc) as i32 {
-            28 => CURLE_OPERATION_TIMEDOUT,
-            35 => CURLE_SSL_CONNECT_ERROR,
-            _ => CURLE_COULDNT_CONNECT,
-        };
-        easy.flags |= EF_DONE;
-        return easy.result;
+        body.free_owned();
+        set_err(easy, b"request too large\0");
+        return CURLE_OUT_OF_MEMORY;
     }
 
+    if !headers_contain(user_hdrs, b"host") {
+        let _ = append_bytes(req_slice, &mut off, b"Host: ");
+        let _ = append_bytes(req_slice, &mut off, &url.host[..url.host_len]);
+        if url.port != 443 && url.port != 80 {
+            let _ = append_bytes(req_slice, &mut off, b":");
+            let _ = append_u64(req_slice, &mut off, u64::from(url.port));
+        }
+        let _ = append_bytes(req_slice, &mut off, b"\r\n");
+    }
+    if !headers_contain(user_hdrs, b"user-agent") {
+        if ptr_live(easy.user_agent.cast()) {
+            let ua_n = unsafe { strlen(easy.user_agent) };
+            let ua = unsafe { core::slice::from_raw_parts(easy.user_agent.cast::<u8>(), ua_n) };
+            let _ = append_bytes(req_slice, &mut off, b"User-Agent: ");
+            let _ = append_bytes(req_slice, &mut off, ua);
+            let _ = append_bytes(req_slice, &mut off, b"\r\n");
+        } else {
+            let _ = append_bytes(req_slice, &mut off, b"User-Agent: kakehashi-libcurl\r\n");
+        }
+    }
+    // Forward guest headers; skip hop-by-hop framing (we set Content-Length).
+    // Also drop Content-Encoding when we decoded a false "gzip" (zlib) body.
+    for line in user_hdrs.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        if header_line_has_name(line, b"content-length")
+            || header_line_has_name(line, b"transfer-encoding")
+            || header_line_has_name(line, b"connection")
+            || (strip_ce && header_line_has_name(line, b"content-encoding"))
+        {
+            continue;
+        }
+        if !append_bytes(req_slice, &mut off, line) || !append_bytes(req_slice, &mut off, b"\r\n") {
+            unsafe {
+                free(req_buf.cast());
+            }
+            body.free_owned();
+            set_err(easy, b"request headers overflow\0");
+            return CURLE_OUT_OF_MEMORY;
+        }
+    }
+    if method_of(easy) == 1 || method_of(easy) == 3 || post_len > 0 {
+        let _ = append_bytes(req_slice, &mut off, b"Content-Length: ");
+        let _ = append_u64(req_slice, &mut off, post_len);
+        let _ = append_bytes(req_slice, &mut off, b"\r\n");
+    }
+    let _ = append_bytes(req_slice, &mut off, b"Connection: close\r\n\r\n");
+
+    if post_len > 0 {
+        let body_bytes = body.as_slice();
+        if !append_bytes(req_slice, &mut off, body_bytes) {
+            unsafe {
+                free(req_buf.cast());
+            }
+            body.free_owned();
+            set_err(easy, b"post body overflow\0");
+            return CURLE_OUT_OF_MEMORY;
+        }
+    }
+    body.free_owned();
+
+    let req_bytes = &req_slice[..off];
+    if !write_all_fd(fd, req_bytes) {
+        unsafe {
+            free(req_buf.cast());
+        }
+        set_err(easy, b"send request failed\0");
+        return CURLE_COULDNT_CONNECT;
+    }
+    unsafe {
+        free(req_buf.cast());
+    }
+
+    // Read response headers (and possibly first body bytes).
+    let hdr_buf = unsafe { malloc(MAX_RESP_HDR) }.cast::<u8>();
+    if hdr_buf.is_null() {
+        set_err(easy, b"oom response headers\0");
+        return CURLE_OUT_OF_MEMORY;
+    }
+    let mut hdr_filled = 0_usize;
+    let mut header_end = None;
+    while header_end.is_none() {
+        if hdr_filled >= MAX_RESP_HDR {
+            unsafe {
+                free(hdr_buf.cast());
+            }
+            set_err(easy, b"response headers too large\0");
+            return CURLE_COULDNT_CONNECT;
+        }
+        let space = MAX_RESP_HDR.saturating_sub(hdr_filled);
+        let dest = unsafe { core::slice::from_raw_parts_mut(hdr_buf.add(hdr_filled), space) };
+        let n = read_some_fd(fd, dest);
+        if n <= 0 {
+            unsafe {
+                free(hdr_buf.cast());
+            }
+            set_err(easy, b"read response headers failed\0");
+            return CURLE_COULDNT_CONNECT;
+        }
+        hdr_filled = hdr_filled.saturating_add(n as usize);
+        let view = unsafe { core::slice::from_raw_parts(hdr_buf, hdr_filled) };
+        header_end = find_header_end(view);
+    }
+    let hend = header_end.unwrap_or(hdr_filled);
+    let hdr_view = unsafe { core::slice::from_raw_parts(hdr_buf, hend) };
+    let http_code = parse_status_code(hdr_view);
     easy.response_code = c_long::from(http_code);
-    easy.download_size = out_len as i64;
+
     free_cstr(easy.content_type);
-    easy.content_type = if ctype_local[0] != 0 {
-        dup_cstr(ctype_local.as_ptr().cast()).unwrap_or(ptr::null_mut())
+    easy.content_type = if let Some(ct) = header_value(hdr_view, b"content-type") {
+        let mut tmp = [0_u8; 128];
+        let n = ct.len().min(tmp.len().saturating_sub(1));
+        tmp[..n].copy_from_slice(&ct[..n]);
+        tmp[n] = 0;
+        dup_cstr(tmp.as_ptr().cast()).unwrap_or(ptr::null_mut())
     } else {
         ptr::null_mut()
     };
 
     if easy.flags & EF_FAIL != 0 && http_code >= 400 {
-        set_err(easy, b"HTTP error\0");
         unsafe {
-            free(body_buf.cast());
+            free(hdr_buf.cast());
         }
-        easy.result = CURLE_HTTP_RETURNED_ERROR;
-        easy.flags |= EF_DONE;
-        return easy.result;
+        set_err(easy, b"HTTP error\0");
+        return CURLE_HTTP_RETURNED_ERROR;
     }
 
-    let write = easy.write_fn.unwrap_or(default_write);
-    let mut fed = 0_u64;
-    while fed < out_len {
-        let remain = (out_len - fed) as usize;
-        let chunk = remain.min(16 * 1024);
-        let p = unsafe { body_buf.add(fed as usize) };
-        let n = unsafe { write(p.cast(), 1, chunk, easy.write_data) };
-        if n != chunk {
-            set_err(easy, b"write callback short\0");
-            crate::trace::force_note(b"[kh] write short\n");
-            unsafe {
-                free(body_buf.cast());
-            }
-            easy.result = CURLE_WRITE_ERROR;
-            easy.flags |= EF_DONE;
-            return easy.result;
-        }
-        fed = fed.saturating_add(chunk as u64);
-    }
+    // Body starts after headers; may already be buffered.
+    let mut pending =
+        unsafe { core::slice::from_raw_parts(hdr_buf.add(hend), hdr_filled.saturating_sub(hend)) };
+    let mut download: u64 = 0;
+
+    let body_rc = if method_of(easy) == 2 {
+        // HEAD — no body.
+        CURLE_OK
+    } else if is_chunked(hdr_view) {
+        stream_chunked_body(easy, fd, &mut pending, hdr_buf, &mut download)
+    } else if let Some(clen) = parse_content_length(hdr_view) {
+        stream_fixed_body(easy, fd, &mut pending, clen, &mut download)
+    } else {
+        // Connection: close / EOF delimited.
+        stream_until_eof(easy, fd, &mut pending, &mut download)
+    };
 
     unsafe {
-        free(body_buf.cast());
+        free(hdr_buf.cast());
     }
-    free_cstr(easy.effective_url);
-    easy.effective_url = dup_cstr(easy.url).unwrap_or(ptr::null_mut());
-    easy.result = CURLE_OK;
-    easy.flags |= EF_DONE;
+    easy.download_size = download as i64;
+    body_rc
+}
+
+fn stream_fixed_body(
+    easy: &Easy,
+    fd: c_int,
+    pending: &mut &[u8],
+    content_len: u64,
+    download: &mut u64,
+) -> c_int {
+    let mut left = content_len;
+    if !pending.is_empty() {
+        let take = (pending.len() as u64).min(left) as usize;
+        let chunk = &pending[..take];
+        if !feed_write_cb(easy, chunk) {
+            set_err(easy, b"write callback short\0");
+            return CURLE_WRITE_ERROR;
+        }
+        *download = download.saturating_add(take as u64);
+        left = left.saturating_sub(take as u64);
+        *pending = pending.get(take..).unwrap_or(&[]);
+    }
+    let mut buf = [0_u8; IO_CHUNK];
+    while left > 0 {
+        let want = (left as usize).min(buf.len());
+        let n = read_some_fd(fd, &mut buf[..want]);
+        if n <= 0 {
+            set_err(easy, b"short body read\0");
+            return CURLE_COULDNT_CONNECT;
+        }
+        let nu = n as usize;
+        if !feed_write_cb(easy, &buf[..nu]) {
+            set_err(easy, b"write callback short\0");
+            return CURLE_WRITE_ERROR;
+        }
+        *download = download.saturating_add(nu as u64);
+        left = left.saturating_sub(nu as u64);
+    }
     CURLE_OK
+}
+
+fn stream_until_eof(easy: &Easy, fd: c_int, pending: &mut &[u8], download: &mut u64) -> c_int {
+    if !pending.is_empty() {
+        if !feed_write_cb(easy, pending) {
+            set_err(easy, b"write callback short\0");
+            return CURLE_WRITE_ERROR;
+        }
+        *download = download.saturating_add(pending.len() as u64);
+        *pending = &[];
+    }
+    let mut buf = [0_u8; IO_CHUNK];
+    loop {
+        let n = read_some_fd(fd, &mut buf);
+        if n == 0 {
+            return CURLE_OK;
+        }
+        if n < 0 {
+            set_err(easy, b"body read error\0");
+            return CURLE_COULDNT_CONNECT;
+        }
+        let nu = n as usize;
+        if !feed_write_cb(easy, &buf[..nu]) {
+            set_err(easy, b"write callback short\0");
+            return CURLE_WRITE_ERROR;
+        }
+        *download = download.saturating_add(nu as u64);
+    }
+}
+
+/// Chunked transfer decoding (HTTP/1.1).
+fn stream_chunked_body(
+    easy: &Easy,
+    fd: c_int,
+    pending: &mut &[u8],
+    // hdr_buf still owns the storage behind `pending` — only used if we need
+    // a scratch; pending is a subslice of it. We re-buffer into a local ring.
+    _hdr_buf: *mut u8,
+    download: &mut u64,
+) -> c_int {
+    // Copy any pre-buffered body into a growable-ish fixed scratch.
+    let mut scratch = [0_u8; IO_CHUNK.saturating_mul(2)];
+    let mut scratch_len = 0_usize;
+    if !pending.is_empty() {
+        let n = pending.len().min(scratch.len());
+        scratch[..n].copy_from_slice(&pending[..n]);
+        scratch_len = n;
+        *pending = &[];
+    }
+
+    loop {
+        // Ensure we have a full chunk-size line.
+        let line_end = loop {
+            if let Some(i) = scratch[..scratch_len].windows(2).position(|w| w == b"\r\n") {
+                break i;
+            }
+            if scratch_len >= scratch.len() {
+                set_err(easy, b"chunk size line too long\0");
+                return CURLE_COULDNT_CONNECT;
+            }
+            let n = read_some_fd(fd, &mut scratch[scratch_len..]);
+            if n <= 0 {
+                set_err(easy, b"chunk size read fail\0");
+                return CURLE_COULDNT_CONNECT;
+            }
+            scratch_len = scratch_len.saturating_add(n as usize);
+        };
+        let size_line = &scratch[..line_end];
+        // Ignore chunk extensions after `;`.
+        let hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
+        let mut size: u64 = 0;
+        for &c in hex {
+            let dig = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                b' ' | b'\t' => continue,
+                _ => {
+                    set_err(easy, b"bad chunk size\0");
+                    return CURLE_COULDNT_CONNECT;
+                }
+            };
+            size = (size << 4) | u64::from(dig);
+        }
+        // Consume size line + CRLF.
+        let after = line_end.saturating_add(2);
+        if after > scratch_len {
+            set_err(easy, b"chunk parse bug\0");
+            return CURLE_COULDNT_CONNECT;
+        }
+        scratch.copy_within(after..scratch_len, 0);
+        scratch_len = scratch_len.saturating_sub(after);
+
+        if size == 0 {
+            // Trailer headers until blank line — drain and done.
+            loop {
+                if let Some(i) = scratch[..scratch_len]
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                {
+                    let _ = i;
+                    return CURLE_OK;
+                }
+                if scratch[..scratch_len] == *b"\r\n" {
+                    return CURLE_OK;
+                }
+                // Need more trailer data.
+                if scratch_len >= scratch.len() {
+                    // Compact: keep last few bytes.
+                    scratch_len = 0;
+                }
+                let n = read_some_fd(fd, &mut scratch[scratch_len..]);
+                if n <= 0 {
+                    return CURLE_OK;
+                }
+                scratch_len = scratch_len.saturating_add(n as usize);
+                // Empty trailer is just CRLF after last chunk.
+                if scratch_len >= 2 && &scratch[..2] == b"\r\n" {
+                    return CURLE_OK;
+                }
+            }
+        }
+
+        let mut left = size;
+        while left > 0 {
+            if scratch_len == 0 {
+                let want = (left as usize).min(scratch.len());
+                let n = read_some_fd(fd, &mut scratch[..want]);
+                if n <= 0 {
+                    set_err(easy, b"chunk data short\0");
+                    return CURLE_COULDNT_CONNECT;
+                }
+                scratch_len = n as usize;
+            }
+            let take = (left as usize).min(scratch_len);
+            if !feed_write_cb(easy, &scratch[..take]) {
+                set_err(easy, b"write callback short\0");
+                return CURLE_WRITE_ERROR;
+            }
+            *download = download.saturating_add(take as u64);
+            left = left.saturating_sub(take as u64);
+            scratch.copy_within(take..scratch_len, 0);
+            scratch_len = scratch_len.saturating_sub(take);
+        }
+        // Trailing CRLF after chunk data.
+        loop {
+            if scratch_len >= 2 {
+                if &scratch[..2] == b"\r\n" {
+                    scratch.copy_within(2..scratch_len, 0);
+                    scratch_len = scratch_len.saturating_sub(2);
+                    break;
+                }
+                set_err(easy, b"bad chunk trailer\0");
+                return CURLE_COULDNT_CONNECT;
+            }
+            let n = read_some_fd(fd, &mut scratch[scratch_len..]);
+            if n <= 0 {
+                set_err(easy, b"chunk trailer read fail\0");
+                return CURLE_COULDNT_CONNECT;
+            }
+            scratch_len = scratch_len.saturating_add(n as usize);
+        }
+    }
 }
 
 // ── exports (no_mangle C ABI; `pub(crate)` like zlib.rs) ─────────────────────

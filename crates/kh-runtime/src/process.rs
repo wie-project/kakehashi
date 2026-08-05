@@ -42,6 +42,10 @@ static FD_HOST: [AtomicI32; FD_SLOTS] = [const { AtomicI32::new(FD_EMPTY) }; FD_
 /// guests still expect **blocking** semantics until they `fcntl(F_SETFL)`.
 /// I/O emulates blocking waits when this bit is clear.
 static FD_GUEST_NB: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS];
+/// Guest FD has a host-side TLS session ([`crate::tls_fd`]).
+///
+/// Lock-free hot-path check so ordinary `read`/`write` skip the TLS HashMap.
+static FD_TLS: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS];
 /// Hint for next free FD scan.
 static FD_NEXT: AtomicI32 = AtomicI32::new(3);
 
@@ -128,6 +132,12 @@ pub fn fd_take(gfd: i32) -> Option<RawFd> {
     };
     let slot = FD_HOST.get(idx)?;
     let v = slot.swap(FD_EMPTY, Ordering::AcqRel);
+    if let Some(t) = FD_TLS.get(idx) {
+        t.store(0, Ordering::Release);
+    }
+    if let Some(nb) = FD_GUEST_NB.get(idx) {
+        nb.store(0, Ordering::Release);
+    }
     if v < 0 { None } else { Some(v) }
 }
 
@@ -214,6 +224,35 @@ pub fn fd_set_guest_nonblock(gfd: i32, nonblock: bool) {
     }
 }
 
+/// True when `gfd` is a TLS-wrapped guest FD (hot path; no mutex).
+#[must_use]
+#[inline]
+pub fn fd_is_tls(gfd: i32) -> bool {
+    if gfd < 0 {
+        return false;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return false;
+    };
+    FD_TLS
+        .get(idx)
+        .is_some_and(|s| s.load(Ordering::Acquire) != 0)
+}
+
+/// Mark / clear TLS session association for `gfd` (paired with [`crate::tls_fd`]).
+#[inline]
+pub fn fd_set_tls(gfd: i32, is_tls: bool) {
+    if gfd < 0 {
+        return;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return;
+    };
+    if let Some(slot) = FD_TLS.get(idx) {
+        slot.store(u8::from(is_tls), Ordering::Release);
+    }
+}
+
 /// Clear host `O_NONBLOCK` on stdio when the fd is a pipe/FIFO.
 ///
 /// Nested `kh run` (git helpers after `fork`+re-exec) inherits command pipes as
@@ -256,6 +295,9 @@ fn reset_fd_map() {
         }
     }
     for slot in &FD_GUEST_NB {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in &FD_TLS {
         slot.store(0, Ordering::Relaxed);
     }
     FD_NEXT.store(3, Ordering::Relaxed);

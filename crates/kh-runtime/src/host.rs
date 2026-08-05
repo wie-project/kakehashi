@@ -192,6 +192,12 @@ pub fn poll_fd_writable(fd: RawFd, timeout_ms: i32) -> bool {
     poll_fd(fd, libc::POLLOUT, timeout_ms)
 }
 
+/// Block until `fd` is readable **or** writable (TLS may need both).
+#[must_use]
+pub fn poll_fd_io(fd: RawFd, timeout_ms: i32) -> bool {
+    poll_fd(fd, libc::POLLIN | libc::POLLOUT, timeout_ms)
+}
+
 fn poll_fd(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd,

@@ -12,9 +12,9 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | --- | --- | --- |
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/git` | **pass** (swscan, no Apple ID) |
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
-| G2 | Missing surface from probes | **in progress** (HTTPS helper / freestanding libcurl) |
+| G2 | Missing surface from probes | **mostly met** (HTTPS helper / freestanding libcurl; polish remains) |
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
-| G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote` + shallow `clone`) |
+| G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote`, shallow + full small `clone`) |
 
 ### G4 notes (HTTPS / freestanding libcurl)
 
@@ -26,7 +26,8 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | --- | --- |
 | `curl_*` C ABI | freestanding `kh-libsystem` (`src/curl.rs`) — clean-room, not upstream libcurl |
 | Bottle alias | `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` ([`layout::ensure_libcurl_symlink`](../crates/kh-runtime/src/bottle/layout.rs)) |
-| HTTP(S) I/O | host helper `KH_HELPER_HTTP` (`0x4B48_000C`) runs host `curl` + bottle CA |
+| HTTPS I/O (path B) | `KH_HELPER_TLS_CONNECT` → host TCP + **rustls**; guest `read`/`write` on TLS-wrapped FD are **plaintext**; freestanding builds HTTP/1.1 and streams body into `write_fn` (no multi‑GiB guest buffer) |
+| Legacy | `KH_HELPER_HTTP` (host `curl` CLI + 64 MiB body cap) kept for tools that still call it; freestanding `easy_perform` no longer uses it for HTTPS |
 | Loader alias fix | map `install_name` from **LC_LOAD** (not only LC_ID) so two-level ordinals against `libcurl.4.dylib` resolve |
 
 **Progress (HTTPS list via freestanding libcurl):**
@@ -38,6 +39,9 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | Host HTTP helper + body + `Content-Type` | **pass** |
 | `git ls-remote https://…` (spawned helper) | **pass** (Docker; protocol v1) |
 | `git clone --depth 1 https://…` | **pass** (Docker; working tree + objects) |
+| `git clone https://…` (full, small repo) | **pass** (Docker; Hello-World; TLS socket path) |
+| `git clone https://…` (full, ~9 MiB pack) | **pass** (Docker; this repo after inflate fix) |
+| `git clone --depth 1` linux kernel | **pass** (Docker; ~279 MiB pack, ~2 GiB tree; path B streaming) |
 
 ```text
 # capabilities
@@ -55,6 +59,10 @@ kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 # shallow clone
 kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
 # → exit 0; hw/README present
+
+# full clone (small repos; response body ≤ 64 MiB host/guest cap)
+kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
+# → exit 0; hw-full/README present
 ```
 
 **Fixes landed for G4 (list / ls-remote / clone):**
@@ -89,10 +97,49 @@ kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
    soft environ + stack with host `GIT_DIR` / friends (`KH_HELPER_GETENV`);
    without this: `remote-curl: fetch attempted without a local repo`.
 10. **`setitimer`/`getitimer` soft stubs** — clone progress ticker mid-checkout.
+11. **CodeQL `rust/access-invalid-pointer` on `easy_from`** — explicit
+    `p.is_null()` before PAGEZERO (NotNullCheckBarrier); OOM path of
+    `curl_easy_init` returns `null_mut` and must not be treated as live.
+12. **HTTPS path B (TLS guest FD + freestanding HTTP/1.1)** — replaces host
+    `curl` CLI + 64 MiB body cap for freestanding `easy_perform`:
+    - `KH_HELPER_TLS_CONNECT` (`0x4B48_0011`): host TCP + rustls handshake
+      (bottle CA); returns guest FD.
+    - Host `read`/`write` on that FD decrypt/encrypt via rustls; guest sees
+      plaintext (same as a completed TLS socket from the app’s POV).
+    - Freestanding builds request, parses response headers, streams body
+      (`Content-Length` / chunked / EOF) into curl `write_fn` in 64 KiB chunks.
+    - **POST body**: gather `POSTFIELDS` or `READFUNCTION` (git large want lists);
+      if guest sets `Content-Encoding: gzip` but freestanding `deflate` only
+      emits zlib-wrapper (not true gzip), **decode zlib + strip CE** before
+      send — otherwise GitHub returns **HTTP 400** on full monorepo clones.
+    - Verified: Hello-World full clone; **linux** shallow + full `clone` POST
+      accepted (pack download) under Docker.
+    - **TLS wire flush**: never drop unsent ciphertext on `EAGAIN` (pending
+      buffer); flush after `process_new_packets` (TLS 1.3 KeyUpdate). Missing
+      this caused `curl 7 chunk data short` / `bad pack header` mid multi‑GiB
+      pack streams when the TCP send buffer filled.
+    - **TLS deframer**: `process_new_packets` after every `read_tls` +
+      `pending_in` leftover wire. Without this, multi-record TCP segments hit
+      rustls `message buffer full` → `chunk trailer read fail` early in linux
+      full clone.
+13. **Freestanding `inflate` rewrite (miniz streaming + git ABI)** — multi‑MiB
+    packs failed at `index-pack` (`pack has bad object … inflate returned -3/-5`).
+    Root causes vs Apple `git` 2.50 `index-pack`:
+    - Hand-rolled NON_WRAPPING history missed miniz `HAS_MORE_INPUT` semantics.
+    - Missing `inflateReset` / `deflateReset` (git reuses one `z_stream`).
+    - miniz `MZFlush::Finish` clears HAS_MORE; git multi-calls with partial
+      windows — always drive miniz with `MZFlush::None`, end via zlib trailer.
+    - `index-pack` loops only while `status == Z_OK` (not `Z_BUF_ERROR`); map
+      “need more input” Buf → `Z_OK`. Empty `avail_out` still probes StreamEnd.
+    Verified: `index-pack` of ~9 MiB pack + full `clone` of this repo (Docker).
 
-**Polish / still open:** full (non-shallow) clone of large repos, protocol v2
-`stateless-connect`, push. Prefer `protocol.version=1` in guest `~/.gitconfig`
-until v2 RPC is complete.
+**Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
+time budget; protocol v2 `stateless-connect`; push; plain `http://` on the
+socket path. Prefer `protocol.version=1` in guest `~/.gitconfig` until v2 RPC
+is complete. Stage freestanding with **release** dylib
+(`cargo build -p kh-libsystem --release --target aarch64-apple-darwin` then
+`./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
+release over a newer debug build.
 
 Local G3 remains green. Curl options **tier1** is green after the `fcntl`
 varargs fix.

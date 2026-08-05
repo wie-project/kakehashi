@@ -244,6 +244,22 @@ pub(crate) const KH_HELPER_REGEXEC: u32 = KH_HELPER_BASE | 0x0F;
 /// Host `regfree` — `x0` = handle from `REGCOMP`.
 pub(crate) const KH_HELPER_REGFREE: u32 = KH_HELPER_BASE | 0x10;
 
+/// TLS connect for freestanding libcurl (path B): host TCP + rustls handshake.
+///
+/// `x0` = guest VA of packed `KhTlsConnect` (LE):
+/// ```text
+/// u32 magic = 0x4B48_544C  // "KHTL"
+/// u32 version = 1
+/// u32 flags    // bit0 = verify peer (TLS_FLAG_VERIFY)
+/// u32 port
+/// u64 hostname_va, hostname_len
+/// u64 ca_path_va   // 0 → bottle CA when verify
+/// u64 out_fd_va    // writes i32 guest fd
+/// u64 errbuf_va, errbuf_cap
+/// ```
+/// Returns 0 on success; negative errno-ish on failure.
+pub(crate) const KH_HELPER_TLS_CONNECT: u32 = KH_HELPER_BASE | 0x11;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -276,7 +292,123 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_REGCOMP => handle_regcomp(args),
         KH_HELPER_REGEXEC => handle_regexec(args),
         KH_HELPER_REGFREE => handle_regfree(args),
+        KH_HELPER_TLS_CONNECT => handle_tls_connect(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
+    }
+}
+
+const KHTLS_MAGIC: u32 = 0x4B48_544C; // KHTL
+const KHTLS_REQ_BYTES: usize = 64; // 4×u32 + 6×u64
+
+fn handle_tls_connect(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_tls_connect";
+    let req_va = args.x0;
+    if req_va == 0 || !registry_check_range(req_va, KHTLS_REQ_BYTES, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let req = guest_slice(req_va, KHTLS_REQ_BYTES);
+    let read_u32 = |off: usize| -> u32 {
+        let end = off.saturating_add(4);
+        req.get(off..end)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u32::from_le_bytes)
+    };
+    let read_u64 = |off: usize| -> u64 {
+        let end = off.saturating_add(8);
+        req.get(off..end)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u64::from_le_bytes)
+    };
+
+    let magic = read_u32(0);
+    let version = read_u32(4);
+    let flags = read_u32(8);
+    let port = read_u32(12);
+    let hostname_va = read_u64(16);
+    let hostname_len = usize::try_from(read_u64(24)).unwrap_or(0);
+    let ca_va = read_u64(32);
+    let out_fd_va = read_u64(40);
+    let errbuf_va = read_u64(48);
+    let errbuf_cap = usize::try_from(read_u64(56)).unwrap_or(0);
+
+    let write_err = |msg: &str| {
+        if errbuf_va != 0 && errbuf_cap > 0 && registry_check_range(errbuf_va, errbuf_cap, true) {
+            let mut bytes = msg.as_bytes().to_vec();
+            if bytes.len() >= errbuf_cap {
+                bytes.truncate(errbuf_cap.saturating_sub(1));
+            }
+            bytes.push(0);
+            guest_write(errbuf_va, &bytes);
+        }
+    };
+
+    if magic != KHTLS_MAGIC || version != 1 {
+        write_err("bad tls connect magic/version");
+        return SyscallResult::err(name, EINVAL);
+    }
+    if port == 0 || port > u32::from(u16::MAX) {
+        write_err("bad port");
+        return SyscallResult::err(name, EINVAL);
+    }
+    if hostname_va == 0 || hostname_len == 0 || hostname_len > 255 {
+        write_err("bad hostname");
+        return SyscallResult::err(name, EINVAL);
+    }
+    if !registry_check_range(hostname_va, hostname_len, false) {
+        write_err("hostname EFAULT");
+        return SyscallResult::err(name, EFAULT);
+    }
+    if out_fd_va == 0 || !registry_check_range(out_fd_va, 4, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+
+    let host_bytes = guest_slice(hostname_va, hostname_len);
+    let Ok(hostname) = std::str::from_utf8(host_bytes) else {
+        write_err("hostname not utf8");
+        return SyscallResult::err(name, EINVAL);
+    };
+
+    let ca_host = if ca_va != 0 {
+        bottle::read_c_string(ca_va, CSTR_MAX).and_then(|guest_path| {
+            bottle::translate_path(&guest_path)
+                .ok()
+                .filter(|p| p.is_file())
+        })
+    } else {
+        None
+    };
+    let ca_host = ca_host.or_else(|| {
+        bottle::active_ca_pem_path().or_else(|| {
+            bottle::bottle_root().and_then(|r| {
+                let p = r.join(crate::bottle::GUEST_CA_FILE_REL);
+                p.is_file().then_some(p)
+            })
+        })
+    });
+
+    let port_u16 = u16::try_from(port).unwrap_or(0);
+    match crate::tls_fd::connect(hostname, port_u16, flags, ca_host.as_deref()) {
+        Ok(gfd) => {
+            guest_write(out_fd_va, &gfd.to_le_bytes());
+            SyscallResult::ok(name, 0)
+        }
+        Err(e) => {
+            write_err(&e);
+            // Prefer connect-ish / SSL-ish errno codes freestanding curl maps.
+            let lower = e.to_ascii_lowercase();
+            let err = if lower.contains("certificate")
+                || lower.contains("tls")
+                || lower.contains("ssl")
+                || lower.contains("handshake")
+            {
+                35 // CURLE_SSL_CONNECT_ERROR mapped later
+            } else if lower.contains("timed out") || lower.contains("timeout") {
+                28
+            } else {
+                7 // connect failure
+            };
+            SyscallResult::err(name, i64::from(err))
+        }
     }
 }
 

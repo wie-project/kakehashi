@@ -128,6 +128,9 @@ git config --global protocol.version 1
 kh run git -- --version
 kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
+# full / large clones stream over TLS guest FDs (path B; no 64 MiB body cap)
+# kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
+# Docker stress: ./scripts/docker-git.sh clone --depth 1 --single-branch https://github.com/torvalds/linux.git
 ```
 
 See [`docs/git.md`](docs/git.md) for gates (G0–G4). Docker: `scripts/docker-git.sh`.
@@ -135,7 +138,7 @@ See [`docs/git.md`](docs/git.md) for gates (G0–G4). Docker: `scripts/docker-gi
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, full git (push, large non-shallow clones, protocol
+real Apple Security.framework, full git (push, protocol
 v2), GUI, codesign.
 
 ## Crates

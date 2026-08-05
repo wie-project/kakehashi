@@ -21,11 +21,8 @@ use core::ptr;
 use miniz_oxide::deflate::core::{
     CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
 };
-use miniz_oxide::inflate::TINFLStatus;
-use miniz_oxide::inflate::core::inflate_flags::{
-    TINFL_FLAG_PARSE_ZLIB_HEADER, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-};
-use miniz_oxide::inflate::core::{DecompressorOxide, decompress};
+use miniz_oxide::inflate::stream::{self as mz_stream, InflateState as MzInflateState};
+use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
 use crate::errno;
 use crate::heap::{free, malloc};
@@ -73,17 +70,15 @@ struct DeflateState {
     finished: bool,
 }
 
-struct InflateState {
+/// Owned inflate engine (miniz streaming state with 32 KiB LZ dictionary).
+///
+/// Large (~33 KiB); always heap-allocated via freestanding `malloc`.
+struct KhInflate {
     magic: u32,
-    decomp: DecompressorOxide,
-    finished: bool,
-    /// Full decompressed history (miniz NON_WRAPPING needs prior bytes for
-    /// backrefs). `hist_len` is valid data; capacity is `hist_cap`.
-    hist: *mut u8,
-    hist_cap: usize,
-    hist_len: usize,
-    /// Bytes already copied out to the caller from `hist`.
-    hist_delivered: usize,
+    /// Remembered `window_bits` → raw vs zlib for `inflateReset`.
+    window_bits: c_int,
+    /// miniz streaming decompressor (zlib-wrapped by default).
+    mz: MzInflateState,
 }
 
 fn zstream<'a>(strm: *mut c_void) -> Option<&'a mut ZStream> {
@@ -260,6 +255,64 @@ pub(crate) unsafe extern "C" fn deflateEnd(strm: *mut c_void) -> c_int {
     Z_OK
 }
 
+/// C `deflateReset` → nlist `_deflateReset` (re-init compressor in place).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn deflateReset(strm: *mut c_void) -> c_int {
+    let Some(zs) = zstream(strm) else {
+        return Z_STREAM_ERROR;
+    };
+    if zs.state.is_null() {
+        return Z_STREAM_ERROR;
+    }
+    let st = unsafe { &mut *zs.state.cast::<DeflateState>() };
+    if st.magic != MAGIC_DEFLATE {
+        return Z_STREAM_ERROR;
+    }
+    // Re-create compressor with default mid level (matches git soft reset use).
+    let flags = create_comp_flags_from_zip_params(6, 15, 0);
+    st.comp = CompressorOxide::new(flags);
+    st.finished = false;
+    zs.total_in = 0;
+    zs.total_out = 0;
+    zs.msg = ptr::null_mut();
+    zs.adler = 1;
+    Z_OK
+}
+
+/// C `deflateBound` → soft upper bound (zlib-compatible overestimate).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn deflateBound(
+    _strm: *mut c_void,
+    source_len: u64,
+    _bits: c_int,
+) -> u64 {
+    // zlib: sourceLen + (sourceLen >> 12) + (sourceLen >> 14) + (sourceLen >> 25) + 13
+    source_len
+        .saturating_add(source_len >> 12)
+        .saturating_add(source_len >> 14)
+        .saturating_add(source_len >> 25)
+        .saturating_add(13)
+}
+
+/// C `deflateSetHeader` → soft no-op (gzip header; git uses zlib wrapper).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn deflateSetHeader(
+    _strm: *mut c_void,
+    _head: *mut c_void,
+) -> c_int {
+    Z_OK
+}
+
+fn data_format_from_window_bits(window_bits: c_int) -> DataFormat {
+    // Positive → zlib header; negative → raw DEFLATE; |window| > 15 can select gzip
+    // in real zlib — we only need zlib vs raw for git packs.
+    if window_bits < 0 {
+        DataFormat::Raw
+    } else {
+        DataFormat::Zlib
+    }
+}
+
 /// C `inflateInit_` → nlist `_inflateInit_`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn inflateInit_(
@@ -278,25 +331,21 @@ pub(crate) unsafe extern "C" fn inflateInit2_(
     version: *const c_char,
     stream_size: c_int,
 ) -> c_int {
-    let _ = (version, stream_size, window_bits);
+    let _ = (version, stream_size);
     let Some(zs) = zstream(strm) else {
         return Z_STREAM_ERROR;
     };
-    let raw = unsafe { malloc(core::mem::size_of::<InflateState>()) };
+    let raw = unsafe { malloc(core::mem::size_of::<KhInflate>()) };
     if raw.is_null() {
         errno::set_errno(12);
         return Z_MEM_ERROR;
     }
-    let st = raw.cast::<InflateState>();
+    let st = raw.cast::<KhInflate>();
     unsafe {
-        st.write(InflateState {
+        st.write(KhInflate {
             magic: MAGIC_INFLATE,
-            decomp: DecompressorOxide::new(),
-            finished: false,
-            hist: ptr::null_mut(),
-            hist_cap: 0,
-            hist_len: 0,
-            hist_delivered: 0,
+            window_bits,
+            mz: MzInflateState::new(data_format_from_window_bits(window_bits)),
         });
     }
     zs.state = raw;
@@ -307,142 +356,122 @@ pub(crate) unsafe extern "C" fn inflateInit2_(
     Z_OK
 }
 
-/// Grow inflate history so at least `need` more bytes can be written at `hist_len`.
-fn inflate_hist_reserve(st: &mut InflateState, need: usize) -> bool {
-    let want = st.hist_len.saturating_add(need);
-    if want <= st.hist_cap {
-        return true;
-    }
-    let mut new_cap = st.hist_cap.max(4096);
-    while new_cap < want {
-        new_cap = new_cap.saturating_mul(2);
-        if new_cap > 16 * 1024 * 1024 {
-            return false;
-        }
-    }
-    let new_ptr = if st.hist.is_null() {
-        unsafe { malloc(new_cap) }
-    } else {
-        unsafe { crate::heap::realloc(st.hist.cast(), new_cap) }
-    };
-    if new_ptr.is_null() {
-        return false;
-    }
-    st.hist = new_ptr.cast();
-    st.hist_cap = new_cap;
-    true
-}
-
-/// C `inflate` → nlist `_inflate`.
+/// C `inflateReset` → nlist `_inflateReset`.
+///
+/// Apple git reuses one `z_stream` across pack objects; without a real reset the
+/// second object after `Z_STREAM_END` yields `Z_BUF_ERROR` / data errors mid-pack.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn inflate(strm: *mut c_void, flush: c_int) -> c_int {
-    let _ = flush;
+pub(crate) unsafe extern "C" fn inflateReset(strm: *mut c_void) -> c_int {
     let Some(zs) = zstream(strm) else {
         return Z_STREAM_ERROR;
     };
     if zs.state.is_null() {
         return Z_STREAM_ERROR;
     }
-    let st = unsafe { &mut *zs.state.cast::<InflateState>() };
+    let st = unsafe { &mut *zs.state.cast::<KhInflate>() };
     if st.magic != MAGIC_INFLATE {
         return Z_STREAM_ERROR;
     }
-    if zs.next_out.is_null() || zs.avail_out == 0 {
-        return Z_BUF_ERROR;
+    st.mz.reset(data_format_from_window_bits(st.window_bits));
+    zs.total_in = 0;
+    zs.total_out = 0;
+    zs.msg = ptr::null_mut();
+    zs.adler = 1;
+    Z_OK
+}
+
+/// C `inflate` → nlist `_inflate`.
+///
+/// Uses miniz_oxide's streaming wrapper (32 KiB sliding dictionary + correct
+/// `TINFL_FLAG_HAS_MORE_INPUT` for `MZFlush::None`). Hand-rolled NON_WRAPPING
+/// history failed on Apple git `index-pack` of multi‑MiB packs
+/// (`inflate returned -3` / `-5` at mid-pack offsets).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn inflate(strm: *mut c_void, flush: c_int) -> c_int {
+    let Some(zs) = zstream(strm) else {
+        return Z_STREAM_ERROR;
+    };
+    if zs.state.is_null() {
+        return Z_STREAM_ERROR;
+    }
+    let st = unsafe { &mut *zs.state.cast::<KhInflate>() };
+    if st.magic != MAGIC_INFLATE {
+        return Z_STREAM_ERROR;
+    }
+    if zs.next_out.is_null() && zs.avail_out != 0 {
+        return Z_STREAM_ERROR;
     }
 
-    // First: drain any already-decompressed history into the caller's buffer.
-    let mut produced_to_user = 0_usize;
-    let out_len = zs.avail_out as usize;
-    let output = unsafe { core::slice::from_raw_parts_mut(zs.next_out, out_len) };
-    if st.hist_delivered < st.hist_len {
-        let pending = st.hist_len - st.hist_delivered;
-        let n = pending.min(out_len);
-        if n > 0 && !st.hist.is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(st.hist.add(st.hist_delivered), output.as_mut_ptr(), n);
-            }
-            st.hist_delivered += n;
-            produced_to_user = n;
-            zs.next_out = unsafe { zs.next_out.add(n) };
-            zs.avail_out = zs.avail_out.saturating_sub(n as u32);
-            zs.total_out = zs.total_out.saturating_add(n as u64);
-        }
-        if st.finished && st.hist_delivered >= st.hist_len {
-            return Z_STREAM_END;
-        }
-        if zs.avail_out == 0 {
-            return Z_OK;
-        }
-    } else if st.finished {
-        return Z_STREAM_END;
-    }
-
-    // Decompress more into history (full prior output kept for DEFLATE backrefs).
-    let room = (zs.avail_out as usize).max(256);
-    if !inflate_hist_reserve(st, room) {
-        return Z_MEM_ERROR;
-    }
     let in_len = zs.avail_in as usize;
     let input = if zs.next_in.is_null() || in_len == 0 {
         &[][..]
     } else {
         unsafe { core::slice::from_raw_parts(zs.next_in, in_len) }
     };
-    let hist_slice =
-        unsafe { core::slice::from_raw_parts_mut(st.hist, st.hist_cap) };
-    let flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-    let (status, in_consumed, out_produced) =
-        decompress(&mut st.decomp, input, hist_slice, st.hist_len, flags);
-
-    zs.next_in = if zs.next_in.is_null() {
-        ptr::null_mut()
+    // Empty out buffer: still drive miniz so a finished stream can report
+    // StreamEnd (and so we don't spin forever returning Z_OK).
+    let out_len = zs.avail_out as usize;
+    let output = if zs.next_out.is_null() || out_len == 0 {
+        &mut [][..]
     } else {
-        unsafe { zs.next_in.add(in_consumed) }
+        unsafe { core::slice::from_raw_parts_mut(zs.next_out, out_len) }
     };
-    zs.avail_in = zs.avail_in.saturating_sub(in_consumed as u32);
-    zs.total_in = zs.total_in.saturating_add(in_consumed as u64);
-    st.hist_len = st.hist_len.saturating_add(out_produced);
 
-    // Copy new bytes to user.
-    if st.hist_delivered < st.hist_len && zs.avail_out > 0 {
-        let pending = st.hist_len - st.hist_delivered;
-        let n = pending.min(zs.avail_out as usize);
-        let out_now = unsafe {
-            core::slice::from_raw_parts_mut(zs.next_out, zs.avail_out as usize)
+    // IMPORTANT: Always `MZFlush::None` for miniz streaming.
+    //
+    // Real zlib allows multi-call `inflate(..., Z_FINISH)` while more input is
+    // still being fed (git `index-pack` / `use_pack` windows). miniz maps
+    // `MZFlush::Finish` to "no HAS_MORE_INPUT", which breaks that pattern and
+    // surfaces as `Z_BUF_ERROR` / `Z_DATA_ERROR` mid-pack (e.g. offset 499674).
+    // Stream end is detected via zlib trailer → `MZStatus::StreamEnd`.
+    let _ = flush;
+    let res = mz_stream::inflate(&mut st.mz, input, output, MZFlush::None);
+
+    let consumed = res.bytes_consumed;
+    let written = res.bytes_written;
+    if consumed > 0 {
+        zs.next_in = if zs.next_in.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { zs.next_in.add(consumed) }
         };
-        if n > 0 && !st.hist.is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(st.hist.add(st.hist_delivered), out_now.as_mut_ptr(), n);
-            }
-            st.hist_delivered += n;
-            produced_to_user = produced_to_user.saturating_add(n);
-            zs.next_out = unsafe { zs.next_out.add(n) };
-            zs.avail_out = zs.avail_out.saturating_sub(n as u32);
-            zs.total_out = zs.total_out.saturating_add(n as u64);
-        }
+        zs.avail_in = zs.avail_in.saturating_sub(consumed as u32);
+        zs.total_in = zs.total_in.saturating_add(consumed as u64);
+    }
+    if written > 0 {
+        zs.next_out = unsafe { zs.next_out.add(written) };
+        zs.avail_out = zs.avail_out.saturating_sub(written as u32);
+        zs.total_out = zs.total_out.saturating_add(written as u64);
     }
 
-    match status {
-        TINFLStatus::Done => {
-            st.finished = true;
-            if st.hist_delivered >= st.hist_len {
-                Z_STREAM_END
-            } else {
+    match res.status {
+        Ok(MZStatus::Ok) => Z_OK,
+        Ok(MZStatus::StreamEnd) => Z_STREAM_END,
+        Ok(MZStatus::NeedDict) => {
+            // Git packs do not use preset dictionaries.
+            Z_DATA_ERROR
+        }
+        Err(MZError::Buf) => {
+            // Apple `git index-pack` (builtin/index-pack.c `unpack_entry_data`):
+            //   do { status = git_inflate(&stream, 0); ... } while (status == Z_OK);
+            //   if (status != Z_STREAM_END) bad_object(..., status);
+            // It does **not** continue on Z_BUF_ERROR (unlike packfile.c).
+            // So "need more input" must be Z_OK, not Z_BUF_ERROR, or small
+            // OFS_DELTA objects die with `inflate returned -5` mid-pack.
+            if consumed > 0 || written > 0 || in_len == 0 {
                 Z_OK
+            } else {
+                // Input was available but miniz made zero progress → corrupt.
+                crate::trace::force_note(b"[kh] inflate Buf with unread input\n");
+                Z_DATA_ERROR
             }
         }
-        TINFLStatus::NeedsMoreInput | TINFLStatus::HasMoreOutput => {
-            if produced_to_user == 0 && in_consumed == 0 && out_produced == 0 {
-                Z_BUF_ERROR
-            } else {
-                Z_OK
-            }
+        Err(MZError::Data) => {
+            crate::trace::force_note(b"[kh] inflate MZError::Data\n");
+            Z_DATA_ERROR
         }
-        TINFLStatus::Failed
-        | TINFLStatus::FailedCannotMakeProgress
-        | TINFLStatus::BadParam
-        | TINFLStatus::Adler32Mismatch => Z_DATA_ERROR,
+        Err(MZError::Mem) => Z_MEM_ERROR,
+        Err(MZError::Stream | MZError::Param | _) => Z_STREAM_ERROR,
     }
 }
 
@@ -453,17 +482,14 @@ pub(crate) unsafe extern "C" fn inflateEnd(strm: *mut c_void) -> c_int {
         return Z_STREAM_ERROR;
     };
     if !zs.state.is_null() {
-        let st = unsafe { &mut *zs.state.cast::<InflateState>() };
+        let st = unsafe { &mut *zs.state.cast::<KhInflate>() };
         if st.magic != MAGIC_INFLATE {
             return Z_STREAM_ERROR;
         }
-        if !st.hist.is_null() {
-            unsafe {
-                free(st.hist.cast());
-            }
-            st.hist = ptr::null_mut();
-        }
+        st.magic = 0;
+        // Drop MzInflateState then free the allocation.
         unsafe {
+            ptr::drop_in_place(st);
             free(zs.state);
         }
         zs.state = ptr::null_mut();
@@ -544,4 +570,35 @@ pub(crate) unsafe extern "C" fn zError(err: c_int) -> *const c_char {
         _ => b"unknown error\0",
     };
     s.as_ptr().cast()
+}
+
+/// Inflate zlib-wrapped (preferred) or raw DEFLATE into a freestanding `malloc` buffer.
+///
+/// Used by freestanding libcurl when git claims `Content-Encoding: gzip` but
+/// actually emits a **zlib** wrapper (not true gzip). Caller must `free` the
+/// returned pointer. Cap: 64 MiB decoded.
+pub(crate) fn inflate_to_malloc(src: &[u8]) -> Option<(*mut u8, usize)> {
+    use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib_with_limit};
+
+    const MAX_OUT: usize = 64 * 1024 * 1024;
+    if src.is_empty() {
+        return None;
+    }
+    let decoded = match decompress_to_vec_zlib_with_limit(src, MAX_OUT) {
+        Ok(v) => v,
+        // Raw DEFLATE fallback (no zlib header).
+        Err(_) => match decompress_to_vec(src) {
+            Ok(v) if v.len() <= MAX_OUT => v,
+            _ => return None,
+        },
+    };
+    let n = decoded.len();
+    let p = unsafe { malloc(n.max(1)) }.cast::<u8>();
+    if p.is_null() {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(decoded.as_ptr(), p, n);
+    }
+    Some((p, n))
 }

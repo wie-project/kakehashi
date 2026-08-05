@@ -28,6 +28,10 @@ flate2 = { workspace = true }
 liblzma = { workspace = true }
 # Host-side POSIX-ish regex for freestanding `regcomp`/`regexec` helpers (G4 git).
 regex = { version = "1", default-features = false, features = ["std", "unicode-case"] }
+# Host TLS for freestanding libcurl socket path (`KH_HELPER_TLS_CONNECT`).
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [lints]
 workspace = true

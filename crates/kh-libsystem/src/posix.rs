@@ -805,6 +805,36 @@ pub(crate) unsafe extern "C" fn getpgrp() -> c_int {
     ret_c_int(unsafe { sys::syscall0(SYS_GETPGRP) })
 }
 
+/// C `getpgid` → nlist `_getpgid` (pid 0 → self).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpgid(pid: c_int) -> c_int {
+    if pid == 0 {
+        return unsafe { getpgrp() };
+    }
+    // Soft: no full process table; treat as own group if positive pid.
+    if pid < 0 {
+        errno::set_errno(3); // ESRCH
+        return -1;
+    }
+    // Best-effort: return the pid as pgid (single-session bottle).
+    pid
+}
+
+/// C `tcgetpgrp` → soft: report session group (no real tty).
+///
+/// Observed: Apple `git index-pack -v` probes controlling-terminal pgrp.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tcgetpgrp(_fd: c_int) -> c_int {
+    // Same as getpgrp when there is no guest tty association.
+    unsafe { getpgrp() }
+}
+
+/// C `tcsetpgrp` → soft success (no guest tty).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn tcsetpgrp(_fd: c_int, _pgrp: c_int) -> c_int {
+    0
+}
+
 /// C `kill` → nlist `_kill`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn kill(pid: c_int, sig: c_int) -> c_int {

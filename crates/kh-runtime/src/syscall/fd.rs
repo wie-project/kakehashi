@@ -130,7 +130,11 @@ fn open_fail(name: &'static str, path: &str, why: &str) -> SyscallResult {
         .raw_os_error()
         .unwrap_or(libc::ENOENT);
     let darwin = map_open_errno(host_err);
-    log_open_fail(path, &format!("{why} host_errno={host_err} darwin={darwin}"));
+    log_open_fail(
+        path,
+        host_err,
+        &format!("{why} host_errno={host_err} darwin={darwin}"),
+    );
     SyscallResult::err(name, darwin)
 }
 
@@ -170,6 +174,7 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
         if first_err == libc::EEXIST || excl {
             log_open_fail(
                 path,
+                first_err,
                 &format!("openat host_errno={first_err} darwin={}", map_open_errno(first_err)),
             );
             return SyscallResult::err(name, map_open_errno(first_err));
@@ -178,7 +183,7 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     }
 
     let Ok(host_path) = translate_path(path) else {
-        log_open_fail(path, "ENOENT(translate)");
+        log_open_fail(path, libc::ENOENT, "ENOENT(translate)");
         return SyscallResult::err(name, ENOENT);
     };
     let Ok(c_path) = std::ffi::CString::new(host_path.as_os_str().as_encoded_bytes()) else {
@@ -206,6 +211,7 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     if first_err == libc::EEXIST || excl {
         log_open_fail(
             path,
+            first_err,
             &format!("open host_errno={first_err} darwin={}", map_open_errno(first_err)),
         );
         return SyscallResult::err(name, map_open_errno(first_err));
@@ -213,8 +219,15 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     open_fail(name, path, "open")
 }
 
-fn log_open_fail(path: &str, why: &str) {
-    tracing::warn!(path, why, "open fail");
+/// Log open failures. **ENOENT / EEXIST are expected** (git probes missing
+/// objects, templates, attrs) — at default `warn` they flooded Docker logs
+/// (~thousands/sec on monorepo clone) and crushed throughput via virtiofs.
+fn log_open_fail(path: &str, host_err: i32, why: &str) {
+    if host_err == libc::ENOENT || host_err == libc::EEXIST {
+        tracing::debug!(path, why, "open fail");
+    } else {
+        tracing::warn!(path, why, "open fail");
+    }
 }
 
 /// Create intermediate directories for a bottle-relative path (`a/b` → `mkdirat a`).
@@ -251,6 +264,8 @@ pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
     }
     // Drop readdir stream before releasing the host FD.
     process::with_mut(|p| p.close_dir_stream(gfd));
+    // Drop rustls session before closing the wire socket.
+    let _ = crate::tls_fd::take_tls(gfd);
     match take_guest_fd(gfd) {
         Some(hfd) => {
             host::close_fd(hfd);
