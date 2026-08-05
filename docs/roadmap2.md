@@ -50,8 +50,9 @@ This rewrite is **process-first**. Ideas are secondary and gated.
 | --- | --- |
 | Guest ARM64 runs **natively** (no emulator / JIT) | Wall tax = **boundary × crossings** + real guest work |
 | Production entry = freestanding **hypercall** (TLS switch, host alt stack, full Q0–Q31 prolog + tramp, Rust dispatch) | Every BSD syscall / helper has a high fixed floor |
-| UTM multi-file `7zz` (~8k / ~240 MiB, `mx=5 mmt=4`) ≈ **×5.2** vs native Linux `7zz` | Dominated by **path walk + per-crossing boundary**, not “wrong LZMA” |
-| Few-file compression often ≈ **×1.1–1.2** | Trampoline polish alone will not close the multi-file gap |
+| UTM multi-file `7zz` (~14.5k / ~309 MiB, `mx=5 mmt=4`) ≈ **×1.24** vs native Linux `7zz` | Residual ≈ boundary × crossings + real LZMA (post size-class freelist) |
+| Historical multi-file was ≈ **×5.2** (~8k / ~240 MiB) | Freestanding first-fit freelist O(n²); **fixed** by size-class LIFO |
+| Few-file compression often ≈ **×1.1–1.3** | Multi-file is no longer an outlier order-of-magnitude tax |
 | I/O hot path already: lock-free FD, direct host I/O, `check_range` last-hit | Do not “optimize” read/write by adding locks or copies |
 
 ### Already banked (do not re-litigate)
@@ -68,6 +69,7 @@ This rewrite is **process-first**. Ideas are secondary and gated.
 | Contended-bit futex mutex / cond (F1/F1c) | Large MT lock win banked |
 | Batch bind/rebase mprotect (A5) | Load-time only |
 | Release LTO, `codegen-units=1`, strip | Host binary tuned |
+| Freestanding size-class freelist | Multi-file wall ~×5.2 → ~×1.24; plate-A avg_walk ~3000 → ~1–2 |
 
 ### Forbidden prototypes (do not re-land)
 
@@ -267,11 +269,12 @@ not regressed beyond noise; plate C / MT gate green; stats-off tax ~0.
 | ID | Work | Preconditions |
 | --- | --- | --- |
 | **S5** | Narrow park/wake entry (or proven equivalent) | (1) Phase 0–2 done or consciously deferred; (2) plate C + futex + boundary stats show park/wake dominate **product** wall; (3) design note vs invariants 12–16; (4) still host TPIDR; full NEON if any host `bl` can clobber SIMD; (5) **not** a second general BSD path |
-| **D1** | Dispatch jump table / denser hot numbers | Only with host-side ns or plate proof; never alone as “×5 fix” |
+| **D1** | Dispatch jump table / denser hot numbers | Only with host-side ns or plate proof; never alone as “close ×1.2→×1.0” |
 | **D2** | `check_range` miss-path structure | Only if P2 shows miss walks hot |
 
 **Default recommendation:** do **not** start Phase 3 until plate A residual is
-understood after Phase 2. Multi-file ×5 is usually **count**, not park.
+understood after Phase 2. Multi-file residual after the freelist fix is usually
+**count × boundary floor** + guest work, not park.
 
 ### Explicitly deferred / rejected as first moves
 
@@ -320,12 +323,12 @@ understood after Phase 2. Multi-file ×5 is usually **count**, not park.
 | Workload | Plausible goal | Not a near-term goal |
 | --- | --- | --- |
 | Few-file compress (B) | hold ~×1.1–1.3 | ×1.0 |
-| Multi-file chatty (A) | cut FS crossing share (e.g. part of ×5 → mid-×3s) with F3/F1\* | ×1–2 via trampoline polish alone |
+| Multi-file (product / UTM) | hold ~×1.2–1.4; optional F3/F1\* if plate A still chatty | ×1.0 via trampoline polish alone |
 | MT locks (C) | F1 already banked; S5 only if residual | “another futex rewrite” without stats |
 
-Product note: ×5 on Linux aarch64 can still beat scarce macOS CI cost
-(root README). Perf work is optional relative to **git** surface unless a
-specific job is boundary-bound.
+Product note: ~×1.2 on Linux aarch64 already beats scarce macOS CI cost by a
+wide margin (root README). Perf work is optional relative to **git** surface
+unless a specific job is boundary-bound.
 
 ---
 

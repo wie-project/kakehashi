@@ -144,4 +144,4 @@ relative paths, `..`, or missing dirfd.
 - [Threading](threading.md)
 - [Invariants](invariants.md)
 - [Architecture](architecture.md)
-- [Roadmap](roadmap.md) — residual boundary tax / perf plateau
+- [Roadmap](roadmap.md) — multi-file ~×1.24 plateau; residual boundary tax
