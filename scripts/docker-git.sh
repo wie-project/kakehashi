@@ -79,6 +79,10 @@ else
 fi
 "$KH" bottle ensure
 "$KH" install xcode-tools
+
+"$KH" run git -- config --global user.email "kh@test.io"
+"$KH" run git -- config --global user.name "Vladislav"
+
 exec "$KH" run git -- "$@"
 ' -- ${GUEST_ARGS[@]+"${GUEST_ARGS[@]}"}
 rc=$?
