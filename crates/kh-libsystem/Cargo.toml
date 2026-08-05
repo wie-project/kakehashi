@@ -23,6 +23,9 @@ bench = false
 [dependencies]
 # Pure Rust DEFLATE for freestanding zlib (Apple git object store).
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# Note: do **not** add regex-automata here — workspace feature-unification with
+# tracing-subscriber/matchers enables its `std` feature and collides with our
+# freestanding `#[panic_handler]`. POSIX regex is host-side (`KH_HELPER_REG*`).
 
 [build-dependencies]
 cc = "1.2"

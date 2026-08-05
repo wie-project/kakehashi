@@ -113,7 +113,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // `git config --global` (and `~/.gitconfig`) is visible to Apple git under
     // `kh run`. Fall back to bottle `/var/root` when host HOME is unset/odd.
     let home = guest_home_env();
-    let env_owned = [
+    // Base env + host `GIT_*` (nested re-exec of git-remote-* inherits
+    // `GIT_DIR` / `GIT_OBJECT_DIRECTORY` via inject_kh_env → host environ).
+    // Without this, clone dies: "remote-curl: fetch attempted without a local repo".
+    let mut env_owned = vec![
         // git-core first so `execvp("git-remote-https")` finds CLT helpers (G4).
         "PATH=/Library/Developer/CommandLineTools/usr/libexec/git-core:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -121,6 +124,16 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         home,
         "TMPDIR=/tmp".to_owned(),
     ];
+    for (k, v) in std::env::vars() {
+        if !k.starts_with("GIT_") || k.contains('\0') || v.contains('\0') {
+            continue;
+        }
+        // Soft-cap: skip absurdly large values.
+        if k.len().saturating_add(v.len()) > 512 {
+            continue;
+        }
+        env_owned.push(format!("{k}={v}"));
+    }
     let env_refs: Vec<&str> = env_owned.iter().map(String::as_str).collect();
 
     let stack_base = stack.guest_addr;

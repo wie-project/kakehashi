@@ -91,9 +91,9 @@ pub(crate) fn ensure_url(url: &str, dest: &Path) -> Result<(), CacheError> {
     let len = tmp.metadata()?.len();
     if len < 4096 {
         let head = fs::read(&tmp).unwrap_or_default();
-        let looks_html = head.windows(5).any(|w| {
-            w.eq_ignore_ascii_case(b"<html") || w.eq_ignore_ascii_case(b"<!doc")
-        });
+        let looks_html = head
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"<html") || w.eq_ignore_ascii_case(b"<!doc"));
         if looks_html {
             drop(fs::remove_file(&tmp));
             return Err(CacheError::Command(format!(
@@ -119,21 +119,12 @@ pub(crate) fn download_url(url: &str, dest: &Path) -> Result<(), CacheError> {
     }
 
     let status = Command::new("curl")
-        .args([
-            "-fL",
-            "--retry",
-            "3",
-            "--continue-at",
-            "-",
-            "-o",
-        ])
+        .args(["-fL", "--retry", "3", "--continue-at", "-", "-o"])
         .arg(dest)
         .arg(url)
         .status()
         .map_err(|e| {
-            CacheError::Command(format!(
-                "download failed: need host curl ({e}); url={url}"
-            ))
+            CacheError::Command(format!("download failed: need host curl ({e}); url={url}"))
         })?;
     if status.success() {
         return Ok(());
@@ -193,11 +184,7 @@ mod tests {
     fn unique(prefix: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "kh-cache-{}-{}-{n}",
-            prefix,
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("kh-cache-{}-{}-{n}", prefix, std::process::id()))
     }
 
     #[test]

@@ -1394,7 +1394,8 @@ fn soft_env_rebuild_environ() {
     }
 }
 
-/// Seed PATH/HOME/TMPDIR to match the loader stack env (execute.rs).
+/// Seed PATH/HOME/TMPDIR to match the loader stack env (execute.rs), plus
+/// host `GIT_*` (clone nested re-exec: `GIT_DIR` must reach git-remote-http).
 fn soft_env_seed_defaults() {
     // SAFETY: one-shot seed before guest walks environ.
     unsafe {
@@ -1431,7 +1432,64 @@ fn soft_env_seed_defaults() {
     ] {
         let _ = unsafe { soft_env_set(name.as_ptr().cast(), val.as_ptr().cast(), 1) };
     }
+    // Nested `kh run` after `execve` inherits host env with GIT_* from the
+    // parent guest's soft environ (inject_kh_env). Pull them in so `getenv`
+    // / `environ` walks see `GIT_DIR` (required for clone fetch).
+    soft_env_seed_git_from_host();
     soft_env_rebuild_environ();
+}
+
+/// Pull common `GIT_*` keys from the host process into soft environ.
+fn soft_env_seed_git_from_host() {
+    // Keys git-remote-http / clone set before spawning helpers.
+    const KEYS: &[&[u8]] = &[
+        b"GIT_DIR\0",
+        b"GIT_WORK_TREE\0",
+        b"GIT_OBJECT_DIRECTORY\0",
+        b"GIT_ALTERNATE_OBJECT_DIRECTORIES\0",
+        b"GIT_COMMON_DIR\0",
+        b"GIT_NAMESPACE\0",
+        b"GIT_EXEC_PATH\0",
+        b"GIT_PROTOCOL\0",
+        b"GIT_CONFIG_PARAMETERS\0",
+        b"GIT_CONFIG_COUNT\0",
+        b"GIT_CONFIG_GLOBAL\0",
+        b"GIT_CONFIG_SYSTEM\0",
+        b"GIT_HTTP_USER_AGENT\0",
+        b"GIT_SSL_NO_VERIFY\0",
+        b"GIT_SSL_CAINFO\0",
+        b"GIT_CURL_VERBOSE\0",
+        b"GIT_TRACE\0",
+        b"GIT_TRACE_PACKET\0",
+        b"GIT_TRACE_CURL\0",
+        b"GIT_TERMINAL_PROMPT\0",
+        b"GIT_ASKPASS\0",
+        b"GIT_QUARANTINE_PATH\0",
+        b"GIT_DEFAULT_HASH\0",
+        b"GIT_SHALLOW_FILE\0",
+    ];
+    let mut val_buf = [0_u8; SOFT_ENV_WIDTH];
+    for key in KEYS {
+        let key_ptr = key.as_ptr();
+        let n = unsafe {
+            sys::helper3(
+                crate::KH_HELPER_GETENV,
+                u64::try_from(key_ptr.addr()).unwrap_or(0),
+                u64::try_from(val_buf.as_mut_ptr().addr()).unwrap_or(0),
+                u64::try_from(val_buf.len()).unwrap_or(0),
+            )
+        };
+        if n <= 1 {
+            continue;
+        }
+        let _ = unsafe {
+            soft_env_set(
+                key.as_ptr().cast(),
+                val_buf.as_ptr().cast(),
+                1,
+            )
+        };
+    }
 }
 
 /// Internal setenv without re-seeding (used by seed + public setenv).

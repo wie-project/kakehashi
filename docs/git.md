@@ -14,7 +14,7 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
 | G2 | Missing surface from probes | **in progress** (HTTPS helper / freestanding libcurl) |
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
-| G4 | Remote over HTTPS (reuse curl network path) | **in progress** (`ls-remote` pass; clone open) |
+| G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote` + shallow `clone`) |
 
 ### G4 notes (HTTPS / freestanding libcurl)
 
@@ -37,6 +37,7 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | Helper `list` (protocol v0/v1) | **pass** — refs from GitHub |
 | Host HTTP helper + body + `Content-Type` | **pass** |
 | `git ls-remote https://…` (spawned helper) | **pass** (Docker; protocol v1) |
+| `git clone --depth 1 https://…` | **pass** (Docker; working tree + objects) |
 
 ```text
 # capabilities
@@ -50,9 +51,13 @@ printf 'list\n\n' | kh run …/git-remote-http -- origin https://github.com/octo
 # full spawn path
 kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 # → 7fd1a60b…\tHEAD / 7fd1a60b…\trefs/heads/master / …
+
+# shallow clone
+kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
+# → exit 0; hw/README present
 ```
 
-**Fixes landed for G4 list / ls-remote:**
+**Fixes landed for G4 (list / ls-remote / clone):**
 
 1. **Apple arm64 varargs** — `curl_easy_setopt` / `curl_easy_getinfo` are
    `...` APIs; Darwin places the value on the **stack**, not in `x2`. C wrappers
@@ -76,13 +81,21 @@ kh run git -- ls-remote https://github.com/octocat/Hello-World.git
    (`/Volumes/linux/Volumes/linux/…` broke `~/.gitconfig` / `protocol.version`).
 7. **Guest `PATH`** — include CLT `…/libexec/git-core` so `execvp(git-remote-https)`
    finds the helper.
+8. **POSIX `regcomp`/`regexec`** — freestanding C ABI + host helpers
+   (`KH_HELPER_REG*`, host `regex` crate). In-dylib `regex-automata` was
+   dropped: workspace feature-unification with `tracing-subscriber` enabled
+   its `std` feature and collided with freestanding `#[panic_handler]`.
+9. **`GIT_*` env pass-through** — nested `kh run` after re-exec must seed
+   soft environ + stack with host `GIT_DIR` / friends (`KH_HELPER_GETENV`);
+   without this: `remote-curl: fetch attempted without a local repo`.
+10. **`setitimer`/`getitimer` soft stubs** — clone progress ticker mid-checkout.
 
-**Still open for full G4:** `clone` / fetch pack transfer, protocol v2
-`stateless-connect`. Prefer `protocol.version=1` in guest `~/.gitconfig` until
-v2 RPC is complete.
+**Polish / still open:** full (non-shallow) clone of large repos, protocol v2
+`stateless-connect`, push. Prefer `protocol.version=1` in guest `~/.gitconfig`
+until v2 RPC is complete.
 
-Local G3 without the remote helper remains green. Curl options **tier1** is
-green again after the `fcntl` varargs fix.
+Local G3 remains green. Curl options **tier1** is green after the `fcntl`
+varargs fix.
 
 ### G3 notes (path, uid, zlib, printf)
 

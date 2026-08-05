@@ -708,3 +708,30 @@ pub(crate) unsafe extern "C" fn FSEventStreamSetDispatchQueue(
     _queue: *mut c_void,
 ) {
 }
+
+// ── timers (git progress / clone) ───────────────────────────────────────────
+
+/// C `setitimer` → soft success (no real interval timers).
+///
+/// Apple `git` clone uses this for the progress ticker; missing export was a
+/// hard trampoline exit mid-checkout (`index.lock` left behind).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setitimer(
+    _which: c_int,
+    _value: *const c_void,
+    _ovalue: *mut c_void,
+) -> c_int {
+    0
+}
+
+/// C `getitimer` → zeroed soft success.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getitimer(_which: c_int, value: *mut c_void) -> c_int {
+    if !value.is_null() {
+        // struct itimerval { timeval it_interval; timeval it_value; } — 32 bytes on arm64.
+        unsafe {
+            core::ptr::write_bytes(value.cast::<u8>(), 0, 32);
+        }
+    }
+    0
+}

@@ -225,6 +225,25 @@ pub(crate) const KH_HELPER_HEAP_STATS_ON: u32 = KH_HELPER_BASE | 0x0B;
 /// success; negative errno-ish on failure.
 pub(crate) const KH_HELPER_HTTP: u32 = KH_HELPER_BASE | 0x0C;
 
+/// Host `getenv` for freestanding soft-env seed (nested `GIT_*` after re-exec).
+///
+/// `x0` = key C string VA, `x1` = out buffer VA, `x2` = capacity (incl. NUL).
+/// Returns byte length **including** NUL when found; `0` if unset / too long.
+pub(crate) const KH_HELPER_GETENV: u32 = KH_HELPER_BASE | 0x0D;
+
+/// Host `regcomp` — `x0` = pattern C string, `x1` = Darwin cflags,
+/// `x2` = out guest VA of two `u64`s: `[handle, re_nsub]`.
+/// Returns `0` or a positive Darwin `REG_*` code (not errno carry).
+pub(crate) const KH_HELPER_REGCOMP: u32 = KH_HELPER_BASE | 0x0E;
+
+/// Host `regexec` — `x0` = guest VA of packed request
+/// `{handle, string, nmatch, pmatch, eflags}` (5×`u64` LE).
+/// Returns `0` / `REG_NOMATCH` / other `REG_*`.
+pub(crate) const KH_HELPER_REGEXEC: u32 = KH_HELPER_BASE | 0x0F;
+
+/// Host `regfree` — `x0` = handle from `REGCOMP`.
+pub(crate) const KH_HELPER_REGFREE: u32 = KH_HELPER_BASE | 0x10;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -253,6 +272,10 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_GUEST_HOME => handle_guest_home(args),
         KH_HELPER_HEAP_STATS_ON => handle_heap_stats_on(),
         KH_HELPER_HTTP => handle_http(args),
+        KH_HELPER_GETENV => handle_getenv(args),
+        KH_HELPER_REGCOMP => handle_regcomp(args),
+        KH_HELPER_REGEXEC => handle_regexec(args),
+        KH_HELPER_REGFREE => handle_regfree(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
 }
@@ -594,6 +617,300 @@ fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
         name,
         u64::try_from(out.len()).unwrap_or(0),
     )
+}
+
+fn handle_getenv(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_getenv";
+    let key_ptr = args.x0;
+    let out_ptr = args.x1;
+    let Ok(cap) = usize::try_from(args.x2) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if key_ptr == 0 || !registry_check_range(key_ptr, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(key) = crate::bottle::read_c_string(key_ptr, 256) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    if key.is_empty() || key.contains('\0') {
+        return SyscallResult::err(name, EINVAL);
+    }
+    let Ok(val) = std::env::var(&key) else {
+        return SyscallResult::ok(name, 0);
+    };
+    if val.contains('\0') {
+        return SyscallResult::ok(name, 0);
+    }
+    let bytes = val.as_bytes();
+    if out_ptr == 0 || cap == 0 || !registry_check_range(out_ptr, cap, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    if bytes.len().saturating_add(1) > cap {
+        // Too long — treat as missing so guest does not get a truncated path.
+        return SyscallResult::ok(name, 0);
+    }
+    let mut out = vec![0_u8; bytes.len().saturating_add(1)];
+    if let Some(dst) = out.get_mut(..bytes.len()) {
+        dst.copy_from_slice(bytes);
+    }
+    guest_write(out_ptr, &out);
+    SyscallResult::ok(name, u64::try_from(out.len()).unwrap_or(0))
+}
+
+// ── Host POSIX-ish regex (for freestanding regcomp/regexec) ─────────────────
+
+/// Darwin `REG_*` (cflags / errors) — must match freestanding `regex_posix.rs`.
+const DARWIN_REG_EXTENDED: i32 = 1;
+const DARWIN_REG_ICASE: i32 = 2;
+const DARWIN_REG_NOSUB: i32 = 4;
+const DARWIN_REG_NEWLINE: i32 = 8;
+const DARWIN_REG_STARTEND: i32 = 4;
+const DARWIN_REG_NOMATCH: u64 = 1;
+const DARWIN_REG_BADPAT: u64 = 2;
+const DARWIN_REG_INVARG: u64 = 16;
+const DARWIN_REG_ESPACE: u64 = 12;
+
+struct HostRegex {
+    re: regex::Regex,
+    nosub: bool,
+}
+
+fn regex_table() -> &'static std::sync::Mutex<Vec<Option<HostRegex>>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<Option<HostRegex>>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Count capturing groups in a rust-style pattern (unescaped `(`).
+fn count_groups(pat: &str) -> usize {
+    let mut n = 0_usize;
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let _ = chars.next();
+            continue;
+        }
+        if c == '(' && chars.peek() != Some(&'?') {
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+/// Minimal BRE → rust-regex (subset used by git pathspecs).
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing
+)]
+fn bre_to_rust(bre: &str) -> String {
+    let mut out = String::with_capacity(bre.len().saturating_mul(2));
+    let bytes = bre.as_bytes();
+    let mut i = 0_usize;
+    while i < bytes.len() {
+        let Some(&b) = bytes.get(i) else {
+            break;
+        };
+        if b == b'\\'
+            && let Some(&n) = bytes.get(i.saturating_add(1))
+        {
+            match n {
+                b'(' | b')' | b'+' | b'?' | b'|' | b'{' | b'}' => {
+                    out.push(char::from(n));
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                _ => {
+                    out.push('\\');
+                    out.push(char::from(n));
+                    i = i.saturating_add(2);
+                    continue;
+                }
+            }
+        }
+        match b {
+            b'(' | b')' | b'+' | b'?' | b'|' | b'{' | b'}' => {
+                out.push('\\');
+                out.push(char::from(b));
+            }
+            _ => out.push(char::from(b)),
+        }
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_regcomp";
+    let pat_ptr = args.x0;
+    let cflags = i32::try_from(args.x1.cast_signed()).unwrap_or(0);
+    let out_ptr = args.x2;
+    if pat_ptr == 0 || !registry_check_range(pat_ptr, 1, false) {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    }
+    if out_ptr == 0 || !registry_check_range(out_ptr, 16, true) {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    }
+    let Some(pat) = crate::bottle::read_c_string(pat_ptr, 1 << 16) else {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    };
+    let is_ere = cflags & DARWIN_REG_EXTENDED != 0;
+    let mut rust_pat = if is_ere {
+        pat
+    } else {
+        bre_to_rust(&pat)
+    };
+    let nsub = count_groups(&rust_pat);
+    if cflags & DARWIN_REG_NEWLINE != 0 {
+        rust_pat.insert_str(0, "(?m)");
+    }
+    if cflags & DARWIN_REG_ICASE != 0 {
+        rust_pat.insert_str(0, "(?i)");
+    }
+    let Ok(re) = regex::Regex::new(&rust_pat) else {
+        return SyscallResult::ok(name, DARWIN_REG_BADPAT);
+    };
+    let nosub = cflags & DARWIN_REG_NOSUB != 0;
+    let host = HostRegex { re, nosub };
+    let handle = {
+        let Ok(mut table) = regex_table().lock() else {
+            return SyscallResult::ok(name, DARWIN_REG_ESPACE);
+        };
+        // Find free slot; handles are 1-based indices.
+        if let Some((idx, slot)) = table.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
+            *slot = Some(host);
+            u64::try_from(idx.saturating_add(1)).unwrap_or(1)
+        } else {
+            table.push(Some(host));
+            u64::try_from(table.len()).unwrap_or(1)
+        }
+    };
+    let nsub_out = if nosub {
+        0_u64
+    } else {
+        u64::try_from(nsub).unwrap_or(0)
+    };
+    let mut words = [0_u8; 16];
+    if let Some(dst) = words.get_mut(..8) {
+        dst.copy_from_slice(&handle.to_le_bytes());
+    }
+    if let Some(dst) = words.get_mut(8..) {
+        dst.copy_from_slice(&nsub_out.to_le_bytes());
+    }
+    guest_write(out_ptr, &words);
+    SyscallResult::ok(name, 0)
+}
+
+fn handle_regexec(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_regexec";
+    let req_ptr = args.x0;
+    if req_ptr == 0 || !registry_check_range(req_ptr, 40, false) {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    }
+    let raw = guest_slice(req_ptr, 40);
+    let mut words = [0_u64; 5];
+    for (i, w) in words.iter_mut().enumerate() {
+        let off = i.saturating_mul(8);
+        if let Some(chunk) = raw.get(off..off.saturating_add(8)) {
+            let mut b = [0_u8; 8];
+            b.copy_from_slice(chunk);
+            *w = u64::from_le_bytes(b);
+        }
+    }
+    let handle = words.first().copied().unwrap_or(0);
+    let string_va = words.get(1).copied().unwrap_or(0);
+    let nmatch = usize::try_from(words.get(2).copied().unwrap_or(0)).unwrap_or(0);
+    let pmatch_va = words.get(3).copied().unwrap_or(0);
+    let eflags = i32::try_from(words.get(4).copied().unwrap_or(0).cast_signed()).unwrap_or(0);
+
+    if handle == 0 || string_va == 0 || !registry_check_range(string_va, 1, false) {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    }
+    let Some(hay_owned) = crate::bottle::read_c_string(string_va, 1 << 20) else {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    };
+
+    let Ok(table) = regex_table().lock() else {
+        return SyscallResult::ok(name, DARWIN_REG_ESPACE);
+    };
+    let idx = usize::try_from(handle.saturating_sub(1)).unwrap_or(usize::MAX);
+    let Some(Some(host)) = table.get(idx) else {
+        return SyscallResult::ok(name, DARWIN_REG_INVARG);
+    };
+
+    // REG_STARTEND: search window in pmatch[0] (byte offsets into string).
+    let (hay, base_off) = if eflags & DARWIN_REG_STARTEND != 0 {
+        if pmatch_va == 0 || !registry_check_range(pmatch_va, 16, true) {
+            return SyscallResult::ok(name, DARWIN_REG_INVARG);
+        }
+        let pm = guest_slice(pmatch_va, 16);
+        let so = i64::from_le_bytes(pm.get(..8).and_then(|c| c.try_into().ok()).unwrap_or([0; 8]));
+        let eo = i64::from_le_bytes(
+            pm.get(8..16)
+                .and_then(|c| c.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
+        if so < 0 || eo < so {
+            return SyscallResult::ok(name, DARWIN_REG_INVARG);
+        }
+        let so_u = usize::try_from(so).unwrap_or(0);
+        let eo_u = usize::try_from(eo).unwrap_or(0);
+        if eo_u > hay_owned.len() {
+            return SyscallResult::ok(name, DARWIN_REG_INVARG);
+        }
+        (
+            hay_owned.get(so_u..eo_u).unwrap_or("").to_owned(),
+            so,
+        )
+    } else {
+        (hay_owned, 0_i64)
+    };
+
+    let Some(caps) = host.re.captures(&hay) else {
+        return SyscallResult::ok(name, DARWIN_REG_NOMATCH);
+    };
+
+    if !host.nosub && nmatch > 0 && pmatch_va != 0 {
+        let bytes_need = nmatch.saturating_mul(16);
+        if registry_check_range(pmatch_va, bytes_need, true) {
+            let mut buf = vec![0_u8; bytes_need];
+            for i in 0..nmatch {
+                let (so, eo) = if let Some(m) = caps.get(i) {
+                    (
+                        base_off.saturating_add(i64::try_from(m.start()).unwrap_or(0)),
+                        base_off.saturating_add(i64::try_from(m.end()).unwrap_or(0)),
+                    )
+                } else {
+                    (-1_i64, -1_i64)
+                };
+                let off = i.saturating_mul(16);
+                if let Some(dst) = buf.get_mut(off..off.saturating_add(16)) {
+                    if let Some(lo) = dst.get_mut(..8) {
+                        lo.copy_from_slice(&so.to_le_bytes());
+                    }
+                    if let Some(hi) = dst.get_mut(8..) {
+                        hi.copy_from_slice(&eo.to_le_bytes());
+                    }
+                }
+            }
+            guest_write(pmatch_va, &buf);
+        }
+    }
+    SyscallResult::ok(name, 0)
+}
+
+fn handle_regfree(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_regfree";
+    let handle = args.x0;
+    if handle == 0 {
+        return SyscallResult::ok(name, 0);
+    }
+    if let Ok(mut table) = regex_table().lock() {
+        let idx = usize::try_from(handle.saturating_sub(1)).unwrap_or(usize::MAX);
+        if let Some(slot) = table.get_mut(idx) {
+            *slot = None;
+        }
+    }
+    SyscallResult::ok(name, 0)
 }
 
 fn handle_verify_cert(args: SyscallArgs) -> SyscallResult {

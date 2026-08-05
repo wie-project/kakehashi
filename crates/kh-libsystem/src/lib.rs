@@ -45,6 +45,7 @@ mod net;
 mod posix;
 mod process;
 mod pthread;
+mod regex_posix;
 mod rtti;
 mod stdio;
 mod string;
@@ -114,6 +115,14 @@ pub const KH_HELPER_GUEST_HOME: u32 = 0x4B48_000A;
 pub const KH_HELPER_HEAP_STATS_ON: u32 = 0x4B48_000B;
 /// Host-helper id: HTTP(S) perform for freestanding libcurl (`KhHttpReq` in guest).
 pub const KH_HELPER_HTTP: u32 = 0x4B48_000C;
+/// Host-helper id: host `getenv` into guest buffer (seed `GIT_*` after re-exec).
+pub const KH_HELPER_GETENV: u32 = 0x4B48_000D;
+/// Host-helper id: POSIX `regcomp` (pattern VA, Darwin cflags, out `[handle,nsub]`).
+pub const KH_HELPER_REGCOMP: u32 = 0x4B48_000E;
+/// Host-helper id: POSIX `regexec` (guest VA of packed request).
+pub const KH_HELPER_REGEXEC: u32 = 0x4B48_000F;
+/// Host-helper id: POSIX `regfree` (handle).
+pub const KH_HELPER_REGFREE: u32 = 0x4B48_0010;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

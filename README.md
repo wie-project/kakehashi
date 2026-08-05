@@ -118,11 +118,25 @@ Details and gates: [`docs/curl.md`](docs/curl.md).
 | Bottle + freestanding `libSystem` | `kh bottle ensure` embeds dylib                          |
 | Unit tests + clippy               | `cargo test` / `clippy` workspace (excl. `kh-libsystem`) |
 
+### Apple `git` (CLT)
+
+```bash
+kh install xcode-tools   # public swscan; no Apple ID
+# Prefer protocol v1 until v2 RPC is complete:
+git config --global protocol.version 1
+
+kh run git -- --version
+kh run git -- ls-remote https://github.com/octocat/Hello-World.git
+kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
+```
+
+See [`docs/git.md`](docs/git.md) for gates (G0–G4). Docker: `scripts/docker-git.sh`.
+
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, `git` / CLT, GUI, codesign. Next product slice:
-**git** via `kh install xcode-tools` — see [`docs/git.md`](docs/git.md).
+real Apple Security.framework, full git (push, large non-shallow clones, protocol
+v2), GUI, codesign.
 
 ## Crates
 

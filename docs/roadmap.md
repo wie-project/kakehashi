@@ -61,7 +61,7 @@ Priority is **guest surface**, not shaving another tenth off an already ~×1.2 m
 | Priority | Direction | Notes |
 | --- | --- | --- |
 | 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| 2 | **git** / **xcode-tools** | **In progress.** Install: [git.md](git.md). G0 swscan (no Apple ID); G1+ trace-first |
+| 2 | **git** / **xcode-tools** | **G4 met** (ls-remote + shallow clone HTTPS). Polish: push, large clone, protocol v2 — [git.md](git.md) |
 | — | Optional polish | `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen; not gates |
 
 Rationale: curl was the smaller vertical slice that forced network ABI on top
