@@ -56,7 +56,7 @@ kh run 7zz -- t mt.7z
 ./scripts/docker-7zz.sh a /Volumes/linux/out/demo.7z /Volumes/linux/src/README.md
 ls -lh .tmp/kh-out/demo.7z
 
-KAKEHASHI_HYPERCALL=1 ./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
+./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
   /Volumes/linux/out/mt.7z /Volumes/linux/src/README.md
 ./scripts/docker-7zz.sh t /Volumes/linux/out/mt.7z
 ```
@@ -192,8 +192,8 @@ mostly real LZMA + boundary × crossings (not “wrong compression”).
 
 Few-file / compression-heavy samples remain ~×1.1–1.3.
 
-Hypercall is on by default for all guest threads. Opt out with
-`KAKEHASHI_HYPERCALL=0` only for debug (residual `svc`→`brk` / SIGTRAP).
+Hypercall is always wired for freestanding libSystem (sole production BSD
+entry). Residual `svc`→`brk`/SIGTRAP remains only for unpatched fixtures.
 
 ### Why ~×1.2 is still useful in CI
 

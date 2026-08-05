@@ -9,9 +9,9 @@
 #
 # Guest input mode (MODE):
 #   list   (default) — `7zz a … @listfile` with one guest path per line.
-#           Avoids directory readdir (currently Darwin 7zz under kh hits
-#           EINVAL on recursive dir scan; open/stat/read path still chatty).
-#   dir    — pass the tree directory (exposes readdir bug; may archive 0 files).
+#           Still useful for plate-A FS chats without dirent walk cost.
+#   dir    — pass the tree directory (recursive opendir/readdir; fixed after
+#           freestanding ENOSYS-spin + size-class heap; was EINVAL/0 files).
 #
 # Why /tmp? Thousands of small files through Colima virtiofs measure the disk
 # bridge more than the translator (see bench-fair-local.sh).
@@ -29,7 +29,6 @@
 #   MX, MMT         7zz -mx / -mmt (default: 5, 4 — product gate shape)
 #   KAKEHASHI_BOUNDARY_STATS  default: 1 (use ns for host-dispatch timing)
 #   KAKEHASHI_FUTEX_STATS     default: 0
-#   KAKEHASHI_HYPERCALL       default: 1
 #   KH_EXTRA_CARGO_ARGS       default: --release
 #   KH_BENCH_OUT              host results dir (default: .tmp/kh-bench-multifile)
 #   KAKEHASHI_SMOKE_IMAGE     default: kakehashi:dev
@@ -51,7 +50,6 @@ MMT="${MMT:-4}"
 SKIP_NATIVE="${SKIP_NATIVE:-0}"
 export KAKEHASHI_BOUNDARY_STATS="${KAKEHASHI_BOUNDARY_STATS:-1}"
 export KAKEHASHI_FUTEX_STATS="${KAKEHASHI_FUTEX_STATS:-0}"
-export KAKEHASHI_HYPERCALL="${KAKEHASHI_HYPERCALL:-1}"
 # Multi-file needs a release kh for honest wall; override with empty or debug.
 KH_EXTRA_CARGO_ARGS="${KH_EXTRA_CARGO_ARGS---release}"
 
@@ -70,7 +68,7 @@ fi
 TREE_MB=$(( (NFILES * FILE_BYTES) / 1024 / 1024 ))
 echo "=== multi-file 7zz bench ==="
 echo "  nfiles=$NFILES  file_bytes=$FILE_BYTES  (~${TREE_MB} MiB payload)  dirs=$DIRS  mode=$MODE"
-echo "  mx=$MX  mmt=$MMT  hypercall=$KAKEHASHI_HYPERCALL"
+echo "  mx=$MX  mmt=$MMT"
 echo "  BOUNDARY_STATS=$KAKEHASHI_BOUNDARY_STATS  FUTEX_STATS=$KAKEHASHI_FUTEX_STATS"
 echo "  cargo: $KH_EXTRA_CARGO_ARGS"
 echo "  results → $OUT"
@@ -84,7 +82,6 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/src/target \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
-  -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL}" \
   -e "KAKEHASHI_BOUNDARY_STATS=${KAKEHASHI_BOUNDARY_STATS}" \
   -e "KAKEHASHI_FUTEX_STATS=${KAKEHASHI_FUTEX_STATS}" \
   -e "NFILES=${NFILES}" \
@@ -137,7 +134,6 @@ fi
   echo "nproc=$(nproc)"
   echo "nfiles=$NFILES file_bytes=$FILE_BYTES dirs=$DIRS mode=$MODE"
   echo "mx=$MX mmt=$MMT"
-  echo "hypercall=${KAKEHASHI_HYPERCALL:-1}"
   echo "boundary_stats=${KAKEHASHI_BOUNDARY_STATS:-1}"
   echo "native_7zz=${NATIVE_7ZZ:-none}"
   echo "guest=kh run 7zz"
@@ -231,7 +227,7 @@ echo "kh_create_ms=$KH_MS kh_rc=$KH_RC" | tee -a "$ART/summary.txt"
 echo "kh_create_s=$(python3 -c "print(f\"{$KH_MS/1000:.2f}\")")" | tee -a "$ART/summary.txt"
 # Fail fast if archive is empty / create clearly failed.
 if grep -q "Files read from disk: 0" "$ART/kh-create.log" 2>/dev/null; then
-  echo "error: guest read 0 files (dir readdir broken? use MODE=list)" | tee -a "$ART/summary.txt"
+  echo "error: guest read 0 files (tree empty, bad path, or readdir regression; try MODE=list)" | tee -a "$ART/summary.txt"
   tail -30 "$ART/kh-create.log" | tee -a "$ART/summary.txt"
   exit 1
 fi

@@ -32,9 +32,9 @@ root [`README.md`](../README.md).
 Linux aarch64 (Docker or bare-metal):
 
 ```bash
-KAKEHASHI_HYPERCALL=1 ./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
+./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
   /Volumes/linux/out/mt.7z /Volumes/linux/src/README.md
-KAKEHASHI_HYPERCALL=1 ./scripts/docker-7zz.sh t /Volumes/linux/out/mt.7z
+./scripts/docker-7zz.sh t /Volumes/linux/out/mt.7z
 ```
 
 Expect `Everything is Ok` and exit 0. SEGV with PC in host `libgcc_s.so.1`

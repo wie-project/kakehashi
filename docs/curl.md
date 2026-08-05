@@ -43,6 +43,7 @@ Docker, and HTTP GET under UTM.
 | Real Security.framework | Out of scope; soft SecTrust remains for AppleSecTrust feature bit |
 | `/etc/ssl/openssl.cnf` seed | Optional quieting of OpenSSL probe |
 | Broader curl CLI | POST, auth, proxies, HTTP/2–3 end-to-end, FTP — implement trace-first only when a gate needs them |
+| `t7_two_urls` SEGV (serial multi-URL + `-o …#1`) | Once seen as guest SIGSEGV in c-ares `_ares_query_dnsrec_cb` (bad callback arg); tier7 + 30× stress now green. Re-open if it returns under full `docker-curl-options.sh all` |
 
 ### Recent freestanding polish (UTM crash fix)
 

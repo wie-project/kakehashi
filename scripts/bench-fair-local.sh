@@ -16,12 +16,10 @@
 # Usage:
 #   ./scripts/bench-fair-local.sh              # 200 MiB, mx=5, mmt=2
 #   SIZE_MB=64 MMT=1 ./scripts/bench-fair-local.sh
-#   KAKEHASHI_HYPERCALL=0 ./scripts/bench-fair-local.sh
 #
 # Env:
 #   SIZE_MB, MX, MMT          workload (defaults: 200, 5, 2)
 #   KAKEHASHI_SMOKE_IMAGE     docker image (default: kakehashi:dev)
-#   KAKEHASHI_HYPERCALL       1=hypercall path, 0=svc→brk path
 #   KH_BENCH_OUT              host results dir (default: <repo>/.tmp/kh-bench-fair)
 #   KEEP_BLOB=1               also copy the random blob to results (large)
 #
@@ -88,7 +86,7 @@ What is here
     sizes.txt         byte sizes of blob + both archives
     verify-native.txt full \`7zz t\` output for native.7z
     verify-kh.txt     full \`7zz t\` output for kh.7z
-    run-meta.txt      knobs used for this run (size, mx, mmt, hypercall, …)
+    run-meta.txt      knobs used for this run (size, mx, mmt, …)
 
 How to re-check yourself
 ------------------------
@@ -110,7 +108,7 @@ How to re-check yourself
 Notes
 -----
   - Guest Darwin 7zz and host Linux 7zz are *different builds*.
-    Compare hypercall vs KAKEHASHI_HYPERCALL=0 for path overhead, not absolute
+    Hypercall is always on; residual svc→brk is fixtures-only.
     "native × N" across product versions.
   - Work files during the run live in the container at /tmp/khbench-fair and
     are deleted with the container. Only what lands under artifacts/ is kept.
@@ -118,7 +116,7 @@ Notes
 EOF
 
 echo "=== fair local bench ==="
-echo "  size=${SIZE_MB} MiB  mx=$MX  mmt=$MMT  hypercall=${KAKEHASHI_HYPERCALL:-1}"
+echo "  size=${SIZE_MB} MiB  mx=$MX  mmt=$MMT"
 echo "  results → $OUT"
 echo "  run_id  → $RUN_ID"
 echo
@@ -131,7 +129,7 @@ docker run --rm \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
   -e CARGO_TARGET_DIR=/src/target \
-  -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-1}" \
+
   -e SIZE_MB="$SIZE_MB" -e MX="$MX" -e MMT="$MMT" \
   -e KEEP_BLOB="$KEEP_BLOB" -e RUN_ID="$RUN_ID" \
   -w /src \
@@ -159,7 +157,6 @@ $KH bottle ensure >/dev/null
   echo "size_mb=$SIZE_MB"
   echo "mx=$MX"
   echo "mmt=$MMT"
-  echo "hypercall=${KAKEHASHI_HYPERCALL:-1}"
   echo "guest_7zz=tests/clang-probe/7zz.bin"
   echo "host_7zz=/bin7/7zz"
   /bin7/7zz 2>&1 | head -1 || true
@@ -183,7 +180,7 @@ NATIVE_MS=$(( (END-START)/1000000 ))
 echo "native_ms=$NATIVE_MS" | tee -a /results/summary.txt
 
 echo "" | tee -a /results/summary.txt
-echo "=== B: kh + Darwin 7zz (HYPERCALL=${KAKEHASHI_HYPERCALL:-1}) ===" | tee -a /results/summary.txt
+echo "=== B: kh + Darwin 7zz ===" | tee -a /results/summary.txt
 rm -f "$W/kh.7z"
 START=$(date +%s%N)
 $KH run --max-syscalls 500000000 tests/clang-probe/7zz.bin -- \
@@ -199,7 +196,7 @@ n=$NATIVE_MS; k=$KH_MS
 print(f"ratio_kh_over_native={k/n:.2f}x" if n else "ratio=n/a")
 print(f"native_s={n/1000:.2f}  kh_s={k/1000:.2f}")
 print("note: guest 7zz (Darwin) and host 7zz (Linux) are different builds;")
-print("      compare hyper vs brk (KAKEHASHI_HYPERCALL=0) for pure path cost.")
+print("      hypercall always on; residual svc only for fixtures.")
 PY
 
 # ---- persist artifacts on the bind-mounted /results (host OUT) ----

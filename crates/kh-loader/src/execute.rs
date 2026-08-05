@@ -138,13 +138,11 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     address_space.register_borrowed(&stack);
     drop(registry_install(address_space));
 
-    // Wire freestanding libSystem → `kh_hypercall_entry` (production path).
-    // Opt out with `KAKEHASHI_HYPERCALL=0|false|off|no` (debug: residual svc→brk).
-    let hypercall_wired = if hypercall_enabled() {
-        install_libsystem_hypercall(&mut session)
-    } else {
-        false
-    };
+    // Wire freestanding libSystem → `kh_hypercall_entry` (sole production BSD path).
+    // Residual Darwin `svc` in fixtures/apps is always rewritten to `brk` below;
+    // that is *not* a second production path (see invariants 7, 12).
+    warn_if_hypercall_env_opt_out();
+    let hypercall_wired = install_libsystem_hypercall(&mut session);
     // Rewrite any leftover Darwin `svc` so Linux never executes them as host syscalls.
     let mut patched_svc = 0usize;
     for memory in session.mapped_memories_mut() {
@@ -275,18 +273,22 @@ fn trap_to_load(err: TrapError) -> LoadError {
     }
 }
 
-/// Freestanding libSystem hypercall is on by default (avoids SIGTRAP).
-///
-/// Disable with `KAKEHASHI_HYPERCALL=0|false|off|no`.
-fn hypercall_enabled() -> bool {
-    match std::env::var_os("KAKEHASHI_HYPERCALL") {
-        None => true,
-        Some(v) => {
-            !(v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("off"))
-        }
+/// `KAKEHASHI_HYPERCALL=0` used to force freestanding `svc`→SIGTRAP for A/B
+/// path digs. That opt-out is **removed**: production always wires hypercall.
+/// Residual `svc`→`brk` still runs for fixtures; it is not a dual product path.
+fn warn_if_hypercall_env_opt_out() {
+    let Some(v) = std::env::var_os("KAKEHASHI_HYPERCALL") else {
+        return;
+    };
+    let off = v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("off");
+    if off {
+        tracing::warn!(
+            "KAKEHASHI_HYPERCALL={v:?} is ignored; freestanding hypercall is always wired \
+             (use residual svc→brk only for unpatched fixtures, not as a product path)"
+        );
     }
 }
 

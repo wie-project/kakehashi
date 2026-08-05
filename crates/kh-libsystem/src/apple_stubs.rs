@@ -462,11 +462,12 @@ pub(crate) unsafe extern "C" fn SecTrustEvaluateWithError(
         free(pack);
     }
 
+    // Verbose only: force_note would spam every HTTPS guest on first verify.
     if TRUST_NOTE.fetch_add(1, Ordering::Relaxed) == 0 {
         if ret == 0 {
-            trace::force_note(b"[kh-libsystem] SecTrust: host CA verify ok\n");
+            trace::note(b"[kh-libsystem] SecTrust: host CA verify ok\n");
         } else {
-            trace::force_note(b"[kh-libsystem] SecTrust: host CA verify failed\n");
+            trace::note(b"[kh-libsystem] SecTrust: host CA verify failed\n");
         }
     }
 

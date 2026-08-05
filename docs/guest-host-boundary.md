@@ -63,8 +63,8 @@ blr   _kh_bsd_hypercall   // patched to kh_hypercall_entry
 → HyperRet { retval: x0, error: x1 }
 ```
 
-Loader patches `_kh_bsd_hypercall` / `kh_bsd_hypercall` to
-`hypercall_entry_addr()` when `KAKEHASHI_HYPERCALL` is enabled (default).
+Loader always patches `_kh_bsd_hypercall` / `kh_bsd_hypercall` to
+`hypercall_entry_addr()` on Linux aarch64 (sole production BSD entry).
 
 ### Host entry (`kh_hypercall_entry`)
 
@@ -102,14 +102,15 @@ Partial save is a correctness bug under `-mmt>1`.
 
 ## Residual `svc` / SIGTRAP
 
-Leftover Darwin `svc` sites (fixtures, unpatched stubs, or
-`KAKEHASHI_HYPERCALL=0`) are rewritten to `brk #IMM`:
+Leftover Darwin `svc` sites (fixtures, unpatched stubs — **not** freestanding
+libSystem under `kh`) are rewritten to `brk #IMM`:
 
 1. Kernel delivers `SIGTRAP` with full `ucontext`.
 2. Handler restores host TLS, translates syscall, updates `ucontext`.
 3. `bsdthread_terminate` redirects PC/SP/`x29` to the host worker-exit trampoline.
 
 Production multi-thread path is freestanding hypercall only.
+`KAKEHASHI_HYPERCALL=0` is ignored (legacy dig opt-out removed).
 
 ## Fault handling
 
@@ -127,8 +128,8 @@ Fault PC inside **host** `libgcc_s` during worker exit signals illegal
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall (production) |
-| `KAKEHASHI_HYPERCALL=0` | — | Debug: residual `svc`→`brk`/SIGTRAP |
+| `KAKEHASHI_HYPERCALL` | (ignored) | Always wired on Linux aarch64; `=0` logs a deprecation warning |
+| `KAKEHASHI_HEAP_STATS` | off | Freestanding heap dump on exit when host env is truthy |
 | `KAKEHASHI_FUTEX_STATS` | off | Print guest park/wake counters at exit |
 | `KAKEHASHI_BOUNDARY_STATS` | off | Count BSD/helper dispatches at exit (`1`/`on` = counts; `ns`/`time` = counts + host-side ns in `syscall::dispatch`) |
 | `KAKEHASHI_BOUNDARY_BENCH_ITERS` | (test default) | Iteration count for host dispatch class microbench (`boundary_bench` / `scripts/bench-boundary-classes.sh`) |

@@ -112,7 +112,7 @@ keep `7zz -mmt=4` green; clean-room only (no Darling).
 ### Perf PR checklist
 
 - [ ] `cargo test -p kh-runtime --lib` (workspace if touching loader/cli)
-- [ ] `KAKEHASHI_HYPERCALL=1` `7zz a -mx=5 -mmt=4` → Ok; `7zz t` → Ok
+- [ ] `7zz a -mx=5 -mmt=4` → Ok; `7zz t` → Ok (hypercall always on)
 - [ ] Repeat MT create ≥2 times
 - [ ] Stage dylib if freestanding ABI changed
 - [ ] Bare-metal note if only Docker was used

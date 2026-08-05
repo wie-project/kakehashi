@@ -3,10 +3,11 @@
 //! **Production path:** freestanding libSystem → `kh_hypercall_entry` (alt
 //! stack + NEON tramp + [`kh_trampoline_dispatch`]). No `SIGTRAP` on that path.
 //!
-//! **Residual `svc`:** any leftover Darwin `svc` (fixtures, unpatched stubs)
-//! is rewritten to `brk #IMM` so Linux does not treat it as a host syscall.
-//! The `SIGTRAP` handler translates those sites. Former experimental
-//! `svc`→veneer rewrite (`KAKEHASHI_TRAMPOLINE`) was removed.
+//! **Residual `svc`:** leftover Darwin `svc` in fixtures / unpatched third-party
+//! code is rewritten to `brk #IMM` so Linux does not treat it as a host
+//! syscall. The `SIGTRAP` handler translates those sites. This is **not** a
+//! second production path — freestanding libSystem is always hypercall-wired.
+//! Former experimental `svc`→veneer (`KAKEHASHI_TRAMPOLINE`) was removed.
 //!
 //! Live handlers require **Linux aarch64**. Patching works on any host.
 #![allow(unsafe_code)]

@@ -225,7 +225,8 @@ struct HyperRet {
 /// Optional direct hypercall into the host translator (identity-mapped).
 ///
 /// The loader writes `kh_hypercall_entry` here after mapping freestanding
-/// `libSystem`. When zero (real Darwin / unset), fall back to `svc #0x80`.
+/// `libSystem` (always on Linux aarch64). When zero (real Darwin / host has
+/// not wired yet), fall back to `svc #0x80`.
 ///
 /// Exported as `_kh_bsd_hypercall` (Darwin nlist) for the loader to patch.
 ///
@@ -236,9 +237,9 @@ static mut KH_BSD_HYPERCALL: usize = 0;
 
 /// Invokes a Darwin BSD syscall with up to seven arguments (`x0`–`x6`).
 ///
-/// When the host has wired [`KH_BSD_HYPERCALL`], every thread uses the
-/// freestanding hypercall (host alt stack + TPIDR save/restore). Otherwise
-/// fall back to `svc #0x80` (real Darwin or debug `KAKEHASHI_HYPERCALL=0`).
+/// Under `kh` on Linux the loader always wires [`KH_BSD_HYPERCALL`] before
+/// guest entry (host alt stack + TPIDR save/restore). The `svc #0x80` fallback
+/// remains for real Darwin and for any image where the slot was not found.
 ///
 /// Join completion is published from the host stack after `bsdthread_terminate`
 /// (see `kh-runtime::thread`).
@@ -260,7 +261,7 @@ pub(crate) unsafe fn syscall7(
 ) -> isize {
     #[cfg(target_arch = "aarch64")]
     {
-        // Prefer host hypercall when wired (every guest thread).
+        // Prefer host hypercall when wired (every guest thread under `kh`).
         // SAFETY: slot is process-local; runtime writes once before guest entry.
         let hyper = unsafe { core::ptr::addr_of!(KH_BSD_HYPERCALL).read_volatile() };
         if hyper != 0 {
@@ -279,9 +280,12 @@ pub(crate) unsafe fn syscall7(
             };
         }
 
+        // Real Darwin / unwired image only. Under `kh`, residual `svc` in
+        // *other* images is rewritten to `brk` by the loader; freestanding
+        // itself should have a non-zero hyper slot before guest entry.
         let mut ret: u64;
         let mut flags: u64;
-        // SAFETY: pure register syscall (real Darwin / unpatched path).
+        // SAFETY: pure register syscall (real Darwin / unwired freestanding).
         unsafe {
             core::arch::asm!(
                 "svc #0x80",

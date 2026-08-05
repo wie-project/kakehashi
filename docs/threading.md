@@ -169,9 +169,10 @@ KAKEHASHI_FUTEX_STATS=1 kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 …
 
 | Variable | Effect |
 | --- | --- |
-| (default) | Hypercall ON for all threads when patched |
-| `KAKEHASHI_HYPERCALL=0` | Debug residual `svc`→`brk`/SIGTRAP |
+| (default) | Hypercall always wired for freestanding libSystem |
+| `KAKEHASHI_HYPERCALL=0` | **Ignored** (legacy dig opt-out; residual `svc`→`brk` still for fixtures) |
 | `KAKEHASHI_FUTEX_STATS=1` | Park/wake counters on process exit |
+| `KAKEHASHI_HEAP_STATS=1` | Freestanding heap dump on exit (host env) |
 
 Hypercall is the only production boundary for freestanding libSystem.
 

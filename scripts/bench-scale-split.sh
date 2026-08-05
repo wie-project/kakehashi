@@ -19,7 +19,6 @@ if [[ -x tests/clang-probe/7zz.bin ]]; then
 fi
 $KH install 7zip >/dev/null || true
 export KAKEHASHI_BOUNDARY_STATS=ns
-export KAKEHASHI_HYPERCALL="${KAKEHASHI_HYPERCALL:-1}"
 
 W=/tmp/scale
 rm -rf "$W"

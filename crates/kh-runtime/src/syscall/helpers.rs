@@ -209,6 +209,12 @@ pub(crate) const KH_HELPER_VERIFY_CERT: u32 = KH_HELPER_BASE | 9;
 /// Returns byte length **including** NUL, or error via carry/`EINVAL`.
 pub(crate) const KH_HELPER_GUEST_HOME: u32 = KH_HELPER_BASE | 0x0A;
 
+/// Host dig/bench flag: non-zero when host `KAKEHASHI_HEAP_STATS` is truthy.
+///
+/// Freestanding cannot read host env; this is the opt-in path for heap dump
+/// (replaces dig-time always-on seed).
+pub(crate) const KH_HELPER_HEAP_STATS_ON: u32 = KH_HELPER_BASE | 0x0B;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -235,8 +241,24 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_GETADDRINFO => handle_getaddrinfo(args),
         KH_HELPER_VERIFY_CERT => handle_verify_cert(args),
         KH_HELPER_GUEST_HOME => handle_guest_home(args),
+        KH_HELPER_HEAP_STATS_ON => handle_heap_stats_on(),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
+}
+
+fn handle_heap_stats_on() -> SyscallResult {
+    let name = "kh_heap_stats_on";
+    let on = match std::env::var_os("KAKEHASHI_HEAP_STATS") {
+        None => false,
+        Some(v) => {
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+    };
+    SyscallResult::ok(name, u64::from(on))
 }
 
 fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
@@ -682,6 +704,8 @@ mod tests {
         assert!(is_helper(KH_HELPER_PARK));
         assert!(is_helper(KH_HELPER_WAKE));
         assert!(is_helper(KH_HELPER_VERIFY_CERT));
+        assert!(is_helper(KH_HELPER_GUEST_HOME));
+        assert!(is_helper(KH_HELPER_HEAP_STATS_ON));
         assert!(!is_helper(4)); // write
         assert!(!is_helper(1)); // exit
     }

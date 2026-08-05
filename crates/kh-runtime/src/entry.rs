@@ -162,7 +162,7 @@ pub unsafe fn call_guest_args(
         // freestanding hypercalls run host Rust under **Linux** AAPCS64 (x18
         // is scratch) while Darwin guests treat x18 as reserved; parking host
         // SP in x18 then produced `SIGBUS BUS_ADRALN` at `si_addr=0x1` after
-        // guest `main` returned under `KAKEHASHI_HYPERCALL`.
+        // guest `main` returned under freestanding hypercall.
         let mut host_sp: u64 = 0;
         // Guest TPIDR only around guest code; restore host before returning to
         // Rust (constructors / `main` return path use host TLS for logging etc.).

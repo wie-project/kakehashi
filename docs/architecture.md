@@ -97,8 +97,8 @@ When hypercall is wired, freestanding `syscall7` calls `kh_bsd_hypercall`
 
 | Mode | Mechanism | Use |
 | --- | --- | --- |
-| Hypercall (default) | Guest `bl` → `kh_hypercall_entry` → host alt stack → dispatch | Production, all threads |
-| Residual `svc`→`brk` | Patched leftovers + SIGTRAP | Fixtures / debug (`KAKEHASHI_HYPERCALL=0`) |
+| Hypercall (always) | Guest `bl` → `kh_hypercall_entry` → host alt stack → dispatch | Production, all threads |
+| Residual `svc`→`brk` | Patched leftovers + SIGTRAP | Fixtures / unpatched third-party only |
 
 See [Guest–host boundary](guest-host-boundary.md).
 

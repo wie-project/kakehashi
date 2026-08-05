@@ -116,7 +116,6 @@ docker run --rm \
   -e KAKEHASHI_CONFIG_DIR=/src/.kh/config \
   -e KAKEHASHI_DATA_DIR=/src/.kh/data \
   -e CARGO_TARGET_DIR=/src/target \
-  -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-}" \
   -e "KH_EXTRA_CARGO_ARGS=${KH_EXTRA_CARGO_ARGS:-}" \
   -e "KH_CURL_TIERS=${TIER_LIST}" \
   "${IMAGE}" \

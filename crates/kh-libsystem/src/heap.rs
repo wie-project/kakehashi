@@ -14,21 +14,14 @@
 //!
 //! ## Heap stats (`KAKEHASHI_HEAP_STATS`)
 //!
-//! Opt-in counters for plate-A residual digs (superlinear us/crossing vs n files).
-//! Hot path when off: one `AtomicU8` load after first resolve. When on: cheap
-//! `fetch_add` on alloc/free paths; dump to guest stderr (fd 2) at `_exit`.
+//! **Off by default.** Opt-in counters for plate-A residual digs. Hot path when
+//! off: one `AtomicU8` load after first resolve. When on: cheap `fetch_add` on
+//! alloc/free; dump to guest stderr (fd 2) at `_exit` / post-`main` dump.
 //!
-//! Soft-env only sees vars seeded here or via `setenv`. Host enables dump by
-//! exporting `KAKEHASHI_HEAP_STATS=1` **and** seeding it into soft env on first
-//! `getenv`/`dump` (see [`stats_mode`]): we probe host env via a one-shot
-//! anonymous mmap of a **host** page is not available — instead soft-env seed
-//! copies the flag when `stats_mode` first runs by treating any non-empty
-//! soft getenv as on, **or** always-on dump when the env string is baked by
-//! host inject into stack envp (main only). For freestanding dig, soft seed
-//! also accepts the host process flag through `helper0`-free path: dump is
-//! enabled when soft getenv returns non-null **or** when the static mode was
-//! forced via `kh_heap_stats_enable` (tests). Bench scripts set
-//! `KAKEHASHI_HEAP_STATS=1` and call soft seed inject below.
+//! Host enables with `KAKEHASHI_HEAP_STATS=1` (truthy). Freestanding cannot
+//! read host environ, so the first stats resolve queries
+//! [`crate::KH_HELPER_HEAP_STATS_ON`] and seeds soft env. Guest `setenv` /
+//! `kh_heap_stats_enable` also work.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -223,29 +216,22 @@ fn stats_mode() -> u8 {
     STATS_MODE.load(Ordering::Relaxed)
 }
 
-/// Seed `KAKEHASHI_HEAP_STATS` into soft env from a compile-time default path:
-/// prefer existing soft/getenv; if unset, leave off. Host can `setenv` before
-/// exit dump if the guest code path calls it; dig scripts use the public
-/// enable hook via env injection in soft seed when `KH_HEAP_STATS_DEFAULT_ON`.
+/// Seed soft `KAKEHASHI_HEAP_STATS` from the host when requested.
 ///
-/// Dig-friendly: if the literal `KAKEHASHI_HEAP_STATS` is present as a **host**
-/// process convention, freestanding cannot read it. We therefore enable dump
-/// when soft env has it **or** when the binary was built with always-on dig
-/// mode below (`true` while we dig residual on plate A — flip to soft-only
-/// after the dig lands).
+/// Freestanding cannot read host `environ`; the loader/runtime exposes
+/// [`crate::KH_HELPER_HEAP_STATS_ON`]. Digs and benches set
+/// `KAKEHASHI_HEAP_STATS=1` on the **host** process; default is off (no
+/// stderr dump noise on every `kh run`).
 fn soft_env_seed_heap_flag() {
-    // Always try to seed from soft_env_set so getenv works once host injects.
-    // Dig mode: enable by default so 4k plate dumps without soft-env plumbing.
-    // Opt-out: set soft env KAKEHASHI_HEAP_STATS=0 before first alloc (rare).
-    const DIG_DEFAULT_ON: bool = true;
-    if !DIG_DEFAULT_ON {
-        return;
-    }
-    // Only seed if not already set (soft getenv may recurse carefully).
     let key = b"KAKEHASHI_HEAP_STATS\0";
     // SAFETY: key is NUL-terminated static.
     let existing = unsafe { crate::posix::getenv(key.as_ptr().cast()) };
     if !existing.is_null() {
+        return;
+    }
+    // SAFETY: helper id matches kh-runtime; no guest buffer.
+    let on = unsafe { sys::helper0(crate::KH_HELPER_HEAP_STATS_ON) };
+    if on <= 0 {
         return;
     }
     let val = b"1\0";
