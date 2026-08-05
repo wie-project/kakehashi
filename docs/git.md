@@ -132,11 +132,21 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     - `index-pack` loops only while `status == Z_OK` (not `Z_BUF_ERROR`); map
       “need more input” Buf → `Z_OK`. Empty `avail_out` still probes StreamEnd.
     Verified: `index-pack` of ~9 MiB pack + full `clone` of this repo (Docker).
+14. **`close(0/1/2)` must really close** — stdio was identity-mapped and
+    `close` soft-succeeded without dropping the host pipe. Apple
+    `fetch-pack --stateless-rpc` does `close(1)` *before* printing the
+    fetched-ref list to stdout; on Darwin those writes fail harmlessly, but
+    under kh they still reached remote-curl → parent as hundreds of
+    `https unexpectedly said: '<sha> refs/…'` lines after an otherwise green
+    clone (e.g. **facebook/folly**: 560 heads+tags). Fix: track closed stdio,
+    `host close` on take, `EBADF` on later I/O, re-open via `dup2` onto 0/1/2.
+    Verified: full `clone https://github.com/facebook/folly` under Docker with
+    `protocol.version=1` — exit 0, no `unexpectedly said` flood.
 
 **Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
 time budget; protocol v2 `stateless-connect`; push; plain `http://` on the
 socket path. Prefer `protocol.version=1` in guest `~/.gitconfig` until v2 RPC
-is complete. Stage freestanding with **release** dylib
+is complete. `./scripts/docker-git.sh` forces v1 for that reason. Stage freestanding with **release** dylib
 (`cargo build -p kh-libsystem --release --target aarch64-apple-darwin` then
 `./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
 release over a newer debug build.

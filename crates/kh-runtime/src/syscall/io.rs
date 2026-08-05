@@ -16,7 +16,9 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     let gfd = super::common::reg_as_i32(args.x0);
     tracing::debug!(gfd, len = args.x2, "write");
     let Some(host_fd) = guest_to_host_fd(args.x0) else {
-        tracing::warn!(gfd, x0 = format_args!("{:#x}", args.x0), "write fail EBADF");
+        // Expected after guest `close` on stdio (fetch-pack prints refs post-close(1)).
+        // At `warn` this floods monorepo clones (~hundreds of lines).
+        tracing::debug!(gfd, x0 = format_args!("{:#x}", args.x0), "write fail EBADF");
         return SyscallResult::err(name, EBADF);
     };
     let Ok(len) = usize::try_from(args.x2) else {

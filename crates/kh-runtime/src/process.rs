@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::host;
@@ -48,6 +48,14 @@ static FD_GUEST_NB: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS
 static FD_TLS: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS];
 /// Hint for next free FD scan.
 static FD_NEXT: AtomicI32 = AtomicI32::new(3);
+/// Guest has `close`'d stdio slots 0/1/2 (bit0=stdin, bit1=stdout, bit2=stderr).
+///
+/// Stdio is identity-mapped to host 0/1/2, so a soft no-op `close` left the host
+/// pipe open. Apple `git fetch-pack --stateless-rpc` closes stdout **before**
+/// printing the fetched-ref list; with a no-op close those lines reach the
+/// remote-curl helper and surface as hundreds of
+/// `https unexpectedly said: '<sha> refs/…'` warnings after a successful clone.
+static STDIO_CLOSED: AtomicU8 = AtomicU8::new(0);
 
 /// Soft Darwin `sigaction` slot (handler + mask + flags).
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +115,9 @@ impl FdTable {
 #[inline]
 pub fn fd_get(gfd: i32) -> Option<RawFd> {
     if gfd == 0 || gfd == 1 || gfd == 2 {
+        if stdio_is_closed(gfd) {
+            return None;
+        }
         return Some(gfd);
     }
     if gfd < 0 {
@@ -121,10 +132,20 @@ pub fn fd_get(gfd: i32) -> Option<RawFd> {
 }
 
 /// Removes a guest FD mapping and returns the host fd (lock-free).
+///
+/// For stdio 0–2: marks the slot closed and returns the host fd (identity) so
+/// the caller can `close` it — matching Darwin when `fetch-pack` drops stdout.
 #[must_use]
 #[inline]
 pub fn fd_take(gfd: i32) -> Option<RawFd> {
-    if gfd <= 2 {
+    if gfd == 0 || gfd == 1 || gfd == 2 {
+        if stdio_is_closed(gfd) {
+            return None;
+        }
+        stdio_mark_closed(gfd);
+        return Some(gfd);
+    }
+    if gfd < 0 {
         return None;
     }
     let Ok(idx) = usize::try_from(gfd) else {
@@ -139,6 +160,42 @@ pub fn fd_take(gfd: i32) -> Option<RawFd> {
         nb.store(0, Ordering::Release);
     }
     if v < 0 { None } else { Some(v) }
+}
+
+/// Bit for guest stdio FD in [`STDIO_CLOSED`] (`0→1`, `1→2`, `2→4`).
+#[inline]
+fn stdio_closed_bit(gfd: i32) -> Option<u8> {
+    match gfd {
+        0 => Some(1),
+        1 => Some(2),
+        2 => Some(4),
+        _ => None,
+    }
+}
+
+#[inline]
+fn stdio_is_closed(gfd: i32) -> bool {
+    let Some(bit) = stdio_closed_bit(gfd) else {
+        return false;
+    };
+    STDIO_CLOSED.load(Ordering::Acquire) & bit != 0
+}
+
+#[inline]
+fn stdio_mark_closed(gfd: i32) {
+    let Some(bit) = stdio_closed_bit(gfd) else {
+        return;
+    };
+    STDIO_CLOSED.fetch_or(bit, Ordering::AcqRel);
+}
+
+/// Clear the closed bit for a stdio slot (after successful `dup2` onto 0/1/2).
+#[inline]
+pub fn stdio_mark_open(gfd: i32) {
+    let Some(bit) = stdio_closed_bit(gfd) else {
+        return;
+    };
+    STDIO_CLOSED.fetch_and(!bit, Ordering::AcqRel);
 }
 
 /// Installs `host_fd` into a **specific** guest FD slot (for `dup2`).
@@ -300,6 +357,7 @@ fn reset_fd_map() {
     for slot in &FD_TLS {
         slot.store(0, Ordering::Relaxed);
     }
+    STDIO_CLOSED.store(0, Ordering::Relaxed);
     FD_NEXT.store(3, Ordering::Relaxed);
 }
 
@@ -463,7 +521,9 @@ pub fn reset_run(max_syscalls: usize) {
 ///
 /// Also opens/replaces the process-wide bottle directory fd for B1 `openat`.
 pub fn set_bottle_root(root: Option<PathBuf>) {
-    let new_fd = root.as_ref().map_or(-1, |p| open_bottle_dirfd(p).unwrap_or(-1));
+    let new_fd = root
+        .as_ref()
+        .map_or(-1, |p| open_bottle_dirfd(p).unwrap_or(-1));
     let old_fd = BOTTLE_DIRFD.swap(new_fd, Ordering::AcqRel);
     if old_fd >= 0 {
         host::close_fd(old_fd);

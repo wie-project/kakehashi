@@ -256,12 +256,14 @@ fn finish_open(name: &'static str, host_fd: RawFd) -> SyscallResult {
 }
 
 /// `close`.
+///
+/// Stdio 0–2 used to soft-succeed without closing the host descriptor. That
+/// broke Apple `git fetch-pack --stateless-rpc`, which `close(1)`s before
+/// printing fetched refs — those lines then leaked into remote-curl → parent
+/// as `https unexpectedly said: '<sha> refs/…'` (e.g. 560 lines on folly).
 pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
     let name = "close";
     let gfd = reg_as_i32(args.x0);
-    if gfd == 0 || gfd == 1 || gfd == 2 {
-        return SyscallResult::ok(name, 0);
-    }
     // Drop readdir stream before releasing the host FD.
     process::with_mut(|p| p.close_dir_stream(gfd));
     // Drop rustls session before closing the wire socket.
@@ -314,10 +316,12 @@ pub(crate) fn handle_dup2(args: SyscallArgs) -> SyscallResult {
 
     // Stdio slots are identity-mapped to host 0/1/2 — must host-dup2 so the
     // next `execve` (re-exec of `kh`) inherits the redirected descriptors.
+    // Also re-opens a slot previously `close`'d (see [`handle_close`]).
     if new <= 2 {
         if host::dup2_fd(host_old, new).is_none() {
             return SyscallResult::err(name, EBADF);
         }
+        process::stdio_mark_open(new);
         process::fd_set_guest_nonblock(new, nb);
         return SyscallResult::ok(name, u64::try_from(new).unwrap_or(0));
     }
