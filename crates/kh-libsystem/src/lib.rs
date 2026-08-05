@@ -82,7 +82,7 @@ unsafe impl core::alloc::GlobalAlloc for KhGlobalAlloc {
 static KH_ALLOC: KhGlobalAlloc = KhGlobalAlloc;
 
 pub use errno::__error;
-pub use heap::{calloc, free, malloc, realloc};
+pub use heap::{calloc, free, kh_heap_stats_dump, kh_heap_stats_enable, malloc, realloc};
 pub use process::{exit, exit_now, kh_bottle_mark};
 pub use stdio::{bzero, memcpy, memmove, memset, puts, strlen, write};
 

@@ -146,38 +146,38 @@ fn note_wake(n: i32, woken: i32) {
 }
 
 /// Base for Kakehashi host helpers (`'KH' << 16`).
-pub(super) const KH_HELPER_BASE: u32 = 0x4B48_0000;
+pub(crate) const KH_HELPER_BASE: u32 = 0x4B48_0000;
 
 /// `puts(const char *s)` — `x0` = C string.
-pub(super) const KH_HELPER_PUTS: u32 = KH_HELPER_BASE | 1;
+pub(crate) const KH_HELPER_PUTS: u32 = KH_HELPER_BASE | 1;
 
 /// Minimal `printf(const char *fmt, ...)` — `x0` = format string.
 ///
 /// Supports only format strings **without** `%` conversions (writes the format
 /// text as-is). Enough for `printf("hello\n")`.
-pub(super) const KH_HELPER_PRINTF: u32 = KH_HELPER_BASE | 2;
+pub(crate) const KH_HELPER_PRINTF: u32 = KH_HELPER_BASE | 2;
 
 /// `readdir` next entry — `x0` = guest fd, `x1` = name buf (256), `x2` = `*u8` d_type.
 ///
 /// Returns `1` if an entry was written, `0` on EOF.
-pub(super) const KH_HELPER_READDIR: u32 = KH_HELPER_BASE | 3;
+pub(crate) const KH_HELPER_READDIR: u32 = KH_HELPER_BASE | 3;
 
 /// `sched_yield` / pthread backoff — no args.
-pub(super) const KH_HELPER_YIELD: u32 = KH_HELPER_BASE | 4;
+pub(crate) const KH_HELPER_YIELD: u32 = KH_HELPER_BASE | 4;
 
 /// Host online CPU count — no args; return value is `ncpu`.
-pub(super) const KH_HELPER_NCPU: u32 = KH_HELPER_BASE | 5;
+pub(crate) const KH_HELPER_NCPU: u32 = KH_HELPER_BASE | 5;
 
 /// Park current host thread while `*u32(addr) == expected` (Linux futex wait).
 ///
 /// `x0` = guest VA of aligned `u32`, `x1` = expected value.
 /// Returns 0 on wake / value mismatch / spurious; never hard-fails for park.
-pub(super) const KH_HELPER_PARK: u32 = KH_HELPER_BASE | 6;
+pub(crate) const KH_HELPER_PARK: u32 = KH_HELPER_BASE | 6;
 
 /// Wake waiters on a park address (Linux futex wake).
 ///
 /// `x0` = guest VA of aligned `u32`, `x1` = max waiters to wake (`0` → all).
-pub(super) const KH_HELPER_WAKE: u32 = KH_HELPER_BASE | 7;
+pub(crate) const KH_HELPER_WAKE: u32 = KH_HELPER_BASE | 7;
 
 /// `getaddrinfo` packed into a guest buffer (curl G3).
 ///
@@ -188,7 +188,7 @@ pub(super) const KH_HELPER_WAKE: u32 = KH_HELPER_BASE | 7;
 /// Buffer layout: `u32 count` then up to N records of 40 bytes:
 /// `family_darwin:u32, socktype:u32, protocol:u32, addrlen:u32, addr[24]`.
 /// Addr bytes are **Darwin** sockaddr layout (sa_len + sa_family + …).
-pub(super) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
+pub(crate) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
 
 /// TLS cert chain verify against the bottle CA bundle (SecTrust soft path).
 ///
@@ -200,14 +200,14 @@ pub(super) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
 /// ```
 /// Leaf is certs[0], intermediates follow. Returns `0` on success, `1` on
 /// soft verify failure (maps to SecTrust false), other negative as errno-ish.
-pub(super) const KH_HELPER_VERIFY_CERT: u32 = KH_HELPER_BASE | 9;
+pub(crate) const KH_HELPER_VERIFY_CERT: u32 = KH_HELPER_BASE | 9;
 
 /// Guest HOME path for freestanding `getenv` / soft env seed.
 ///
 /// `x0` = out buffer VA, `x1` = capacity (incl. NUL). Writes
 /// `/Volumes/linux{host $HOME}` when host HOME is absolute, else `/var/root`.
 /// Returns byte length **including** NUL, or error via carry/`EINVAL`.
-pub(super) const KH_HELPER_GUEST_HOME: u32 = KH_HELPER_BASE | 0x0A;
+pub(crate) const KH_HELPER_GUEST_HOME: u32 = KH_HELPER_BASE | 0x0A;
 
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
@@ -218,7 +218,7 @@ const VERIFY_MAX_CERTS: usize = 16;
 
 /// True when `number` is a synthetic bottle helper (not Darwin BSD).
 #[must_use]
-pub(super) const fn is_helper(number: u32) -> bool {
+pub(crate) const fn is_helper(number: u32) -> bool {
     number & 0xFFFF_0000 == KH_HELPER_BASE
 }
 

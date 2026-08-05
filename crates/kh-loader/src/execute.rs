@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use kh_runtime::{
-    AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack,
+    AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack, call_guest,
     call_guest_args, finish_with_exit_code, install_main_guest_tls, install_trap_handlers,
     map_stack, patch_svc_to_brk, registry_install, registry_take, set_bottle_root,
 };
@@ -190,6 +190,11 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let envp_ptr = argv_ptr.wrapping_add(argc.saturating_add(1).saturating_mul(8));
     let apple_ptr = envp_ptr.wrapping_add(8); // empty env → envp NULL then apple NULL
 
+    // Resolve freestanding heap dump before forget (exports live on session).
+    // `main` return never enters guest `_exit`, so dig counters need this call.
+    let heap_dump_va = freestanding_export_va(&session, "_kh_heap_stats_dump")
+        .or_else(|| freestanding_export_va(&session, "kh_heap_stats_dump"));
+
     // Keep stack / session alive across the call (may noreturn via guest exit).
     // `forget` retains all GuestMemory owners if exit traps.
     std::mem::forget(stack);
@@ -203,10 +208,38 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
             .map_err(|err| LoadError::PageLayout(err.to_string()))?
     };
 
+    // Dump freestanding heap stats (guest stderr) before host process exit.
+    if let Some(va) = heap_dump_va {
+        // SAFETY: VA is freestanding export; stack still mapped; may hypercall write(2).
+        let _ = unsafe { call_guest(va, sp, 0) };
+    }
+
     // dyld: exit(main(...)). Low 32 bits as signed process status (Darwin int).
     let low = u32::try_from(status & 0xffff_ffff).unwrap_or(0);
     let code = i32::from_ne_bytes(low.to_ne_bytes());
     finish_with_exit_code(code);
+}
+
+/// Guest VA of a freestanding `libSystem` export (nlist + slide), if present.
+fn freestanding_export_va(session: &LoadSession, name: &str) -> Option<u64> {
+    let mut any = None;
+    for img in session.images() {
+        let path = img.path.to_string_lossy();
+        let is_libsystem = path.contains("libSystem") || path.contains("libkh_libsystem");
+        for exp in &img.exports {
+            if exp.name != name {
+                continue;
+            }
+            let va = exp.value.saturating_add(img.slide());
+            if is_libsystem {
+                return Some(va);
+            }
+            if any.is_none() {
+                any = Some(va);
+            }
+        }
+    }
+    any
 }
 
 fn stack_err_static(err: &kh_runtime::StackError) -> &'static str {

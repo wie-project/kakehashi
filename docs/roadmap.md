@@ -11,22 +11,23 @@ root [README.md](../README.md#performance-honest).
 | Production BSD entry | Freestanding hypercall (main + workers) |
 | Multi-thread correctness | Green (`7zz -mmt=4 -mx=5` create + test; Docker + UTM) |
 | Zip MT hang (mmt≥3) | Fixed (PRIVATE futex, heap lock, cond always-wake) |
-| Perf plateau (UTM 8k-file) | ~**×5.2** wall vs native Linux `7zz` on same tree |
+| Multi-file wall (UTM) | ~**×1.24** vs native Linux `7zz` (post size-class freelist) |
 
-### Measured plateau (Ubuntu aarch64, ~8k files / ~240 MiB, `mx=5 mmt=4`)
+### Measured multi-file (Ubuntu aarch64 bare-metal, `mx=5 mmt=4`)
 
-| | native `7zz` | `kh` | ratio |
-| --- | ---: | ---: | ---: |
-| wall | ~22.5 s | ~118 s | **×5.2** |
+| tree | native `7zz` | `kh` | ratio | notes |
+| --- | ---: | ---: | ---: | --- |
+| ~14.5k files / ~309 MiB (Nook) | ~44.1 s | ~54.8 s | **×1.24** | current plateau (2026-08) |
+| ~8k / ~240 MiB (historical) | ~22.5 s | ~118 s | ~×5.2 | pre size-class freelist; **superseded** |
 
-Residual cost is **hypercall boundary × syscall count** + real LZMA — not
-PathBuf join and not empty cond-wake storms (those were fixed). Compression-
-heavy, few-file samples are often ~×1.1–1.2.
+The historical ×5 was freestanding **first-fit freelist** O(n²) on chatty
+`malloc` (plate A residual), not “wrong LZMA”. Size-class LIFO freelists
+closed most of that gap. Residual is **boundary × crossings** + real guest
+LZMA. Compression-heavy, few-file samples stay ~×1.1–1.3.
 
-**Do not** land further micro-opts on the 8k archive path without a new design
-that reduces crossings or cheapens the boundary. Correctness gates remain
-mandatory; wall-clock parity with native is **not** a ship blocker (see README
-CI economics).
+Further multi-file opts still need plates + native baseline (see
+[roadmap2.md](roadmap2.md)). Correctness gates remain mandatory; wall-clock
+parity with native is **not** a ship blocker (see README CI economics).
 
 ## Completed (summary)
 
@@ -40,6 +41,8 @@ CI economics).
 | B1 bottle dirfd | Kept for hygiene; no measurable wall win post-F1c |
 | A3 light hypercall | **Removed** — no wall win; one production path |
 | Zip MT deadlock | PRIVATE park/wake, 50 ms safety timeout, heap/mutex/cond fixes |
+| Freestanding size-class freelist | First-fit O(n²) → power-of-two LIFO bins; multi-file ~×5.2 → ~×1.24 |
+| Heap / boundary dig stats | `kh heap stats` dump; `KAKEHASHI_BOUNDARY_STATS` (M0) |
 
 ## Failed prototypes (do not re-land)
 
@@ -53,7 +56,7 @@ CI economics).
 
 ## Open work (product, not micro-perf)
 
-Priority is **guest surface**, not another ×5→×4 micro-pass:
+Priority is **guest surface**, not shaving another tenth off an already ~×1.2 multi-file plate:
 
 | Priority | Direction | Notes |
 | --- | --- | --- |

@@ -130,6 +130,8 @@ Fault PC inside **host** `libgcc_s` during worker exit signals illegal
 | `KAKEHASHI_HYPERCALL` | on | Wire freestanding hypercall (production) |
 | `KAKEHASHI_HYPERCALL=0` | — | Debug: residual `svc`→`brk`/SIGTRAP |
 | `KAKEHASHI_FUTEX_STATS` | off | Print guest park/wake counters at exit |
+| `KAKEHASHI_BOUNDARY_STATS` | off | Count BSD/helper dispatches at exit (`1`/`on` = counts; `ns`/`time` = counts + host-side ns in `syscall::dispatch`) |
+| `KAKEHASHI_BOUNDARY_BENCH_ITERS` | (test default) | Iteration count for host dispatch class microbench (`boundary_bench` / `scripts/bench-boundary-classes.sh`) |
 
 ### Bottle dirfd
 
@@ -142,4 +144,4 @@ relative paths, `..`, or missing dirfd.
 - [Threading](threading.md)
 - [Invariants](invariants.md)
 - [Architecture](architecture.md)
-- [Roadmap](roadmap.md) — residual boundary tax / perf plateau
+- [Roadmap](roadmap.md) — multi-file ~×1.24 plateau; residual boundary tax

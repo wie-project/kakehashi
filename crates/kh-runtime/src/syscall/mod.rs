@@ -17,6 +17,9 @@
 //! - [`signal`] — sigprocmask/sigaction (soft)
 //! - [`net`] — pipe/socket/connect/poll/select (curl G3)
 
+#[cfg(test)]
+mod boundary_bench;
+mod boundary_stats;
 mod common;
 mod fd;
 mod fs;
@@ -43,6 +46,7 @@ pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
 pub fn reset_syscall_state(max_syscalls: usize) {
     proc_state::reset_run(max_syscalls);
     helpers::reset_futex_stats();
+    boundary_stats::reset();
 }
 
 /// Print guest park/wake helper counters when `KAKEHASHI_FUTEX_STATS` is set.
@@ -50,8 +54,20 @@ pub(crate) fn dump_futex_stats_if_enabled() {
     helpers::dump_futex_stats_if_enabled();
 }
 
+/// Print hypercall dispatch counters when `KAKEHASHI_BOUNDARY_STATS` is set.
+pub(crate) fn dump_boundary_stats_if_enabled() {
+    boundary_stats::dump_if_enabled();
+}
+
 /// Dispatches a Darwin BSD syscall by number.
 pub fn dispatch(args: SyscallArgs) -> SyscallResult {
+    let stats = boundary_stats::begin();
+    let result = dispatch_inner(args);
+    boundary_stats::end(stats, args.number);
+    result
+}
+
+fn dispatch_inner(args: SyscallArgs) -> SyscallResult {
     // Atomic tick — do not take the process lock on every SVC.
     if proc_state::tick_syscall() {
         return SyscallResult {
@@ -153,20 +169,55 @@ pub fn dispatch(args: SyscallArgs) -> SyscallResult {
         None => {
             // Rate-limited diagnostic so hangs (e.g. 7zz archive) show the
             // missing Darwin number without flooding when guests spin.
-            log_unknown_syscall(args.number, args.x0, args.x1, args.x2);
+            log_unknown_syscall(args);
             SyscallResult::err("unknown", ENOSYS)
         }
     }
 }
 
-fn log_unknown_syscall(number: u32, x0: u64, x1: u64, x2: u64) {
+fn log_unknown_syscall(args: SyscallArgs) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
     if n >= 32 {
         return;
     }
-    tracing::warn!(number, x0 = format_args!("{x0:#x}"), x1 = format_args!("{x1:#x}"), x2 = format_args!("{x2:#x}"), "unknown BSD syscall");
+    let number = args.number;
+    let pc = args.pc;
+    let path = if pc == 0 { "hypercall" } else { "residual-brk" };
+    // Peek guest text around PC: residual sites often set x16 far above the
+    // svc; dump pc-28..pc+4 as hex words for offline decode.
+    let mut hex = String::new();
+    if pc != 0 {
+        // Words at pc-28..pc+4 (7 before, 1 at pc, 1 after) for offline decode.
+        let base = pc.wrapping_sub(28);
+        for i in 0_u64..9 {
+            let va = base.wrapping_add(i.wrapping_mul(4));
+            let w = if crate::mem::registry_check_range(va, 4, false) {
+                common::guest_read_u32(va)
+            } else {
+                0
+            };
+            if !hex.is_empty() {
+                hex.push(' ');
+            }
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{w:08x}"));
+        }
+    }
+    tracing::warn!(
+        number,
+        number_hex = format_args!("{number:#x}"),
+        pc = format_args!("{pc:#x}"),
+        path,
+        x0 = format_args!("{:#x}", args.x0),
+        x1 = format_args!("{:#x}", args.x1),
+        x2 = format_args!("{:#x}", args.x2),
+        x3 = format_args!("{:#x}", args.x3),
+        x4 = format_args!("{:#x}", args.x4),
+        x5 = format_args!("{:#x}", args.x5),
+        words = hex.as_str(),
+        "unknown BSD syscall"
+    );
 }
 
 #[cfg(test)]

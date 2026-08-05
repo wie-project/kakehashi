@@ -113,6 +113,7 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/src/target \
   -e "KAKEHASHI_HYPERCALL=${KAKEHASHI_HYPERCALL:-}" \
   -e "KAKEHASHI_FUTEX_STATS=${KAKEHASHI_FUTEX_STATS:-}" \
+  -e "KAKEHASHI_BOUNDARY_STATS=${KAKEHASHI_BOUNDARY_STATS:-}" \
   "${IMAGE}" \
   bash -c '
 set -euo pipefail

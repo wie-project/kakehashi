@@ -178,20 +178,24 @@ chatty the guest is — not an instruction emulator.
 ### Measured gap
 
 On Ubuntu aarch64 bare-metal (UTM), multi-file `7zz` archive
-(`-t7z -m0=lzma2 -mx=5 -mmt=4`, ~8k files / ~240 MiB tree):
+(`-t7z -m0=lzma2 -mx=5 -mmt=4`, ~14.5k files / ~309 MiB tree, `mmt=4`):
 
 |      | native Linux `7zz` | Darwin `7zz` under `kh` |     ratio |
 | ---- | -----------------: | ----------------------: | --------: |
-| wall |            ~22.5 s |                  ~118 s | **~×5.2** |
+| wall |           ~44.1 s |                  ~54.8 s | **~×1.24** |
 
-On compression-heavy, few-file samples the gap is often much smaller
-(~×1.1–1.2). The large multi-file gap is dominated by **path walk + per-syscall
-boundary**, not “wrong LZMA”.
+Same machine, same tree, same flags; both exit 1 on a single scan warning
+(broken symlink) — not a hang. Older ~×5.2 numbers (~8k / ~240 MiB, ~22.5 s
+native / ~118 s `kh`) were dominated by freestanding **first-fit freelist**
+O(n²) churn; size-class LIFO freelists closed most of that gap. Residual is
+mostly real LZMA + boundary × crossings (not “wrong compression”).
+
+Few-file / compression-heavy samples remain ~×1.1–1.3.
 
 Hypercall is on by default for all guest threads. Opt out with
 `KAKEHASHI_HYPERCALL=0` only for debug (residual `svc`→`brk` / SIGTRAP).
 
-### Why ~×5 is still useful in CI
+### Why ~×1.2 is still useful in CI
 
 The product goal for CI is not “as fast as native macOS,” but **run Darwin
 CLI/tools on cheap Linux aarch64 runners** instead of scarce, expensive
@@ -208,10 +212,10 @@ minute; see [Actions runner pricing](https://docs.github.com/en/billing/referenc
 | macOS larger (e.g. 12-core / M2 Pro) |   $0.077–$0.102 |
 
 macOS standard is roughly **×10–×12** the Linux arm64 minute rate before any
-wall-time difference. Even if a job runs **×5 slower** under `kh` on Linux
-arm64 than the same work on a macOS runner, billable cost can still be lower
-because the macOS minute is an order of magnitude more expensive
-(illustrative: 5 × $0.005 ≈ $0.025 vs 1 × $0.062). Public-repo free minutes
+wall-time difference. A job that is only **~×1.2 slower** under `kh` on Linux
+arm64 than native Linux (and far cheaper per minute than macOS) is a strong
+CI win; even a larger gap would often still beat macOS billable cost
+(illustrative: 2 × $0.005 ≈ $0.010 vs 1 × $0.062). Public-repo free minutes
 and self-hosted Linux amplify that further; macOS hosted capacity also tends
 to queue longer and (on GitLab SaaS) is Premium/Ultimate / beta-gated.
 
