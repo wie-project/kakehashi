@@ -139,11 +139,13 @@ fn socklen_of(len: usize) -> Option<libc::socklen_t> {
 ///
 /// Both ends are set `O_NONBLOCK|O_CLOEXEC`. Freestanding curl/c-ares often
 /// `poll` then `read` the wakeup pipe; a **blocking** host pipe deadlocks the
-/// single-threaded guest when nothing is writable yet.
+/// single-threaded guest when nothing is readable yet (tier1 hang).
 ///
-/// Git’s `start_command` wants a blocking notify-pipe `read` after `fork`.
-/// That is emulated in the `read` syscall: while unreaped children exist, an
-/// `EAGAIN` on a pipe waits for readability (see `io::handle_read`).
+/// Darwin default is blocking; guest-visible semantics are tracked in
+/// [`crate::process::fd_guest_nonblock`]. I/O waits on `EAGAIN` until the guest
+/// sets `O_NONBLOCK` via `fcntl`. Nested helpers also call
+/// [`crate::process::normalize_stdio_pipes_blocking`] so inherited command
+/// pipes behave as Darwin blocking stdin/stdout.
 #[must_use]
 pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
     let mut fds = [0_i32; 2];
@@ -164,12 +166,9 @@ pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
             return None;
         }
         for fd in fds {
+            set_nonblock(fd);
             // SAFETY: freshly created pipe ends.
             unsafe {
-                let fl = libc::fcntl(fd, libc::F_GETFL);
-                if fl >= 0 {
-                    let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-                }
                 let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
@@ -184,9 +183,19 @@ pub fn pipe_fds() -> Option<(RawFd, RawFd)> {
 /// `poll(2)` (`-1` = forever). Returns `true` if any interesting revent.
 #[must_use]
 pub fn poll_fd_readable(fd: RawFd, timeout_ms: i32) -> bool {
+    poll_fd(fd, libc::POLLIN, timeout_ms)
+}
+
+/// Block until `fd` is writable, hung-up, or errored.
+#[must_use]
+pub fn poll_fd_writable(fd: RawFd, timeout_ms: i32) -> bool {
+    poll_fd(fd, libc::POLLOUT, timeout_ms)
+}
+
+fn poll_fd(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> bool {
     let mut pfd = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
     loop {
@@ -204,7 +213,7 @@ pub fn poll_fd_readable(fd: RawFd, timeout_ms: i32) -> bool {
         if rc == 0 {
             return false;
         }
-        let interest = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        let interest = events | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
         return pfd.revents & interest != 0;
     }
 }
@@ -217,6 +226,30 @@ fn set_nonblock(fd: RawFd) {
         if fl >= 0 {
             let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
+    }
+}
+
+/// Clear host `O_NONBLOCK` (best-effort). Used for nested-helper stdio pipes.
+pub fn clear_nonblock(fd: RawFd) {
+    // SAFETY: live fd.
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// `true` when `fd` is a FIFO/pipe (`S_IFIFO`).
+#[must_use]
+pub fn fd_is_fifo(fd: RawFd) -> bool {
+    // SAFETY: fstat on a live fd.
+    unsafe {
+        let mut st: libc::stat = core::mem::zeroed();
+        if libc::fstat(fd, &raw mut st) != 0 {
+            return false;
+        }
+        (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
     }
 }
 

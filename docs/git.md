@@ -12,9 +12,77 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | --- | --- | --- |
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/git` | **pass** (swscan, no Apple ID) |
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
-| G2 | Missing surface from probes | **in progress** (see below) |
+| G2 | Missing surface from probes | **in progress** (HTTPS helper / freestanding libcurl) |
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
-| G4 | Remote over HTTPS (reuse curl network path) | pending |
+| G4 | Remote over HTTPS (reuse curl network path) | **in progress** (`ls-remote` pass; clone open) |
+
+### G4 notes (HTTPS / freestanding libcurl)
+
+`git-remote-http` `LC_LOAD`s `/usr/lib/libcurl.4.dylib` (plus soft-skipped
+`libz` / `libiconv` / `libexpat` / CoreServices). Product approach matches
+`libc++`:
+
+| Piece | Location |
+| --- | --- |
+| `curl_*` C ABI | freestanding `kh-libsystem` (`src/curl.rs`) — clean-room, not upstream libcurl |
+| Bottle alias | `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` ([`layout::ensure_libcurl_symlink`](../crates/kh-runtime/src/bottle/layout.rs)) |
+| HTTP(S) I/O | host helper `KH_HELPER_HTTP` (`0x4B48_000C`) runs host `curl` + bottle CA |
+| Loader alias fix | map `install_name` from **LC_LOAD** (not only LC_ID) so two-level ordinals against `libcurl.4.dylib` resolve |
+
+**Progress (HTTPS list via freestanding libcurl):**
+
+| Step | State |
+| --- | --- |
+| `capabilities` | **pass** |
+| Helper `list` (protocol v0/v1) | **pass** — refs from GitHub |
+| Host HTTP helper + body + `Content-Type` | **pass** |
+| `git ls-remote https://…` (spawned helper) | **pass** (Docker; protocol v1) |
+
+```text
+# capabilities
+printf 'capabilities\n\n' | kh run …/git-remote-http -- origin https://…
+# → stateless-connect / fetch / get / …
+
+# list (protocol.version=1 in ~/.gitconfig; v2 returns empty refs by design)
+printf 'list\n\n' | kh run …/git-remote-http -- origin https://github.com/octocat/Hello-World.git
+# → @refs/heads/master HEAD / 7fd1a60b… refs/heads/master / …
+
+# full spawn path
+kh run git -- ls-remote https://github.com/octocat/Hello-World.git
+# → 7fd1a60b…\tHEAD / 7fd1a60b…\trefs/heads/master / …
+```
+
+**Fixes landed for G4 list / ls-remote:**
+
+1. **Apple arm64 varargs** — `curl_easy_setopt` / `curl_easy_getinfo` are
+   `...` APIs; Darwin places the value on the **stack**, not in `x2`. C wrappers
+   in `curl_varargs.c` (`va_arg`) call Rust `kh_curl_easy_*_impl`. Without this,
+   `CURLOPT_HTTPHEADER` became `0x5` → SEGV walking the slist.
+2. **`fcntl` varargs** — same ABI: `int fcntl(int, int, …)`. Fixed 3-arg export
+   never saw `O_NONBLOCK` from curl multi → empty wakeup-pipe `read` hung
+   forever (`docker-curl-options.sh` tier1). C wrapper in `fcntl_varargs.c` →
+   `kh_fcntl_impl`.
+3. **Guest `O_NONBLOCK` tracking** — host pipes/sockets stay non-blocking for
+   multi; I/O emulates Darwin **blocking** until the guest `fcntl(F_SETFL)`.
+   Nested re-exec clears nonblock on stdio pipes (helper stdin).
+4. **`Content-Type`** — smart HTTP discovery needs
+   `application/x-git-upload-pack-advertisement`. Host helper parses `-D`
+   headers into `KhHttpReq` v2 `out_ctype`; freestanding exposes it via
+   `CURLINFO_CONTENT_TYPE`. Missing type made git treat the body as dumb HTTP
+   → `info/refs not valid`.
+5. **PAGEZERO guards** — low 4 GiB guest pointers rejected in string/curl walks.
+6. **Nested `HOME`** — re-exec of Mach-O helpers inherits guest
+   `HOME=/Volumes/linux…` as host env; do not prefix again
+   (`/Volumes/linux/Volumes/linux/…` broke `~/.gitconfig` / `protocol.version`).
+7. **Guest `PATH`** — include CLT `…/libexec/git-core` so `execvp(git-remote-https)`
+   finds the helper.
+
+**Still open for full G4:** `clone` / fetch pack transfer, protocol v2
+`stateless-connect`. Prefer `protocol.version=1` in guest `~/.gitconfig` until
+v2 RPC is complete.
+
+Local G3 without the remote helper remains green. Curl options **tier1** is
+green again after the `fcntl` varargs fix.
 
 ### G3 notes (path, uid, zlib, printf)
 
@@ -76,7 +144,7 @@ kh run git -- status                  # clean on main
 | HOME | Guest `HOME=/Volumes/linux{host $HOME}` so host `~/.gitconfig` is readable. Confirm: `kh run git -- config user.name`. |
 | FSEvents | Soft stubs in freestanding libSystem (`FSEventStreamCreate` → null). Nested post-commit `git maintenance --detach` used to fail load when bottle was lost under guest HOME (`unresolved symbol _FSEventStreamCreate`); fixed by always injecting host KAKEHASHI_* paths on re-exec. |
 | `_environ` | Must be a **data** export. Binding a missing-function trampoline here made git walk trampoline bytes as `char **` and SIGSEGV after `pipe` in `start_command`. |
-| Pipe | Host `pipe(2)` is `O_NONBLOCK` (curl/c-ares). Git’s notify-pipe blocking `read` after `fork` is emulated: while unreaped children exist, `read` waits for readability instead of returning `EAGAIN`. |
+| Pipe | Host `pipe(2)` is `O_NONBLOCK` (curl/c-ares). Guest-visible `O_NONBLOCK` is tracked per FD; blocking semantics are emulated until `fcntl(F_SETFL)`. Nested re-exec forces stdio pipes blocking for helpers. |
 | Open-fail WARN | Expected ENOENT probes (`.gitignore`, empty index, templates, attributes) |
 
 ## Install (public Software Update catalog)
@@ -152,3 +220,6 @@ Host image needs `p7zip-full` / `7z` for pkg peel (`Dockerfile.dev`).
 
 Same as curl: **trace-first**. Install real Darwin `git` → `kh run` / `kh
 trace` → implement only the syscalls and freestanding symbols the log shows.
+
+Clean-room rules for all ABI work (no Darling, no proprietary paste, provenance
+in PRs): **[legal-method.md](legal-method.md)**.

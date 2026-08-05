@@ -48,10 +48,22 @@ pub unsafe extern "C" fn puts(s: *const c_char) -> c_int {
 // Variadic *printf lives in `printf_fmt.c` (stable Rust has no c_variadic):
 // `printf`, `fprintf`, `vprintf`, `vfprintf`, `snprintf`, …
 
+/// Darwin MH_EXECUTE `__PAGEZERO` is 4 GiB — low canonical addresses are never
+/// valid guest data. MH_DYLIB freestanding images use low preferred VAs but are
+/// always **slid** at load, so live pointers are `preferred + slide` (>> 32-bit).
+pub(crate) const PAGEZERO_END: usize = 0x1_0000_0000;
+
+/// True when `p` is outside the unmapped low 4 GiB (Darwin PAGEZERO).
+#[inline]
+pub(crate) fn ptr_usable(p: *const c_void) -> bool {
+    p.addr() >= PAGEZERO_END
+}
+
 /// C `strlen` → nlist `_strlen`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
-    if s.is_null() {
+    // Reject PAGEZERO / null — unrebased pointers SEGV here otherwise (G4).
+    if s.is_null() || s.addr() < PAGEZERO_END {
         return 0;
     }
     let mut n = 0_usize;
@@ -74,7 +86,7 @@ pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
 /// C `memcpy` → nlist `_memcpy`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    if n > 0 && !dst.is_null() && !src.is_null() {
+    if n > 0 && ptr_usable(dst) && ptr_usable(src) {
         // SAFETY: non-overlapping regions; manual loop (no host memcpy).
         unsafe {
             byte_copy_forward(dst.cast(), src.cast(), n);
@@ -86,7 +98,7 @@ pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) 
 /// C `memmove` → nlist `_memmove`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
-    if n > 0 && !dst.is_null() && !src.is_null() {
+    if n > 0 && ptr_usable(dst) && ptr_usable(src) {
         // SAFETY: may overlap.
         unsafe {
             let d = dst.cast::<u8>();
@@ -104,7 +116,7 @@ pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize)
 /// C `memset` → nlist `_memset`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_void {
-    if n > 0 && !dst.is_null() {
+    if n > 0 && ptr_usable(dst) {
         let byte = u8::try_from(c.cast_unsigned() & 0xff).unwrap_or(0);
         // SAFETY: valid for n bytes.
         unsafe {

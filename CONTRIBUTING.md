@@ -12,7 +12,7 @@ If you want to help this project, please follow these guidelines.
 
 4. **Language** — Source code and comments are English only.
 
-5. **Legal** — Do not copy code from Darling (GPL-3.0). Treat closed Apple components carefully; study public Apple open source as specification, do not vendor proprietary blobs.
+5. **Legal / clean-room** — Follow [`docs/legal-method.md`](docs/legal-method.md). Hard bans: no Darling (or similar) code for implementation; no porting proprietary Apple sources or decompiled bodies; no vendoring Apple SDKs/CLT blobs in-tree. Primary method: **trace-first** black-box observation of legally obtained guests + public specs (POSIX, man pages, Apple open source as **specification** only).
 
 6. **AI-assisted contributions** — Allowed if you reviewed the change yourself and it complies with the rules above.
 

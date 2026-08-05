@@ -114,7 +114,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // `kh run`. Fall back to bottle `/var/root` when host HOME is unset/odd.
     let home = guest_home_env();
     let env_owned = [
-        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+        // git-core first so `execvp("git-remote-https")` finds CLT helpers (G4).
+        "PATH=/Library/Developer/CommandLineTools/usr/libexec/git-core:\
+/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            .to_owned(),
         home,
         "TMPDIR=/tmp".to_owned(),
     ];
@@ -254,6 +257,12 @@ fn stack_err_static(err: &kh_runtime::StackError) -> &'static str {
 /// config commands. Falls back to bottle `/var/root`.
 fn guest_home_env() -> String {
     match std::env::var("HOME") {
+        // Nested `kh run` (re-exec of a Mach-O helper) inherits the *guest*
+        // env as host environ — HOME is already `/Volumes/linux…`. Do not
+        // prefix again or `~/.gitconfig` resolves to a doubled path (G4).
+        Ok(h) if h.starts_with("/Volumes/linux") && !h.contains('\0') => {
+            format!("HOME={h}")
+        }
         Ok(h) if h.starts_with('/') && !h.contains('\0') => {
             format!("HOME=/Volumes/linux{h}")
         }

@@ -7,10 +7,10 @@ use crate::heap::{free, malloc};
 use crate::sys::{
     self, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_FCNTL, SYS_FORK,
     SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETEGID, SYS_GETEUID,
-    SYS_GETGID, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID, SYS_LINK, SYS_LSEEK,
-    SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN, SYS_OPENAT, SYS_PREAD,
-    SYS_PWRITE, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SIGACTION, SYS_SIGPROCMASK,
-    SYS_GETPGRP, SYS_KILL, SYS_SETPGID, SYS_SETSID, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
+    SYS_GETGID, SYS_GETPGRP, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID, SYS_KILL,
+    SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN,
+    SYS_OPENAT, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SETPGID,
+    SYS_SETSID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::trace;
@@ -52,11 +52,7 @@ fn ret_c_int(ret: isize) -> c_int {
 #[inline]
 fn ret_ssize(ret: isize) -> isize {
     let r = apply_ret(ret);
-    if r < 0 {
-        -1
-    } else {
-        r
-    }
+    if r < 0 { -1 } else { r }
 }
 
 #[inline]
@@ -106,8 +102,7 @@ const O_RDWR: c_int = 0x0002;
 const O_CREAT: c_int = 0x0200;
 const O_EXCL: c_int = 0x0800;
 const EEXIST: i32 = 17;
-const MKSTEMP_ALPH: &[u8] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const MKSTEMP_ALPH: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 /// C `mkstemp` → nlist `_mkstemp` (template ends in `XXXXXX`; rewritten in place).
 ///
@@ -197,17 +192,19 @@ pub(crate) unsafe extern "C" fn close(fd: c_int) -> c_int {
     ret_c_int(ret)
 }
 
-/// C `fcntl` → nlist `_fcntl` (Darwin BSD #92; runtime already translates).
+/// Impl for C `fcntl` (varargs wrapper in `fcntl_varargs.c`).
 ///
-/// Curl G1 first-called missing import on `--version` (named trampoline log).
+/// Darwin `fcntl` is `int fcntl(int, int, ...)`; on Apple arm64 the optional
+/// third argument is **stack-passed**. A fixed 3-arg Rust export never saw
+/// `O_NONBLOCK` from curl multi → wakeup-pipe `read` hung (tier1).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+pub(crate) unsafe extern "C" fn kh_fcntl_impl(fd: c_int, cmd: c_int, arg: u64) -> c_int {
     let ret = unsafe {
         sys::syscall3(
             SYS_FCNTL,
             u64::from(fd.cast_unsigned()),
             u64::from(cmd.cast_unsigned()),
-            u64::from(arg.cast_unsigned()),
+            arg,
         )
     };
     ret_c_int(ret)
@@ -772,11 +769,7 @@ pub(crate) unsafe extern "C" fn vfork() -> c_int {
 
 /// C `waitpid` → nlist `_waitpid` (`wait4` without rusage).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn waitpid(
-    pid: c_int,
-    status: *mut c_int,
-    options: c_int,
-) -> c_int {
+pub(crate) unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
     ret_c_int(unsafe {
         sys::syscall4(
             SYS_WAIT4,
@@ -861,10 +854,7 @@ pub(crate) unsafe extern "C" fn execve(
 
 /// C `execvp` → nlist `_execvp` (PATH search then [`execve`]).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn execvp(
-    file: *const c_char,
-    argv: *const *const c_char,
-) -> c_int {
+pub(crate) unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
     if file.is_null() {
         errno::set_errno(EINVAL);
         return -1;
@@ -922,7 +912,11 @@ pub(crate) unsafe extern "C" fn execvp(
                 1_usize
             } else {
                 unsafe {
-                    core::ptr::copy_nonoverlapping(dir.cast::<u8>(), candidate.as_mut_ptr(), dir_len);
+                    core::ptr::copy_nonoverlapping(
+                        dir.cast::<u8>(),
+                        candidate.as_mut_ptr(),
+                        dir_len,
+                    );
                 }
                 dir_len
             };
@@ -941,13 +935,7 @@ pub(crate) unsafe extern "C" fn execvp(
             if let Some(slot) = candidate.get_mut(n) {
                 *slot = 0;
             }
-            let rc = unsafe {
-                execve(
-                    candidate.as_ptr().cast(),
-                    argv,
-                    envp.cast_const().cast(),
-                )
-            };
+            let rc = unsafe { execve(candidate.as_ptr().cast(), argv, envp.cast_const().cast()) };
             if rc != -1 {
                 return rc;
             }
@@ -965,20 +953,14 @@ pub(crate) unsafe extern "C" fn execvp(
 
 /// C `execl` → nlist `_execl` (varargs not supported; soft fail).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn execl(
-    _path: *const c_char,
-    _arg0: *const c_char,
-) -> c_int {
+pub(crate) unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char) -> c_int {
     errno::set_errno(ENOSYS);
     -1
 }
 
 /// C `execlp` → nlist `_execlp` (varargs not supported; soft fail).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn execlp(
-    _file: *const c_char,
-    _arg0: *const c_char,
-) -> c_int {
+pub(crate) unsafe extern "C" fn execlp(_file: *const c_char, _arg0: *const c_char) -> c_int {
     errno::set_errno(ENOSYS);
     -1
 }
@@ -1364,8 +1346,7 @@ const SOFT_ENV_SLOTS: usize = 48;
 const SOFT_ENV_WIDTH: usize = 384;
 
 /// `KEY=VALUE\0` slots (freestanding; single guest process).
-static mut SOFT_ENV: [[u8; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS] =
-    [[0; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS];
+static mut SOFT_ENV: [[u8; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS] = [[0; SOFT_ENV_WIDTH]; SOFT_ENV_SLOTS];
 static mut SOFT_ENV_LIVE: [bool; SOFT_ENV_SLOTS] = [false; SOFT_ENV_SLOTS];
 static mut SOFT_ENV_SEEDED: bool = false;
 
@@ -1422,7 +1403,10 @@ fn soft_env_seed_defaults() {
         }
         SOFT_ENV_SEEDED = true;
     }
-    let path = b"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0";
+    // git-core first: Apple `git` execvp's `git-remote-https` (and friends) via
+    // PATH; without libexec they fall back to a broken `git remote-https` spawn.
+    let path = b"/Library/Developer/CommandLineTools/usr/libexec/git-core:\
+/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0";
     let tmp = b"/tmp\0";
     // HOME via host helper → `/Volumes/linux{host $HOME}` so host
     // `git config --global` / `~/.gitconfig` is visible under `kh run`.
@@ -1445,13 +1429,7 @@ fn soft_env_seed_defaults() {
         (b"HOME\0".as_slice(), home),
         (b"TMPDIR\0".as_slice(), tmp.as_slice()),
     ] {
-        let _ = unsafe {
-            soft_env_set(
-                name.as_ptr().cast(),
-                val.as_ptr().cast(),
-                1,
-            )
-        };
+        let _ = unsafe { soft_env_set(name.as_ptr().cast(), val.as_ptr().cast(), 1) };
     }
     soft_env_rebuild_environ();
 }
@@ -1563,7 +1541,13 @@ fn soft_env_key_eq(entry: &[u8], key: *const c_char, key_len: usize) -> bool {
     true
 }
 
-fn soft_env_write_kv(entry: &mut [u8; SOFT_ENV_WIDTH], name: *const c_char, key_len: usize, value: *const c_char, val_len: usize) {
+fn soft_env_write_kv(
+    entry: &mut [u8; SOFT_ENV_WIDTH],
+    name: *const c_char,
+    key_len: usize,
+    value: *const c_char,
+    val_len: usize,
+) {
     entry.fill(0);
     unsafe {
         core::ptr::copy_nonoverlapping(name.cast::<u8>(), entry.as_mut_ptr(), key_len);
@@ -2109,7 +2093,6 @@ unsafe fn fill_tm_into(clock: *const i64, out: *mut Tm) {
 }
 
 fn strftime_push(out: &mut [u8; 128], oi: &mut usize, b: u8) -> bool {
-    // Leave room for a trailing NUL when the buffer is later copied out.
     if oi.saturating_add(1) >= out.len() {
         return false;
     }
@@ -2169,14 +2152,23 @@ pub(crate) unsafe extern "C" fn strftime(
     format: *const c_char,
     tm: *const c_void,
 ) -> usize {
-    if s.is_null() || max == 0 || format.is_null() || tm.is_null() {
+    // Darwin PAGEZERO is 4 GiB; refuse low/unrebased buffers.
+    if s.is_null()
+        || s.addr() < crate::stdio::PAGEZERO_END
+        || max == 0
+        || format.is_null()
+        || format.addr() < crate::stdio::PAGEZERO_END
+        || tm.is_null()
+        || tm.addr() < crate::stdio::PAGEZERO_END
+    {
         return 0;
     }
+    let max = max.min(4096);
     let t = unsafe { &*tm.cast::<Tm>() };
     let mut out = [0_u8; 128];
     let mut oi = 0_usize;
     let mut fi = 0_usize;
-    // SAFETY: format is a guest C string.
+    // SAFETY: format is a guest C string (checked above).
     unsafe {
         loop {
             let c = format.add(fi).read().cast_unsigned();
@@ -2238,7 +2230,6 @@ pub(crate) unsafe extern "C" fn strftime(
             }
         }
     }
-    // Need room for NUL; POSIX: return 0 if result including NUL does not fit.
     if oi.saturating_add(1) > max {
         return 0;
     }

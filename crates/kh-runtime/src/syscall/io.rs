@@ -7,6 +7,9 @@ use super::common::{
 };
 use super::fd::{guest_to_host_fd, read_host_fd, write_host_fd};
 
+/// Darwin `EAGAIN`.
+const DARWIN_EAGAIN: i64 = 35;
+
 /// `write`.
 pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     let name = "write";
@@ -29,11 +32,24 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     }
 
     let slice = guest_slice(args.x1, len);
-    match write_host_fd(host_fd, slice) {
-        Ok(n) => SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
-        Err(e) => {
-            tracing::warn!(gfd, error = %e, "write fail");
-            SyscallResult::err(name, EPERM)
+    // Host pipes are O_NONBLOCK; emulate Darwin blocking write until the guest
+    // sets O_NONBLOCK (curl multi) or the pipe drains.
+    loop {
+        match write_host_fd(host_fd, slice) {
+            Ok(n) => return SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
+            Err(e) => {
+                let os = e.raw_os_error().unwrap_or(0);
+                if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
+                    if !crate::process::fd_guest_nonblock(gfd)
+                        && crate::host::poll_fd_writable(host_fd, -1)
+                    {
+                        continue;
+                    }
+                    return SyscallResult::err(name, DARWIN_EAGAIN);
+                }
+                tracing::warn!(gfd, error = %e, "write fail");
+                return SyscallResult::err(name, EPERM);
+            }
         }
     }
 }
@@ -130,9 +146,10 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
     // Read straight into guest memory (identity map) — no intermediate heap
     // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
     let buf = guest_slice_mut(args.x1, len);
-    // Host pipes are `O_NONBLOCK` (curl/c-ares). Git’s notify pipe after
-    // `fork` expects Darwin blocking `read`: while unreaped children exist,
-    // wait for readability instead of returning EAGAIN immediately.
+    // Host pipes/sockets are O_NONBLOCK (curl multi). Darwin guests expect
+    // blocking reads until they fcntl O_NONBLOCK — wait on EAGAIN when the
+    // guest flag is clear (git notify-pipe, helper stdin). When the guest set
+    // nonblock (or the fd is a socket marked nonblock at alloc), surface EAGAIN.
     loop {
         match read_host_fd(host_fd, buf) {
             Ok(nread) => {
@@ -142,13 +159,15 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
             Err(e) => {
                 let os = e.raw_os_error().unwrap_or(0);
                 if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
-                    if crate::process::live_children() > 0
+                    // Guest-blocking FD: wait for data (git notify-pipe / helper
+                    // stdin). Guest-nonblock (curl multi / sockets): EAGAIN.
+                    if !crate::process::fd_guest_nonblock(gfd)
                         && crate::host::poll_fd_readable(host_fd, -1)
                     {
                         continue;
                     }
                     tracing::debug!(gfd, "read EAGAIN");
-                    return SyscallResult::err(name, 35);
+                    return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
                 tracing::warn!(gfd, os, "read fail");
                 return SyscallResult::err(name, EPERM);

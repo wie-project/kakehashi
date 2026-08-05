@@ -9,6 +9,7 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Threading](threading.md) | 1:1 threads, join protocol, worker teardown |
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
+| [Clean-room / legal method](legal-method.md) | No Darling; no proprietary paste; trace-first ABI work |
 | [Roadmap](roadmap.md) | Perf status, next work, process |
 | [Optimization process](roadmap2.md) | Strict measure-first perf process, plates, hard cost rules |
 | [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |

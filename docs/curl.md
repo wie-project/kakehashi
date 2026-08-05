@@ -7,7 +7,8 @@ Colima first, UTM later.
 **Method: trace-first.** Download a real Darwin arm64 binary → install into the
 bottle → `kh run` / `kh trace` → implement only what the log shows.
 
-See also: [roadmap](roadmap.md), [architecture](architecture.md), root
+Clean-room rules: [legal-method.md](legal-method.md). See also:
+[roadmap](roadmap.md), [architecture](architecture.md), root
 [README — What works](../README.md#what-works).
 
 ## Status (gates)
@@ -44,6 +45,7 @@ Docker, and HTTP GET under UTM.
 | `/etc/ssl/openssl.cnf` seed | Optional quieting of OpenSSL probe |
 | Broader curl CLI | POST, auth, proxies, HTTP/2–3 end-to-end, FTP — implement trace-first only when a gate needs them |
 | `t7_two_urls` SEGV (serial multi-URL + `-o …#1`) | Once seen as guest SIGSEGV in c-ares `_ares_query_dnsrec_cb` (bad callback arg); tier7 + 30× stress now green. Re-open if it returns under full `docker-curl-options.sh all` |
+| tier1 hang (regression) | **fixed** — Darwin `fcntl` is varargs; freestanding fixed 3-arg export dropped `O_NONBLOCK` → multi wakeup-pipe `read` blocked forever. See `fcntl_varargs.c` + guest `O_NONBLOCK` FD flags in runtime. |
 
 ### Recent freestanding polish (UTM crash fix)
 

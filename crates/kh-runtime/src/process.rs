@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::host;
@@ -22,8 +22,8 @@ static MAX_SYSCALLS: AtomicU64 = AtomicU64::new(256);
 
 /// Unreaped host children from guest `fork` (parent side only).
 ///
-/// Used so `read` can emulate Darwin **blocking** notify-pipe waits after
-/// spawn while pipes themselves stay `O_NONBLOCK` for curl/c-ares.
+/// Secondary signal for blocking I/O waits; primary control is
+/// [`fd_guest_nonblock`] (guest `O_NONBLOCK` flag).
 static LIVE_CHILDREN: AtomicU64 = AtomicU64::new(0);
 
 /// Max guest FD slots (stdio 0–2 + table). Keeps FDs under typical OPEN_MAX.
@@ -36,6 +36,12 @@ const FD_EMPTY: i32 = -1;
 /// Slots 0–2 are unused (stdio identity). Other slots: host fd ≥ 0, or [`FD_EMPTY`].
 /// Alloc/take update these atomics; dir streams still use the process lock.
 static FD_HOST: [AtomicI32; FD_SLOTS] = [const { AtomicI32::new(FD_EMPTY) }; FD_SLOTS];
+/// Guest-visible `O_NONBLOCK` per FD slot (including stdio 0–2).
+///
+/// Host pipes/sockets are often forced non-blocking for curl multi; Darwin
+/// guests still expect **blocking** semantics until they `fcntl(F_SETFL)`.
+/// I/O emulates blocking waits when this bit is clear.
+static FD_GUEST_NB: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS];
 /// Hint for next free FD scan.
 static FD_NEXT: AtomicI32 = AtomicI32::new(3);
 
@@ -128,6 +134,7 @@ pub fn fd_take(gfd: i32) -> Option<RawFd> {
 /// Installs `host_fd` into a **specific** guest FD slot (for `dup2`).
 ///
 /// Closes any previous host mapping at `gfd` (except stdio 0–2 identity).
+/// Guest nonblock flag is **not** updated — caller should copy from the source.
 /// Returns `false` if `gfd` is out of range.
 #[must_use]
 #[inline]
@@ -149,6 +156,9 @@ pub fn fd_install(gfd: i32, host_fd: RawFd) -> bool {
 }
 
 /// Allocates a guest FD slot for `host_fd` (lock-free CAS scan).
+///
+/// New slots start with guest-blocking semantics (`O_NONBLOCK` clear). Call
+/// [`fd_set_guest_nonblock`] for sockets / after `fcntl(F_SETFL)`.
 #[must_use]
 #[inline]
 pub fn fd_alloc(host_fd: RawFd) -> Option<i32> {
@@ -159,6 +169,7 @@ pub fn fd_alloc(host_fd: RawFd) -> Option<i32> {
     for idx in start..FD_SLOTS {
         if try_claim_slot(idx, host_fd) {
             let gfd = i32::try_from(idx).ok()?;
+            fd_set_guest_nonblock(gfd, false);
             FD_NEXT.store(gfd.saturating_add(1), Ordering::Relaxed);
             return Some(gfd);
         }
@@ -166,11 +177,55 @@ pub fn fd_alloc(host_fd: RawFd) -> Option<i32> {
     for idx in 3..start.min(FD_SLOTS) {
         if try_claim_slot(idx, host_fd) {
             let gfd = i32::try_from(idx).ok()?;
+            fd_set_guest_nonblock(gfd, false);
             FD_NEXT.store(gfd.saturating_add(1), Ordering::Relaxed);
             return Some(gfd);
         }
     }
     None
+}
+
+/// Guest-visible `O_NONBLOCK` for `gfd` (stdio or allocated slot).
+#[must_use]
+#[inline]
+pub fn fd_guest_nonblock(gfd: i32) -> bool {
+    if gfd < 0 {
+        return false;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return false;
+    };
+    FD_GUEST_NB
+        .get(idx)
+        .is_some_and(|s| s.load(Ordering::Acquire) != 0)
+}
+
+/// Sets guest-visible `O_NONBLOCK` for `gfd`.
+#[inline]
+pub fn fd_set_guest_nonblock(gfd: i32, nonblock: bool) {
+    if gfd < 0 {
+        return;
+    }
+    let Ok(idx) = usize::try_from(gfd) else {
+        return;
+    };
+    if let Some(slot) = FD_GUEST_NB.get(idx) {
+        slot.store(u8::from(nonblock), Ordering::Release);
+    }
+}
+
+/// Clear host `O_NONBLOCK` on stdio when the fd is a pipe/FIFO.
+///
+/// Nested `kh run` (git helpers after `fork`+re-exec) inherits command pipes as
+/// host 0/1/2. Those pipes are created non-blocking for curl multi; helpers
+/// expect Darwin blocking stdin/stdout. Call once per guest run start.
+pub fn normalize_stdio_pipes_blocking() {
+    for fd in 0_i32..=2 {
+        if host::fd_is_fifo(fd) {
+            host::clear_nonblock(fd);
+            fd_set_guest_nonblock(fd, false);
+        }
+    }
 }
 
 /// Bottle root published for path translation (set once per run; rare updates).
@@ -199,6 +254,9 @@ fn reset_fd_map() {
         if i > 2 && prev >= 0 {
             host::close_fd(prev);
         }
+    }
+    for slot in &FD_GUEST_NB {
+        slot.store(0, Ordering::Relaxed);
     }
     FD_NEXT.store(3, Ordering::Relaxed);
 }
@@ -354,6 +412,9 @@ pub fn with_ref<R>(f: impl FnOnce(&ProcessState) -> R) -> R {
 /// Resets FD/signals/counters for a new guest run (keeps bottle root).
 pub fn reset_run(max_syscalls: usize) {
     with_mut(|p| p.reset_run(max_syscalls));
+    // After re-exec of a Mach-O helper, host 0/1/2 may be O_NONBLOCK pipes
+    // created for curl multi in the parent — restore Darwin blocking stdio.
+    normalize_stdio_pipes_blocking();
 }
 
 /// Configures the bottle root used by path-taking syscalls.

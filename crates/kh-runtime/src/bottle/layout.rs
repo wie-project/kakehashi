@@ -30,10 +30,19 @@ pub const GUEST_LIBCXX_REL: &str = "usr/lib/libc++.1.dylib";
 /// Relative symlink target of [`GUEST_LIBCXX_REL`] (sibling under `usr/lib/`).
 pub const GUEST_LIBCXX_TARGET: &str = "libSystem.B.dylib";
 
+/// Guest path for the `libcurl.4.dylib` alias under the bottle root.
+///
+/// Same freestanding product as libSystem (`curl_*` exports live in
+/// `kh-libsystem`). Apple `git-remote-http` loads `/usr/lib/libcurl.4.dylib`.
+pub const GUEST_LIBCURL_REL: &str = "usr/lib/libcurl.4.dylib";
+
+/// Relative symlink target of [`GUEST_LIBCURL_REL`].
+pub const GUEST_LIBCURL_TARGET: &str = "libSystem.B.dylib";
+
 /// Empty directories that form the post-install macOS root skeleton.
 ///
-/// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`)
-/// are created separately.
+/// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`,
+/// `usr/lib/libcurl.4.dylib`) are created separately.
 const DIRS: &[&str] = &[
     "Applications",
     "Library/Application Support",
@@ -103,6 +112,8 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     // dylib as libSystem (no second crate). Target file may be installed later
     // by `kh bottle create` / libsystem install.
     ensure_libcxx_symlink(root)?;
+    // Git HTTPS: guest `/usr/lib/libcurl.4.dylib` → same freestanding dylib.
+    ensure_libcurl_symlink(root)?;
 
     // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
     let volumes_linux = root.join(VOLUMES_LINUX);
@@ -150,35 +161,7 @@ pub fn ensure_dev_nodes(root: &Path) -> io::Result<()> {
 /// Idempotent: existing correct symlink is left alone. A pre-existing non-symlink
 /// file at that path is an error so we never clobber a real dylib.
 pub fn ensure_libcxx_symlink(root: &Path) -> io::Result<()> {
-    let link_path = root.join(GUEST_LIBCXX_REL);
-    if let Ok(meta) = link_path.symlink_metadata() {
-        if meta.file_type().is_symlink() {
-            let target = fs::read_link(&link_path)?;
-            if target == Path::new(GUEST_LIBCXX_TARGET) {
-                return Ok(());
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} already exists as symlink to {} (expected {})",
-                    link_path.display(),
-                    target.display(),
-                    GUEST_LIBCXX_TARGET
-                ),
-            ));
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists and is not a symlink",
-                link_path.display()
-            ),
-        ));
-    }
-    if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    std::os::unix::fs::symlink(GUEST_LIBCXX_TARGET, &link_path)
+    ensure_lib_alias_symlink(root, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, false)
 }
 
 /// Returns `true` if the bottle has the libc++ → libSystem alias symlink.
@@ -189,6 +172,69 @@ pub fn has_libcxx_symlink(root: &Path) -> bool {
         Ok(target) => target == Path::new(GUEST_LIBCXX_TARGET),
         Err(_) => false,
     }
+}
+
+/// Ensures `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` (relative) under `root`.
+///
+/// Idempotent for a correct symlink. A pre-existing **regular file** at that
+/// path (e.g. a temporary third-party dylib drop) is replaced by the alias so
+/// freestanding exports always win after `kh bottle ensure`.
+pub fn ensure_libcurl_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, true)
+}
+
+/// Returns `true` if the bottle has the libcurl → libSystem alias symlink.
+#[must_use]
+pub fn has_libcurl_symlink(root: &Path) -> bool {
+    let link_path = root.join(GUEST_LIBCURL_REL);
+    match fs::read_link(&link_path) {
+        Ok(target) => target == Path::new(GUEST_LIBCURL_TARGET),
+        Err(_) => false,
+    }
+}
+
+/// Shared install-name alias helper (libc++ / libcurl → freestanding libSystem).
+///
+/// When `replace_file` is true, a non-symlink file is removed and replaced.
+fn ensure_lib_alias_symlink(
+    root: &Path,
+    rel: &str,
+    target_name: &str,
+    replace_file: bool,
+) -> io::Result<()> {
+    let link_path = root.join(rel);
+    if let Ok(meta) = link_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&link_path)?;
+            if target == Path::new(target_name) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists as symlink to {} (expected {})",
+                    link_path.display(),
+                    target.display(),
+                    target_name
+                ),
+            ));
+        }
+        if replace_file {
+            fs::remove_file(&link_path)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists and is not a symlink",
+                    link_path.display()
+                ),
+            ));
+        }
+    }
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target_name, &link_path)
 }
 
 /// Creates `link` as a relative symlink to `target` under `root`, if absent.
@@ -236,8 +282,11 @@ mod tests {
         assert!(root.join("var").is_symlink());
         assert!(root.join(VOLUMES_LINUX).is_symlink());
         assert!(has_libcxx_symlink(&root));
+        assert!(has_libcurl_symlink(&root));
         let cxx = fs::read_link(root.join(GUEST_LIBCXX_REL)).expect("libcxx readlink");
         assert_eq!(cxx, Path::new(GUEST_LIBCXX_TARGET));
+        let curl = fs::read_link(root.join(GUEST_LIBCURL_REL)).expect("libcurl readlink");
+        assert_eq!(curl, Path::new(GUEST_LIBCURL_TARGET));
 
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));

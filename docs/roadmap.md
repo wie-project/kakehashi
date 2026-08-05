@@ -85,7 +85,7 @@ Method and commands: [curl.md](curl.md). User-facing recipes:
 | Remaining | polish only (HTTPS UTM smoke, broader CLI flags, soft-framework quieting) |
 
 Process notes for curl polish PRs: internet allowed; clippy `-D warnings`;
-keep `7zz -mmt=4` green; clean-room only (no Darling).
+keep `7zz -mmt=4` green; clean-room only — see [legal-method.md](legal-method.md).
 
 ## Process
 

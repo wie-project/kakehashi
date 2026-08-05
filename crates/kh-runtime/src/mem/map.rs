@@ -594,6 +594,12 @@ fn map_one(
         });
     }
 
+    // aarch64: after writing instructions then mprotect(RX), flush I-cache so
+    // the CPU does not execute stale/garbage bytes (G4 SEGV with odd PC/addr).
+    if req.initprot & VM_PROT_EXECUTE != 0 {
+        clear_icache(base, map_len);
+    }
+
     // When fixed, require exact placement.
     if fixed && actual_host != target_guest {
         return Err(MapError::Sys {
@@ -607,6 +613,27 @@ fn map_one(
 
     Ok(region)
 }
+
+/// Flush D/I caches after writing executable guest code (aarch64 requirement).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn clear_icache(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    // libgcc / compiler-rt — same symbol as hypercall tramp setup.
+    unsafe extern "C" {
+        fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
+    }
+    // SAFETY: range is the live mapping we just wrote and mprotected.
+    unsafe {
+        let start = ptr.cast::<libc::c_void>();
+        let end = ptr.wrapping_add(len).cast::<libc::c_void>();
+        __clear_cache(start, end);
+    }
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+fn clear_icache(_ptr: *mut u8, _len: usize) {}
 
 /// Preferred VA span covering every active segment (host-page aligned ends).
 fn image_preferred_span(

@@ -661,8 +661,26 @@ unsafe extern "C" fn guest_fault_sigaction(
     let mut sp = 0_u64;
     let mut x0 = 0_u64;
     let mut x1 = 0_u64;
+    let mut x2 = 0_u64;
     let mut x8 = 0_u64;
     let mut x16 = 0_u64;
+    let mut x19 = 0_u64;
+    let mut x3 = 0_u64;
+    let mut x4 = 0_u64;
+    let mut x5 = 0_u64;
+    let mut x6 = 0_u64;
+    let mut x7 = 0_u64;
+    let mut x9 = 0_u64;
+    let mut x20 = 0_u64;
+    let mut x21 = 0_u64;
+    let mut x22 = 0_u64;
+    let mut x23 = 0_u64;
+    let mut x24 = 0_u64;
+    let mut x25 = 0_u64;
+    let mut x26 = 0_u64;
+    let mut x27 = 0_u64;
+    let mut x28 = 0_u64;
+    let mut x29 = 0_u64;
     let mut lr = 0_u64;
     if !ctx.is_null() {
         // SAFETY: kernel `ucontext_t` for SA_SIGINFO.
@@ -672,8 +690,26 @@ unsafe extern "C" fn guest_fault_sigaction(
         sp = m.sp;
         x0 = m.regs[0];
         x1 = m.regs[1];
+        x2 = m.regs[2];
+        x3 = m.regs[3];
+        x4 = m.regs[4];
+        x5 = m.regs[5];
+        x6 = m.regs[6];
+        x7 = m.regs[7];
         x8 = m.regs[8];
+        x9 = m.regs[9];
         x16 = m.regs[16];
+        x19 = m.regs[19];
+        x20 = m.regs[20];
+        x21 = m.regs[21];
+        x22 = m.regs[22];
+        x23 = m.regs[23];
+        x24 = m.regs[24];
+        x25 = m.regs[25];
+        x26 = m.regs[26];
+        x27 = m.regs[27];
+        x28 = m.regs[28];
+        x29 = m.regs[29];
         lr = m.regs[30];
     }
     let addr = if info.is_null() {
@@ -685,12 +721,30 @@ unsafe extern "C" fn guest_fault_sigaction(
     };
     let msg = format!(
         "error: guest {name} pc={pc:#x} addr={addr:#x} sp={sp:#x} lr={lr:#x} \
-         x0={x0:#x} x1={x1:#x} x8={x8:#x} x16={x16:#x}\n"
+         x0={x0:#x} x1={x1:#x} x2={x2:#x} x3={x3:#x} x4={x4:#x} x5={x5:#x} \
+         x6={x6:#x} x7={x7:#x} x8={x8:#x} x9={x9:#x} x16={x16:#x} \
+         x19={x19:#x} x20={x20:#x} x21={x21:#x} x22={x22:#x} x23={x23:#x} \
+         x24={x24:#x} x25={x25:#x} x26={x26:#x} x27={x27:#x} x28={x28:#x} x29={x29:#x}\n"
     );
     drop(io::stderr().write_all(msg.as_bytes()));
-    // Best-effort: which mapping owns PC / fault address (helps MT diagnosis).
+    // Best-effort: dump AArch64 insn at PC via /proc/self/mem (no raw guest deref).
+    if pc != 0 {
+        if let Ok(mut f) = std::fs::File::open("/proc/self/mem") {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut insn = [0_u8; 4];
+            if f.seek(SeekFrom::Start(pc)).is_ok() && f.read_exact(&mut insn).is_ok() {
+                let w = u32::from_le_bytes(insn);
+                let m = format!("  insn@{pc:#x} = {w:#010x} bytes={insn:02x?}\n");
+                drop(io::stderr().write_all(m.as_bytes()));
+            }
+        }
+    }
+    // Best-effort: which mapping owns PC / fault address / key regs.
     if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-        for &va in &[pc, addr, lr, x16] {
+        for &va in &[pc, addr, lr, x0, x1, x2, x16, x19, x25] {
+            if va == 0 {
+                continue;
+            }
             for line in maps.lines() {
                 let Some((range, rest)) = line.split_once(' ') else {
                     continue;

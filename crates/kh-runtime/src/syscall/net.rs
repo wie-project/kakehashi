@@ -428,6 +428,10 @@ pub(crate) fn handle_socketpair(args: SyscallArgs) -> SyscallResult {
         process_close_orphan(ga, a);
         return SyscallResult::err(name, ENOMEM);
     };
+    // Host forces O_NONBLOCK; guest must see nonblock so keep-alive EAGAIN
+    // is not turned into an infinite blocking wait.
+    crate::process::fd_set_guest_nonblock(ga, true);
+    crate::process::fd_set_guest_nonblock(gb, true);
     guest_write_u32(args.x3, ga.cast_unsigned());
     guest_write_u32(args.x3.wrapping_add(4), gb.cast_unsigned());
     net_log(&format!("socketpair -> gfd {ga},{gb}"));
@@ -451,6 +455,8 @@ pub(crate) fn handle_socket(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EPERM);
     };
     if let Some(g) = alloc_guest_fd(hfd) {
+        // See socketpair: host is nonblock; guest flag must match for EAGAIN.
+        crate::process::fd_set_guest_nonblock(g, true);
         net_log(&format!("socket -> gfd {g}"));
         SyscallResult::ok(name, u64::try_from(g).unwrap_or(0))
     } else {
@@ -562,6 +568,7 @@ pub(crate) fn handle_accept(args: SyscallArgs) -> SyscallResult {
     match result {
         Ok(new_h) => {
             if let Some(g) = alloc_guest_fd(new_h) {
+                crate::process::fd_set_guest_nonblock(g, true);
                 SyscallResult::ok(name, u64::try_from(g).unwrap_or(0))
             } else {
                 host::close_fd(new_h);

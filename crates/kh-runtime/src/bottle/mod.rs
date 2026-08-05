@@ -3,9 +3,10 @@
 //! * **Path translation** — guest absolute paths resolve under a host root.
 //! * **Lifecycle** — exactly one bottle may exist; create materializes a
 //!   macOS-like FS skeleton (including `Volumes/linux` → host `/`,
-//!   `usr/lib/libc++.1.dylib` → `libSystem.B.dylib`) and installs guest
-//!   `libSystem.B.dylib` from disk discovery or the crate-embedded freestanding
-//!   dylib (`resources/libSystem.B.dylib`, published on crates.io).
+//!   `usr/lib/libc++.1.dylib` / `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib`)
+//!   and installs guest `libSystem.B.dylib` from disk discovery or the
+//!   crate-embedded freestanding dylib (`resources/libSystem.B.dylib`,
+//!   published on crates.io).
 //! * **Guest tools** — host path discovery for integration binaries (`7zz`,
 //!   `curl`, Apple CLT / `git`).
 
@@ -34,8 +35,9 @@ pub use guest_tools::{
 pub use swscan::ENV_XCODE_TOOLS_VERSION;
 pub use xcode_tools::{GUEST_CLT_REL, GUEST_GIT_PATH, GUEST_GIT_REL, bottle_has_git, discover_git};
 pub use layout::{
-    GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX,
-    ensure_dev_nodes, ensure_libcxx_symlink, has_libcxx_symlink, is_bottle_root, materialize,
+    GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, MARKER_MAGIC,
+    MARKER_NAME, VOLUMES_LINUX, ensure_dev_nodes, ensure_libcurl_symlink, ensure_libcxx_symlink,
+    has_libcurl_symlink, has_libcxx_symlink, is_bottle_root, materialize,
 };
 pub use libsystem::{
     EMBEDDED_SOURCE_LABEL, ENV_LIBSYSTEM, GUEST_LIBSYSTEM_ID, GUEST_LIBSYSTEM_REL,

@@ -228,6 +228,7 @@ fn print_path(json: bool) -> Result<()> {
                     "valid_marker": st.valid_marker,
                     "libsystem": st.libsystem,
                     "libcxx_alias": st.libcxx_alias,
+                    "libcurl_alias": st.libcurl_alias,
                 })
             );
         } else {
@@ -252,6 +253,7 @@ fn print_status(json: bool) -> Result<()> {
             println!("marker:    {}", st.valid_marker);
             println!("libSystem: {}", st.libsystem);
             println!("libc++:    {}", st.libcxx_alias);
+            println!("libcurl:   {}", st.libcurl_alias);
             if st.exists && st.valid_marker {
                 let bridge = st.path.join(bottle::VOLUMES_LINUX);
                 println!("linux:     {} -> /", bridge.display());
@@ -268,6 +270,14 @@ fn print_status(json: bool) -> Result<()> {
                         st.path.display(),
                         bottle::GUEST_LIBCXX_REL,
                         bottle::GUEST_LIBCXX_TARGET
+                    );
+                }
+                if st.libcurl_alias {
+                    println!(
+                        "alias:     {}/{} -> {}",
+                        st.path.display(),
+                        bottle::GUEST_LIBCURL_REL,
+                        bottle::GUEST_LIBCURL_TARGET
                     );
                 }
             }
@@ -290,5 +300,6 @@ fn status_json(st: &BottleStatus) -> serde_json::Value {
         "valid_marker": st.valid_marker,
         "libsystem": st.libsystem,
         "libcxx_alias": st.libcxx_alias,
+        "libcurl_alias": st.libcurl_alias,
     })
 }

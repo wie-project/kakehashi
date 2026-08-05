@@ -101,7 +101,6 @@ pub(crate) fn handle_execve(args: SyscallArgs) -> SyscallResult {
         argc = argv.len(),
         "execve"
     );
-
     let err = if is_macho(&host_path) {
         reexec_kh_macho(&host_path, &argv, &envp)
     } else if let Some(script_err) = try_exec_script(&host_path, &argv, &envp) {

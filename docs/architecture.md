@@ -20,6 +20,9 @@ Linux aarch64. Parse and dry-load work on other hosts.
 | Freestanding libSystem | Bottle ships a clean-room dylib, not Apple’s libraries |
 | No Darling GPL | Spec from public Darwin interfaces; no GPL-3.0 Darling code |
 
+Process detail (allowed sources, bans, PR provenance):
+[legal-method.md](legal-method.md).
+
 ## Crate graph
 
 ```

@@ -263,13 +263,21 @@ pub(crate) fn handle_close(args: SyscallArgs) -> SyscallResult {
 /// `dup`.
 pub(crate) fn handle_dup(args: SyscallArgs) -> SyscallResult {
     let name = "dup";
+    let old = reg_as_i32(args.x0);
     let Some(h) = guest_to_host_fd(args.x0) else {
         return SyscallResult::err(name, EBADF);
     };
     let Some(new_host) = host::dup_fd(h) else {
         return SyscallResult::err(name, EBADF);
     };
-    finish_open(name, new_host)
+    let nb = process::fd_guest_nonblock(old);
+    if let Some(gfd) = alloc_guest_fd(new_host) {
+        process::fd_set_guest_nonblock(gfd, nb);
+        SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
+    } else {
+        host::close_fd(new_host);
+        SyscallResult::err(name, EPERM)
+    }
 }
 
 /// `dup2` — oldfd `x0`, newfd `x1`.
@@ -287,12 +295,15 @@ pub(crate) fn handle_dup2(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::ok(name, u64::try_from(new).unwrap_or(0));
     }
 
+    let nb = process::fd_guest_nonblock(old);
+
     // Stdio slots are identity-mapped to host 0/1/2 — must host-dup2 so the
     // next `execve` (re-exec of `kh`) inherits the redirected descriptors.
     if new <= 2 {
         if host::dup2_fd(host_old, new).is_none() {
             return SyscallResult::err(name, EBADF);
         }
+        process::fd_set_guest_nonblock(new, nb);
         return SyscallResult::ok(name, u64::try_from(new).unwrap_or(0));
     }
 
@@ -303,6 +314,7 @@ pub(crate) fn handle_dup2(args: SyscallArgs) -> SyscallResult {
         host::close_fd(host_new);
         return SyscallResult::err(name, EBADF);
     }
+    process::fd_set_guest_nonblock(new, nb);
     SyscallResult::ok(name, u64::try_from(new).unwrap_or(0))
 }
 
@@ -347,10 +359,28 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
             let Some(rc) = host::fcntl_get(h, libc::F_GETFL) else {
                 return SyscallResult::err(name, EBADF);
             };
-            SyscallResult::ok(name, host_fl_to_darwin(rc))
+            // Report guest-visible O_NONBLOCK, not host (pipes are host-nonblock
+            // for curl multi while guests still see Darwin blocking defaults).
+            let mut d = host_fl_to_darwin(rc);
+            let gfd = reg_as_i32(args.x0);
+            d &= !DARWIN_O_NONBLOCK;
+            if process::fd_guest_nonblock(gfd) {
+                d |= DARWIN_O_NONBLOCK;
+            }
+            SyscallResult::ok(name, d)
         }
         F_SETFL => {
-            let host_fl = darwin_fl_to_host(u64::try_from(arg).unwrap_or(0));
+            // `arg` is the full Darwin flags word (or 0 if guest omitted it).
+            // Preserve host access-mode bits; only toggle status flags we map.
+            let flags = u64::try_from(arg).unwrap_or(0);
+            let guest_nb = flags & DARWIN_O_NONBLOCK != 0;
+            let gfd = reg_as_i32(args.x0);
+            process::fd_set_guest_nonblock(gfd, guest_nb);
+            let Some(cur) = host::fcntl_get(h, libc::F_GETFL) else {
+                return SyscallResult::err(name, EBADF);
+            };
+            let mut host_fl = cur & !libc::O_NONBLOCK & !libc::O_APPEND;
+            host_fl |= darwin_fl_to_host(flags);
             match host::fcntl_set(h, libc::F_SETFL, host_fl) {
                 Some(_) => SyscallResult::ok(name, 0),
                 None => SyscallResult::err(name, EBADF),

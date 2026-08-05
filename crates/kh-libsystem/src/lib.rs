@@ -34,6 +34,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod apple_stubs;
+mod curl;
 mod cxxabi;
 mod errno;
 mod extra_stubs;
@@ -111,6 +112,8 @@ pub const KH_HELPER_VERIFY_CERT: u32 = 0x4B48_0009;
 pub const KH_HELPER_GUEST_HOME: u32 = 0x4B48_000A;
 /// Host-helper id: non-zero when host wants freestanding heap stats dump.
 pub const KH_HELPER_HEAP_STATS_ON: u32 = 0x4B48_000B;
+/// Host-helper id: HTTP(S) perform for freestanding libcurl (`KhHttpReq` in guest).
+pub const KH_HELPER_HTTP: u32 = 0x4B48_000C;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

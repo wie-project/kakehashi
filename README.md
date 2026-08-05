@@ -296,4 +296,5 @@ Bottle bridges the Linux FS as `/Volumes/linux/…`:
 Apache License 2.0. See [`LICENSE.txt`](LICENSE.txt) and [`NOTICE`](NOTICE).
 
 This project is **not** derived from Darling. Do not vendor proprietary Apple
-SDKs or blobs.
+SDKs or blobs. Contributors must follow the clean-room process in
+[`docs/legal-method.md`](docs/legal-method.md).

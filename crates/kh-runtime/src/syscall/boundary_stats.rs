@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use super::helpers::{
     KH_HELPER_BASE, KH_HELPER_GETADDRINFO, KH_HELPER_GUEST_HOME, KH_HELPER_HEAP_STATS_ON,
-    KH_HELPER_NCPU, KH_HELPER_PARK, KH_HELPER_PRINTF, KH_HELPER_PUTS, KH_HELPER_READDIR,
-    KH_HELPER_VERIFY_CERT, KH_HELPER_WAKE, KH_HELPER_YIELD, is_helper,
+    KH_HELPER_HTTP, KH_HELPER_NCPU, KH_HELPER_PARK, KH_HELPER_PRINTF, KH_HELPER_PUTS,
+    KH_HELPER_READDIR, KH_HELPER_VERIFY_CERT, KH_HELPER_WAKE, KH_HELPER_YIELD, is_helper,
 };
 use super::table::name_of;
 
@@ -324,6 +324,7 @@ fn helper_name(number: u32) -> &'static str {
         KH_HELPER_VERIFY_CERT => "kh_verify_cert",
         KH_HELPER_GUEST_HOME => "kh_guest_home",
         KH_HELPER_HEAP_STATS_ON => "kh_heap_stats_on",
+        KH_HELPER_HTTP => "kh_http",
         _ => "kh_helper",
     }
 }

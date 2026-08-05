@@ -264,7 +264,13 @@ pub(crate) unsafe extern "C" fn memset_pattern16(
     pattern16: *const c_void,
     len: usize,
 ) {
-    if b.is_null() || pattern16.is_null() || len == 0 {
+    // Reject PAGEZERO / null (low 4 GiB is never a live guest buffer under kh).
+    if len == 0
+        || b.is_null()
+        || b.addr() < crate::stdio::PAGEZERO_END
+        || pattern16.is_null()
+        || pattern16.addr() < crate::stdio::PAGEZERO_END
+    {
         return;
     }
     // SAFETY: pattern is 16 bytes; fill `len` bytes of `b`.

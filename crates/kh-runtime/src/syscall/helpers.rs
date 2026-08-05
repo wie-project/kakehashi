@@ -215,6 +215,16 @@ pub(crate) const KH_HELPER_GUEST_HOME: u32 = KH_HELPER_BASE | 0x0A;
 /// (replaces dig-time always-on seed).
 pub(crate) const KH_HELPER_HEAP_STATS_ON: u32 = KH_HELPER_BASE | 0x0B;
 
+/// Freestanding libcurl HTTP(S) perform — `x0` = guest VA of packed `KhHttpReq`.
+///
+/// Layout (LE, all fields `u32`/`u64` as documented in `kh-libsystem` curl.rs):
+/// magic, version, method, flags, url, headers, headers_len, body, body_len,
+/// ca_path, out_body, out_body_cap, out_body_len, out_code, errbuf, errbuf_cap.
+///
+/// Host runs system `curl` with bottle CA (or guest `ca_path`). Returns 0 on
+/// success; negative errno-ish on failure.
+pub(crate) const KH_HELPER_HTTP: u32 = KH_HELPER_BASE | 0x0C;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -242,8 +252,302 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_VERIFY_CERT => handle_verify_cert(args),
         KH_HELPER_GUEST_HOME => handle_guest_home(args),
         KH_HELPER_HEAP_STATS_ON => handle_heap_stats_on(),
+        KH_HELPER_HTTP => handle_http(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
+}
+
+const KHHTTP_MAGIC: u32 = 0x4B48_4854;
+const KHHTTP_FLAG_SSL_VERIFY: u32 = 1;
+const HTTP_MAX_BODY: usize = 64 * 1024 * 1024;
+const HTTP_MAX_HDR: usize = 64 * 1024;
+/// `KhHttpReq` v1: 4×u32 + 12×u64 = 112; v2 adds content-type out → 128.
+const HTTP_REQ_BYTES_V1: usize = 112;
+const HTTP_REQ_BYTES_V2: usize = 128;
+
+fn handle_http(args: SyscallArgs) -> SyscallResult {
+    use std::process::Command;
+
+    let name = "kh_http";
+    let req_va = args.x0;
+    // Peek version with a short read so older guests (v1) still work.
+    if req_va == 0 || !registry_check_range(req_va, HTTP_REQ_BYTES_V1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let peek = guest_slice(req_va, HTTP_REQ_BYTES_V1);
+    let version_peek = peek
+        .get(4..8)
+        .and_then(|b| b.try_into().ok())
+        .map_or(0_u32, u32::from_le_bytes);
+    let req_bytes = if version_peek >= 2 {
+        HTTP_REQ_BYTES_V2
+    } else {
+        HTTP_REQ_BYTES_V1
+    };
+    if !registry_check_range(req_va, req_bytes, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let req = guest_slice(req_va, req_bytes);
+    let read_u32 = |off: usize| -> u32 {
+        let end = off.saturating_add(4);
+        req.get(off..end)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u32::from_le_bytes)
+    };
+    let magic = read_u32(0);
+    let version = read_u32(4);
+    let method = read_u32(8);
+    let flags = read_u32(12);
+    if magic != KHHTTP_MAGIC || !(1..=2).contains(&version) {
+        return SyscallResult::err(name, EINVAL);
+    }
+
+    let read_u64 = |off: usize| -> u64 {
+        let end = off.saturating_add(8);
+        req.get(off..end)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u64::from_le_bytes)
+    };
+
+    let url_va = read_u64(16);
+    let headers_va = read_u64(24);
+    let headers_len = usize::try_from(read_u64(32)).unwrap_or(0);
+    let body_va = read_u64(40);
+    let body_len = usize::try_from(read_u64(48)).unwrap_or(0);
+    let ca_va = read_u64(56);
+    let out_body_va = read_u64(64);
+    let out_body_cap = usize::try_from(read_u64(72)).unwrap_or(0);
+    let out_body_len_va = read_u64(80);
+    let out_code_va = read_u64(88);
+    let errbuf_va = read_u64(96);
+    let errbuf_cap = usize::try_from(read_u64(104)).unwrap_or(0);
+    let out_ctype_va = if version >= 2 { read_u64(112) } else { 0 };
+    let out_ctype_cap = if version >= 2 {
+        usize::try_from(read_u64(120)).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let write_err = |msg: &str| {
+        if errbuf_va != 0 && errbuf_cap > 0 && registry_check_range(errbuf_va, errbuf_cap, true) {
+            let mut bytes = msg.as_bytes().to_vec();
+            if bytes.len() >= errbuf_cap {
+                bytes.truncate(errbuf_cap.saturating_sub(1));
+            }
+            bytes.push(0);
+            guest_write(errbuf_va, &bytes);
+        }
+    };
+
+    let Some(url) = bottle::read_c_string(url_va, CSTR_MAX) else {
+        write_err("bad url");
+        return SyscallResult::err(name, EFAULT);
+    };
+    if url.is_empty() {
+        write_err("empty url");
+        return SyscallResult::err(name, EINVAL);
+    }
+
+    if out_body_va == 0
+        || out_body_cap == 0
+        || out_body_cap > HTTP_MAX_BODY
+        || !registry_check_range(out_body_va, out_body_cap, true)
+    {
+        write_err("bad out body");
+        return SyscallResult::err(name, EFAULT);
+    }
+    if out_body_len_va == 0 || !registry_check_range(out_body_len_va, 8, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    if out_code_va == 0 || !registry_check_range(out_code_va, 4, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+
+    let headers = if headers_va != 0 && headers_len > 0 && headers_len <= HTTP_MAX_HDR {
+        if !registry_check_range(headers_va, headers_len, false) {
+            write_err("bad headers");
+            return SyscallResult::err(name, EFAULT);
+        }
+        Some(guest_slice(headers_va, headers_len).to_vec())
+    } else {
+        None
+    };
+
+    let body = if body_va != 0 && body_len > 0 && body_len <= HTTP_MAX_BODY {
+        if !registry_check_range(body_va, body_len, false) {
+            write_err("bad body");
+            return SyscallResult::err(name, EFAULT);
+        }
+        Some(guest_slice(body_va, body_len).to_vec())
+    } else {
+        None
+    };
+
+    // Resolve CA: guest path → host, else bottle CA bundle.
+    let ca_host = if ca_va != 0 {
+        bottle::read_c_string(ca_va, CSTR_MAX).and_then(|guest_path| {
+            bottle::translate_path(&guest_path)
+                .ok()
+                .filter(|p| p.is_file())
+                .map(|p| p.display().to_string())
+        })
+    } else {
+        None
+    };
+    let ca_host = ca_host.or_else(|| {
+        bottle::active_ca_pem_path()
+            .or_else(|| {
+                bottle::bottle_root().and_then(|r| {
+                    let p = r.join(crate::bottle::GUEST_CA_FILE_REL);
+                    p.is_file().then_some(p)
+                })
+            })
+            .map(|p| p.display().to_string())
+    });
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = std::env::temp_dir().join(format!(
+        "kh-http-{}-{nanos}",
+        std::process::id()
+    ));
+    let body_path = tmp.with_extension("body");
+    let hdr_path = tmp.with_extension("hdr");
+    let post_path = tmp.with_extension("post");
+
+    let method_flag = match method {
+        1 => "POST",
+        2 => "HEAD",
+        3 => "PUT",
+        _ => "GET",
+    };
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS")
+        .arg("-L")
+        .arg("-X")
+        .arg(method_flag)
+        .arg("-D")
+        .arg(&hdr_path)
+        .arg("-o")
+        .arg(&body_path)
+        .arg("-w")
+        .arg("%{http_code}");
+    if (flags & KHHTTP_FLAG_SSL_VERIFY) == 0 {
+        cmd.arg("-k");
+    } else if let Some(ref ca) = ca_host {
+        cmd.arg("--cacert").arg(ca);
+    }
+    if let Some(ref hdrs) = headers {
+        for line in hdrs.split(|b| *b == b'\n' || *b == 0) {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(s) = std::str::from_utf8(line) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    cmd.arg("-H").arg(t);
+                }
+            }
+        }
+    }
+    if let Some(ref b) = body {
+        if let Err(e) = std::fs::write(&post_path, b) {
+            write_err(&format!("post body write: {e}"));
+            return SyscallResult::err(name, EINVAL);
+        }
+        cmd.arg("--data-binary").arg(format!("@{}", post_path.display()));
+    }
+    cmd.arg(&url);
+
+    tracing::debug!(%url, method = method_flag, "kh_http host curl");
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            write_err(&format!("spawn curl: {e}"));
+            cleanup_http_tmp(&body_path, &hdr_path, &post_path);
+            return SyscallResult::err(name, ENOSYS);
+        }
+    };
+
+    let code_str = String::from_utf8_lossy(&output.stdout);
+    let http_code: u32 = code_str.trim().parse().unwrap_or(0);
+
+    if !output.status.success() && http_code == 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        write_err(stderr.trim());
+        cleanup_http_tmp(&body_path, &hdr_path, &post_path);
+        // Map common curl failures.
+        let msg = stderr.to_ascii_lowercase();
+        let err = if msg.contains("timed out") || msg.contains("timeout") {
+            28
+        } else if msg.contains("ssl") || msg.contains("certificate") {
+            35
+        } else {
+            7
+        };
+        return SyscallResult::err(name, i64::from(err));
+    }
+
+    let body_bytes = std::fs::read(&body_path).unwrap_or_default();
+    if body_bytes.len() > out_body_cap {
+        write_err("response too large for guest buffer");
+        cleanup_http_tmp(&body_path, &hdr_path, &post_path);
+        return SyscallResult::err(name, EINVAL);
+    }
+    guest_write(out_body_va, &body_bytes);
+    let len_u64 = u64::try_from(body_bytes.len()).unwrap_or(0);
+    guest_write(out_body_len_va, &len_u64.to_le_bytes());
+    guest_write(out_code_va, &http_code.to_le_bytes());
+
+    // Content-Type for CURLINFO_CONTENT_TYPE (git smart-HTTP discovery).
+    if out_ctype_va != 0
+        && out_ctype_cap > 0
+        && registry_check_range(out_ctype_va, out_ctype_cap, true)
+    {
+        let ctype = std::fs::read(&hdr_path)
+            .ok()
+            .and_then(|raw| parse_content_type_header(&raw))
+            .unwrap_or_default();
+        let mut bytes = ctype.into_bytes();
+        if bytes.len() >= out_ctype_cap {
+            bytes.truncate(out_ctype_cap.saturating_sub(1));
+        }
+        bytes.push(0);
+        guest_write(out_ctype_va, &bytes);
+    }
+
+    cleanup_http_tmp(&body_path, &hdr_path, &post_path);
+    SyscallResult::ok(name, 0)
+}
+
+/// Extract `Content-Type` value from an HTTP response header block (`curl -D`).
+fn parse_content_type_header(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("Content-Type:")
+            .or_else(|| line.strip_prefix("content-type:"))
+            .or_else(|| line.strip_prefix("CONTENT-TYPE:"))
+        else {
+            continue;
+        };
+        // Take media type before any `; charset=…`.
+        let value = rest.split(';').next().unwrap_or(rest).trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn cleanup_http_tmp(body: &std::path::Path, hdr: &std::path::Path, post: &std::path::Path) {
+    drop(std::fs::remove_file(body));
+    drop(std::fs::remove_file(hdr));
+    drop(std::fs::remove_file(post));
 }
 
 fn handle_heap_stats_on() -> SyscallResult {
@@ -271,6 +575,8 @@ fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
     let path = match std::env::var("HOME") {
+        // Nested re-exec already has guest HOME in the host environ.
+        Ok(h) if h.starts_with("/Volumes/linux") && !h.contains('\0') => h,
         Ok(h) if h.starts_with('/') && !h.contains('\0') => format!("/Volumes/linux{h}"),
         _ => "/var/root".to_owned(),
     };

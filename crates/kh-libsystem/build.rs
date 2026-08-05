@@ -18,12 +18,17 @@ fn main() {
         return;
     }
 
-    // Freestanding C only for variadic *printf (stable Rust has no c_variadic).
+    // Freestanding C for variadic ABIs (stable Rust has no c_variadic):
+    // *printf + curl_easy_setopt/getinfo + fcntl (Apple arm64 stacks varargs).
     // `-force_load` is required: cdylib + dead_strip drops archive members that
     // nothing in Rust references by name.
     println!("cargo:rerun-if-changed=src/printf_fmt.c");
+    println!("cargo:rerun-if-changed=src/curl_varargs.c");
+    println!("cargo:rerun-if-changed=src/fcntl_varargs.c");
     cc::Build::new()
         .file("src/printf_fmt.c")
+        .file("src/curl_varargs.c")
+        .file("src/fcntl_varargs.c")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-builtin-printf")
@@ -31,6 +36,7 @@ fn main() {
         .flag("-fno-builtin-vfprintf")
         .flag("-fno-builtin-snprintf")
         .flag("-fno-builtin-vsnprintf")
+        .flag("-fno-builtin-fcntl")
         .flag("-fno-stack-protector")
         .warnings(false)
         .compile("kh_printf_fmt");
@@ -42,7 +48,7 @@ fn main() {
     // Through the `cc` linker driver (not raw ld): one -Wl token.
     println!("cargo:rustc-cdylib-link-arg=-Wl,-force_load,{archive}");
     // rustc cdylib uses -exported_symbols_list (Rust-only). Explicitly export
-    // freestanding C *printf symbols pulled from the archive.
+    // freestanding C *printf + curl vararg symbols pulled from the archive.
     for sym in [
         "_printf",
         "_vprintf",
@@ -54,6 +60,9 @@ fn main() {
         "___snprintf_chk",
         "___vsnprintf_chk",
         "___assert_rtn",
+        "_curl_easy_setopt",
+        "_curl_easy_getinfo",
+        "_fcntl",
     ] {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,{sym}");
     }

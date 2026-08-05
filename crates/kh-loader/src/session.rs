@@ -559,7 +559,19 @@ impl LoadSession {
             let mut file = File::open(&host_path)?;
             let memory = GuestMemory::map_image(self.pages.host, preferred, &requests, &mut file)?;
 
-            let install = image_install_name(&parsed, &edge.install_name);
+            // Prefer the **LC_LOAD** install name (`edge.install_name`) over the
+            // dylib's LC_ID. Bottle aliases (`libc++.1.dylib` / `libcurl.4.dylib`
+            // → freestanding `libSystem.B.dylib`) share one real file whose LC_ID
+            // is always `/usr/lib/libSystem.B.dylib`. Two-level binds use the
+            // consumer's LC_LOAD string as the ordinal target, so the mapped
+            // image must be findable under that name (see `find_mapped_by_install_name`
+            // + duplicate real_path alias for the true libSystem edge).
+            let lc_id = image_install_name(&parsed, &edge.install_name);
+            let install = if edge.install_name.is_empty() {
+                lc_id.clone()
+            } else {
+                edge.install_name.clone()
+            };
             let loader_dir = host_path
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -569,6 +581,7 @@ impl LoadSession {
             tracing::info!(
                 path = %host_path.display(),
                 install_name = %install,
+                lc_id = %lc_id,
                 slide = memory.slide(),
                 base = preferred,
                 "mapped dylib"

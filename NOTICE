@@ -15,4 +15,5 @@ limitations under the License.
 
 This project is an independent userspace macOS translation layer for Linux
 ARM64. It is not derived from Darling. Proprietary Apple binaries and SDKs
-are not redistributed with this source tree.
+are not redistributed with this source tree. Contributor clean-room process:
+docs/legal-method.md.

@@ -67,6 +67,8 @@ pub struct BottleStatus {
     pub libsystem: bool,
     /// Whether `{path}/usr/lib/libc++.1.dylib` → `libSystem.B.dylib` alias exists.
     pub libcxx_alias: bool,
+    /// Whether `{path}/usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` alias exists.
+    pub libcurl_alias: bool,
 }
 
 /// Options for [`create`].
@@ -228,12 +230,14 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
     let valid_marker = exists && layout::is_bottle_root(&path);
     let libsystem = exists && path.join(libsystem::GUEST_LIBSYSTEM_REL).is_file();
     let libcxx_alias = exists && layout::has_libcxx_symlink(&path);
+    let libcurl_alias = exists && layout::has_libcurl_symlink(&path);
     Ok(Some(BottleStatus {
         path,
         exists,
         valid_marker,
         libsystem,
         libcxx_alias,
+        libcurl_alias,
     }))
 }
 
@@ -284,6 +288,7 @@ pub fn ensure(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
 
 fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
     layout::ensure_libcxx_symlink(path)?;
+    layout::ensure_libcurl_symlink(path)?;
     layout::ensure_dev_nodes(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
@@ -481,7 +486,9 @@ mod tests {
         let st = status().expect("status").expect("registered");
         assert!(st.libsystem);
         assert!(st.libcxx_alias);
+        assert!(st.libcurl_alias);
         assert!(layout::has_libcxx_symlink(&created.path));
+        assert!(layout::has_libcurl_symlink(&created.path));
 
         destroy(true).expect("destroy");
     }
