@@ -122,10 +122,9 @@ impl MapRequest {
         if self.vmsize == 0 {
             return true;
         }
-        let is_pagezero = self.name == "__PAGEZERO"
-            || (self.initprot == 0 && self.fileoff == 0 && self.filesize == 0);
         // PAGEZERO is typically 4 GiB — never materialize it.
-        is_pagezero
+        self.name == "__PAGEZERO"
+            || (self.initprot == 0 && self.fileoff == 0 && self.filesize == 0)
     }
 }
 
@@ -614,15 +613,17 @@ fn map_one(
     Ok(region)
 }
 
+// libgcc / compiler-rt — same symbol as hypercall tramp setup.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe extern "C" {
+    fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
+}
+
 /// Flush D/I caches after writing executable guest code (aarch64 requirement).
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn clear_icache(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
-    }
-    // libgcc / compiler-rt — same symbol as hypercall tramp setup.
-    unsafe extern "C" {
-        fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
     }
     // SAFETY: range is the live mapping we just wrote and mprotected.
     unsafe {

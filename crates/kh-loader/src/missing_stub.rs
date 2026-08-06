@@ -46,12 +46,16 @@ mod linux_aarch64 {
 
     /// Bytes reserved before the C string in each stub slot.
     const HEADER: usize = 32;
-    /// Max nlist name length we embed (including NUL).
-    const MAX_NAME: usize = 96;
-    /// Fixed slot size (header + name buffer), 16-byte aligned.
-    const SLOT: usize = 128;
-    /// Initial pool (covers ~110 curl misses with headroom).
-    const POOL_BYTES: usize = 64 * 1024;
+    /// Max nlist name length we embed (excluding trailing NUL).
+    ///
+    /// Curl-era names fit in 96; Apple clang / libc++ mangles go past 100
+    /// (e.g. `std::chrono::system_clock::to_time_t` ~109). Cap with headroom
+    /// for longer templates; beyond this we fall back to the anonymous stub.
+    const MAX_NAME: usize = 256;
+    /// Initial pool — clang alone imports hundreds of strong symbols; each
+    /// miss needs HEADER + name + NUL (16-byte aligned). 512 KiB covers a
+    /// large miss list with long C++ names and still leaves room for deps.
+    const POOL_BYTES: usize = 512 * 1024;
 
     struct Pool {
         base: *mut u8,
@@ -108,16 +112,20 @@ mod linux_aarch64 {
 
     fn emit_one(pool: &mut Pool, name: &str, handler: u64) -> Result<u64, LoadError> {
         let name_bytes = name.as_bytes();
-        if name_bytes.len() >= MAX_NAME {
+        if name_bytes.len() > MAX_NAME {
             return Err(LoadError::NotImplemented(
                 "missing-stub name longer than MAX_NAME",
             ));
         }
-        let need = SLOT;
+        // Variable slot: header + C string + NUL, rounded up to 16 bytes.
+        let raw = HEADER
+            .saturating_add(name_bytes.len())
+            .saturating_add(1);
+        let need = raw.saturating_add(15) & !15_usize;
         if pool.used.saturating_add(need) > pool.len {
             return Err(LoadError::NotImplemented("missing-stub pool exhausted"));
         }
-        // SAFETY: `used..used+SLOT` is within the mapped RW region; exclusive under mutex.
+        // SAFETY: `used..used+need` is within the mapped RW region; exclusive under mutex.
         let slot = unsafe { pool.base.add(pool.used) };
         let slot_va = kh_runtime::host::ptr_addr_u64(slot);
         let name_va = slot_va.wrapping_add(u64::try_from(HEADER).unwrap_or(32));
@@ -130,7 +138,7 @@ mod linux_aarch64 {
         let br_x16 = 0xD61F_0200_u32; // br x16
         let nop = 0xD503_201F_u32;
 
-        // SAFETY: slot has SLOT bytes of writable mapped memory.
+        // SAFETY: slot has `need` bytes of writable mapped memory.
         unsafe {
             write_u32(slot, 0, ldr_x0);
             write_u32(slot, 4, ldr_x16);

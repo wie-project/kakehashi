@@ -14,7 +14,7 @@
 //! `munmap` of the worker stack while hypercall dispatch still runs on it.
 
 use core::ffi::{c_int, c_void};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::errno;
 use crate::heap::{free, malloc};
@@ -216,7 +216,7 @@ fn munmap_anon(ptr: *mut u8, len: usize) {
     let _ = unsafe { sys::syscall2(SYS_MUNMAP, addr, total_u) };
 }
 
-// ── mutex (first word of guest pthread_mutex_t) ─────────────────────────────
+// ── mutex (freestanding word inside guest pthread_mutex_t) ──────────────────
 //
 // Futex mutex states (Drepper / Linux classic):
 //   0 = unlocked
@@ -225,6 +225,12 @@ fn munmap_anon(ptr: *mut u8, len: usize) {
 //
 // Uncontended unlock is store-only (no KH_HELPER_WAKE). Always-wake was the
 // main residual futex storm after A1 (UTM 8k-file: ~257k futex, mostly guest).
+//
+// Layout: Darwin `pthread_mutex_t` stores signature `_PTHREAD_MUTEX_SIG_init`
+// (`0x32AAABA7`) in the first word of static/in-place initializers (protobuf,
+// libc++). Using that word as the futex state parks forever on the magic.
+// Freestanding lock state lives at **offset +8** (still zero for BSS-zero
+// mutexes that 7zz/curl rely on).
 
 /// Unlocked.
 const MUTEX_UNLOCKED: u32 = 0;
@@ -233,9 +239,43 @@ const MUTEX_LOCKED: u32 = 1;
 /// Locked with waiters — unlock clears + wakes one.
 const MUTEX_CONTENDED: u32 = 2;
 
+/// Byte offset of freestanding lock word inside `pthread_mutex_t`.
+const MUTEX_STATE_OFF: usize = 8;
+/// Owner `pthread_self` token (0 = none). Enables same-thread re-entry so
+/// LLVM `ManagedStatic` / nested `cl::opt` registration does not futex-deadlock
+/// on a non-recursive freestanding mutex.
+const MUTEX_OWNER_OFF: usize = 16;
+/// Re-entry depth while `owner` is set.
+const MUTEX_DEPTH_OFF: usize = 24;
+
+/// Darwin `_PTHREAD_MUTEX_SIG_init` (public man / header value).
+const DARWIN_MUTEX_SIG: u32 = 0x32AA_ABA7;
+
 #[inline]
 fn mutex_word(mutex: *mut c_void) -> *mut AtomicU32 {
-    mutex.cast::<AtomicU32>()
+    // SAFETY: Darwin mutex is ≥ 64 bytes and ≥ 8-byte aligned; +8 stays
+    // 4-byte aligned for `AtomicU32`.
+    let addr = mutex.addr().saturating_add(MUTEX_STATE_OFF);
+    core::ptr::with_exposed_provenance_mut::<AtomicU32>(addr)
+}
+
+#[inline]
+fn mutex_owner(mutex: *mut c_void) -> *mut AtomicU64 {
+    let addr = mutex.addr().saturating_add(MUTEX_OWNER_OFF);
+    core::ptr::with_exposed_provenance_mut::<AtomicU64>(addr)
+}
+
+#[inline]
+fn mutex_depth(mutex: *mut c_void) -> *mut u32 {
+    let addr = mutex.addr().saturating_add(MUTEX_DEPTH_OFF);
+    core::ptr::with_exposed_provenance_mut::<u32>(addr)
+}
+
+#[inline]
+fn self_token() -> u64 {
+    // SAFETY: pthread_self is freestanding and always returns a stable token.
+    let p = unsafe { pthread_self() };
+    u64::try_from(p.addr()).unwrap_or(1)
 }
 
 #[inline]
@@ -416,7 +456,11 @@ pub(crate) unsafe extern "C" fn pthread_mutex_init(
         return EINVAL;
     }
     unsafe {
+        // Optional Darwin-shaped sig so guests that probe it see a normal mutex.
+        mutex.cast::<u32>().write(DARWIN_MUTEX_SIG);
         (*mutex_word(mutex)).store(MUTEX_UNLOCKED, Ordering::Relaxed);
+        (*mutex_owner(mutex)).store(0, Ordering::Relaxed);
+        mutex_depth(mutex).write(0);
     }
     0
 }
@@ -429,6 +473,8 @@ pub(crate) unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut c_void) -> c_i
     }
     unsafe {
         (*mutex_word(mutex)).store(MUTEX_UNLOCKED, Ordering::Relaxed);
+        (*mutex_owner(mutex)).store(0, Ordering::Relaxed);
+        mutex_depth(mutex).write(0);
     }
     0
 }
@@ -477,6 +523,15 @@ pub(crate) unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> c_i
     if mutex.is_null() {
         return EINVAL;
     }
+    let me = self_token();
+    let owner = unsafe { &*mutex_owner(mutex) };
+    if owner.load(Ordering::Relaxed) == me {
+        unsafe {
+            let d = mutex_depth(mutex);
+            d.write(d.read().saturating_add(1));
+        }
+        return 0;
+    }
     let w = unsafe { &*mutex_word(mutex) };
     if w.compare_exchange(
         MUTEX_UNLOCKED,
@@ -486,6 +541,10 @@ pub(crate) unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> c_i
     )
     .is_ok()
     {
+        owner.store(me, Ordering::Relaxed);
+        unsafe {
+            mutex_depth(mutex).write(1);
+        }
         0
     } else {
         // Darwin EBUSY
@@ -499,6 +558,17 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
     if mutex.is_null() {
         return EINVAL;
     }
+    let me = self_token();
+    let owner = unsafe { &*mutex_owner(mutex) };
+    // Same-thread re-entry (LLVM ManagedStatic / nested option registration).
+    if owner.load(Ordering::Relaxed) == me {
+        unsafe {
+            let d = mutex_depth(mutex);
+            d.write(d.read().saturating_add(1));
+        }
+        return 0;
+    }
+
     let w = unsafe { &*mutex_word(mutex) };
 
     // Fast path: uncontended.
@@ -510,11 +580,23 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
     )
     .is_ok()
     {
+        owner.store(me, Ordering::Relaxed);
+        unsafe {
+            mutex_depth(mutex).write(1);
+        }
         return 0;
     }
 
     // Slow path: short spin, then mark contended and park (F1).
     loop {
+        // Re-check owner after another thread may have released.
+        if owner.load(Ordering::Relaxed) == me {
+            unsafe {
+                let d = mutex_depth(mutex);
+                d.write(d.read().saturating_add(1));
+            }
+            return 0;
+        }
         for _ in 0..64_u32 {
             let cur = w.load(Ordering::Relaxed);
             if cur == MUTEX_UNLOCKED {
@@ -526,6 +608,10 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
                 )
                 .is_ok()
                 {
+                    owner.store(me, Ordering::Relaxed);
+                    unsafe {
+                        mutex_depth(mutex).write(1);
+                    }
                     return 0;
                 }
             } else if cur == MUTEX_LOCKED {
@@ -544,6 +630,10 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
         // swap(2): if prev==0 we acquired; if prev!=0 someone still holds → park.
         let prev = w.swap(MUTEX_CONTENDED, Ordering::Acquire);
         if prev == MUTEX_UNLOCKED {
+            owner.store(me, Ordering::Relaxed);
+            unsafe {
+                mutex_depth(mutex).write(1);
+            }
             return 0;
         }
         // FUTEX_WAIT returns if value ≠ expected (unlock raced ahead → 0).
@@ -556,6 +646,23 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
 pub(crate) unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int {
     if mutex.is_null() {
         return EINVAL;
+    }
+    let me = self_token();
+    let owner = unsafe { &*mutex_owner(mutex) };
+    if owner.load(Ordering::Relaxed) == me {
+        let d = mutex_depth(mutex);
+        // SAFETY: mutex object is live guest storage ≥ 64 bytes.
+        let depth = unsafe { d.read() };
+        if depth > 1 {
+            unsafe {
+                d.write(depth.saturating_sub(1));
+            }
+            return 0;
+        }
+        unsafe {
+            d.write(0);
+        }
+        owner.store(0, Ordering::Release);
     }
     let w = unsafe { &*mutex_word(mutex) };
     // Swap to 0 (not fetch_sub): avoids a transient LOCKED(1) window after

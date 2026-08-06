@@ -176,9 +176,13 @@ fn push_image_inits(img: &ProcessImage, plan: &mut Vec<InitFunc>) -> Result<(), 
 /// Returns the number of functions successfully called.
 pub fn run_initializers(session: &LoadSession, guest_sp: u64) -> Result<usize, LoadError> {
     let plan = plan_initializers(session.images())?;
+    let total = plan.len();
+    tracing::info!(total, "mod_init plan");
     let mut ran = 0_usize;
     for init in &plan {
         tracing::info!(
+            idx = ran,
+            total,
             va = format_args!("{:#x}", init.va),
             image = %init.image_path,
             "run mod_init"
@@ -190,6 +194,11 @@ pub fn run_initializers(session: &LoadSession, guest_sp: u64) -> Result<usize, L
                 .map_err(|err| LoadError::PageLayout(err.to_string()))?
         };
         ran = ran.saturating_add(1);
+        tracing::debug!(
+            idx = ran.saturating_sub(1),
+            va = format_args!("{:#x}", init.va),
+            "mod_init done"
+        );
     }
     Ok(ran)
 }

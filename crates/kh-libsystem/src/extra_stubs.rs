@@ -31,6 +31,43 @@ const ENOSYS: i32 = 78;
 const EAI_NONAME: i32 = 8;
 const EAI_FAMILY: i32 = 1;
 
+// ── intmax helpers ──────────────────────────────────────────────────────────
+
+/// C `imaxabs` → nlist `_imaxabs` (`intmax_t` = `i64` on Darwin arm64).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn imaxabs(j: i64) -> i64 {
+    j.saturating_abs()
+}
+
+// ── execinfo soft (clang crash paths / llvm Support) ─────────────────────────
+
+/// C `backtrace` → nlist `_backtrace`.
+///
+/// Soft: report zero frames. Real stack walk is out of scope for freestanding
+/// libSystem; guests that only probe crash reporting survive.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn backtrace(_buffer: *mut *mut c_void, _size: c_int) -> c_int {
+    0
+}
+
+/// C `backtrace_symbols` → nlist `_backtrace_symbols` (null = failure).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn backtrace_symbols(
+    _buffer: *mut *mut c_void,
+    _size: c_int,
+) -> *mut *mut c_char {
+    core::ptr::null_mut()
+}
+
+/// C `backtrace_symbols_fd` → nlist `_backtrace_symbols_fd` (no-op).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn backtrace_symbols_fd(
+    _buffer: *mut *mut c_void,
+    _size: c_int,
+    _fd: c_int,
+) {
+}
+
 // ── setjmp / longjmp / ucontext soft ────────────────────────────────────────
 
 /// C `setjmp` → always 0 (context not restored by our soft `longjmp`).

@@ -62,13 +62,14 @@ Priority is **guest surface**, not shaving another tenth off an already ~×1.2 m
 
 | Priority | Direction | Notes |
 | --- | --- | --- |
-| 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| 2 | **git** / **xcode-tools** | **Milestone met** (G0–G8). Verified: Wine full history (GitHub + GitLab), llvm-project `--depth 1` over SSH, push/private/auth — [git.md](git.md) |
+| 1 | **Apple clang** (CLT compiler) | **Active** — G1 `clang --version` **pass** (Docker); G2–G3 compile open — [clang.md](clang.md) |
+| — | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
+| — | **git** / **xcode-tools** | **Milestone met** (G0–G8). Verified: Wine full history (GitHub + GitLab), llvm-project `--depth 1` over SSH, push/private/auth — [git.md](git.md) |
 | — | Optional polish | multi‑GiB monorepo soak budgets; `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen — not gates |
 
-Rationale: curl was the smaller vertical slice that forced network ABI on top
-of FS/threads. Git is larger (process model, more POSIX) but remotes reuse the
-curl network path + host OpenSSH bridge.
+Rationale: curl and git closed the open-source utility / CLT VCS slice. **Apple
+clang** is the first priority compiler guest: heavy libc++ / cxxabi surface on
+top of freestanding libSystem (same bottle CLT package as git).
 
 ### Curl milestone — **done** (trace-first)
 
@@ -109,6 +110,23 @@ Method and gates: [git.md](git.md). User-facing recipes:
 
 Process notes for git polish PRs: same as curl — internet allowed; clippy
 `-D warnings`; keep `7zz -mmt=4` green; clean-room — [legal-method.md](legal-method.md).
+
+### Apple clang milestone — **active** (trace-first)
+
+Method and gates: [clang.md](clang.md). Binary from the same CLT install as git
+(`kh install xcode-tools`).
+
+| Slice | State |
+| --- | --- |
+| G0 CLT + `…/usr/bin/clang` | **pass** (shared xcode-tools) |
+| G1 `clang --version` | **pass** (Docker Colima: Apple clang 21.0.0 banner + exit 0) |
+| G2 missing-surface list | open |
+| G3 trivial compile | open |
+| Docker helper | `scripts/docker-clang.sh` |
+
+Process notes: internet for install only; clippy `-D warnings`; keep
+`7zz -mmt=4` + curl/git green when shared paths change; clean-room —
+[legal-method.md](legal-method.md).
 
 ## Process
 

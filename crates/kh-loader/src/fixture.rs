@@ -2092,6 +2092,8 @@ pub const ROUNDTRIP_PAYLOAD_PATH: &str = "tests/fixtures/roundtrip_payload.bin";
 ///
 /// Requires [`ROUNDTRIP_PAYLOAD`] at [`ROUNDTRIP_PAYLOAD_PATH`] relative to CWD.
 #[must_use]
+// `decimal_bitwise_operands` exists on newer clippy; unknown on MSRV 1.88.
+#[allow(unknown_lints)]
 #[allow(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
