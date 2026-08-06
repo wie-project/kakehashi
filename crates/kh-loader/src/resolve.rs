@@ -68,11 +68,13 @@ pub fn resolve_install_name(
     }
 
     let host = if let Some(rest) = install_name.strip_prefix("@executable_path/") {
-        join_no_dotdot(ctx.executable_dir, rest)?
+        // Allow `..` so install names / rpath expansions like
+        // `@executable_path/../lib/libtapi.dylib` resolve under the bottle.
+        join_allow_dotdot(ctx.executable_dir, rest)?
     } else if install_name == "@executable_path" {
         ctx.executable_dir.to_path_buf()
     } else if let Some(rest) = install_name.strip_prefix("@loader_path/") {
-        join_no_dotdot(ctx.loader_dir, rest)?
+        join_allow_dotdot(ctx.loader_dir, rest)?
     } else if install_name == "@loader_path" {
         ctx.loader_dir.to_path_buf()
     } else if let Some(rest) = install_name.strip_prefix("@rpath/") {
@@ -117,6 +119,7 @@ fn resolve_rpath(rest: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, Resolv
             return Err(ResolveError::NestedRpath);
         }
         let base = expand_rpath_value(rpath, ctx)?;
+        // `rest` is usually a bare leaf (`libtapi.dylib`); keep no-dotdot.
         let candidate = join_no_dotdot(&base, rest)?;
         match ensure_allowlisted(&candidate, ctx) {
             Ok(()) => {
@@ -138,11 +141,12 @@ fn expand_rpath_value(rpath: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, 
         return Err(ResolveError::Empty);
     }
     if let Some(rest) = rpath.strip_prefix("@executable_path/") {
-        join_no_dotdot(ctx.executable_dir, rest)
+        // CLT: `@executable_path/../lib` → sibling of `usr/bin`.
+        join_allow_dotdot(ctx.executable_dir, rest)
     } else if rpath == "@executable_path" {
         Ok(ctx.executable_dir.to_path_buf())
     } else if let Some(rest) = rpath.strip_prefix("@loader_path/") {
-        join_no_dotdot(ctx.loader_dir, rest)
+        join_allow_dotdot(ctx.loader_dir, rest)
     } else if rpath == "@loader_path" {
         Ok(ctx.loader_dir.to_path_buf())
     } else if rpath.starts_with('@') {
@@ -151,11 +155,21 @@ fn expand_rpath_value(rpath: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, 
         resolve_absolute(rpath, ctx)
     } else {
         // Relative LC_RPATH: anchor at loader directory.
-        join_no_dotdot(ctx.loader_dir, rpath)
+        join_allow_dotdot(ctx.loader_dir, rpath)
     }
 }
 
 fn join_no_dotdot(base: &Path, rest: &str) -> Result<PathBuf, ResolveError> {
+    join_path(base, rest, false)
+}
+
+/// Join `rest` onto `base`, optionally allowing `..` components (rpath / CLT).
+///
+/// Apple CLT tools ship `LC_RPATH` = `@executable_path/../lib`. Forbidding
+/// `..` made `@rpath/libtapi.dylib` always miss → soft-skip → `ld-classic`
+/// SEGV without tapi (clang G4). Security still rests on
+/// [`ensure_allowlisted`] (bottle ∪ executable_dir) after expand.
+fn join_path(base: &Path, rest: &str, allow_parent: bool) -> Result<PathBuf, ResolveError> {
     if rest.is_empty() {
         return Ok(base.to_path_buf());
     }
@@ -164,12 +178,22 @@ fn join_no_dotdot(base: &Path, rest: &str) -> Result<PathBuf, ResolveError> {
         match comp {
             Component::Normal(s) => out.push(s),
             Component::CurDir => {}
+            Component::ParentDir if allow_parent => {
+                if !out.pop() {
+                    return Err(ResolveError::Escape(rest.to_owned()));
+                }
+            }
             Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
                 return Err(ResolveError::Escape(rest.to_owned()));
             }
         }
     }
     Ok(out)
+}
+
+/// Like [`join_no_dotdot`] but accepts `..` (CLT `@executable_path/../lib`).
+fn join_allow_dotdot(base: &Path, rest: &str) -> Result<PathBuf, ResolveError> {
+    join_path(base, rest, true)
 }
 
 /// Map allowlist: under bottle root (when set) **or** under executable_dir.
@@ -352,11 +376,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dotdot() {
+    fn dotdot_outside_allowlist_rejected() {
+        // `..` is allowed for CLT rpaths, but the result must still sit under
+        // bottle ∪ executable_dir. Without a bottle, parent of exe is out.
         let exe = Path::new("/tmp/kh-exe");
         let c = ctx(None, exe, exe, &[]);
         let err = resolve_install_name("@executable_path/../etc/passwd", &c).unwrap_err();
-        assert!(matches!(err, ResolveError::Escape(_)));
+        assert!(
+            matches!(err, ResolveError::OutsideAllowlist(_)),
+            "expected OutsideAllowlist, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rpath_executable_parent_lib_under_bottle() {
+        // Mirrors Apple CLT: bin/tool with LC_RPATH=@executable_path/../lib
+        // and lib/libtapi.dylib under the same bottle tree.
+        let root =
+            std::env::temp_dir().join(format!("kh-resolve-clt-rpath-{}", std::process::id()));
+        let bin = root.join("usr/bin");
+        let lib = root.join("usr/lib");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&lib).unwrap();
+        let tapi = lib.join("libtapi.dylib");
+        File::create(&tapi).unwrap().write_all(b"x").unwrap();
+
+        let rpaths = vec!["@executable_path/../lib".to_owned()];
+        let c = ctx(Some(root.as_path()), &bin, &bin, &rpaths);
+        let host = resolve_install_name("@rpath/libtapi.dylib", &c).unwrap();
+        assert_eq!(host, tapi);
+        drop(fs::remove_dir_all(root));
     }
 
     #[test]

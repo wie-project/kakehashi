@@ -19,7 +19,7 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | G1 | `kh run clang -- --version` banner + exit 0 | **pass** (Docker Colima, 2026-08: `Apple clang version 21.0.0`) |
 | G2 | Missing surface list from `--version` / tiny C compile probes | **pass** (trace log; see progress) |
 | G3 | Compile trivial `hello.c` → object or executable under bottle | **pass** (Docker: `return_zero.c` → Mach-O arm64 `.o`; also `stdio_hello.c` with SDK) |
-| G4 | Link + run guest binary produced by guest clang (optional stretch) | open |
+| G4 | Link + run guest binary produced by guest clang (optional stretch) | **pass** (Docker: multi-file `g4-mini` via `ld-classic` + SDK TBDs; product runs `g4-mini PASS`, exit 0) |
 
 ### Progress log (Docker Colima, 2026-08)
 
@@ -47,13 +47,26 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | `#include <stdio.h>` / SDK headers | **pass** — swscan SDKs + freestanding `SDKROOT`/`DEVELOPER_DIR` soft env |
 | CLT product **26.6** → `SDKs/MacOSX.sdk` → `MacOSX26.5.sdk` | **pass** (Docker install) |
 | `clang -c stdio_hello.c` | **pass** (Mach-O arm64 `.o`, 744 B) |
+| Multi-file probe `tests/clang-probe/g4-mini/` | **sources ready** (host build/run PASS) |
+| Guest multi-file **compile** (`-c` × N) | **pass** (Docker) |
+| `@executable_path/../lib` rpath | **fixed** — `libtapi` / `libswiftDemangle` load for CLT tools |
+| Darwin BSD `qsort_r` ABI (thunk before compar) | **fixed** — was SEGV PC-on-stack in `ld-classic` |
+| Soft surface for `ld-classic` (`ld_surface`, `reallocf`, Blocks/GCD soft, `stoi`, …) | **landed** |
+| Prefer `--ld-path=…/ld-classic` (not modern `ld` / ObjC+Foundation) | **required** for G4 |
+| `___cxa_throw` diagnostics (type/msg/ra) | **done** — exposed real ld message path |
+| Soft `__dynamic_cast` always-null | **root cause** — `findDylib` `dynamic_cast<ld::dylib::File*>` failed → `indirect dylib … is not a dylib` |
+| Itanium `__dynamic_cast` walk (vtable[-1] typeinfo, SI/VMI bases) | **fixed** — reexport TBD chain works |
+| Soft always-src `__dynamic_cast` | **rejected** — wrong `Resolver::doFile` branch → SEGV |
+| `ccsha256_di` was **data** symbol | **fixed** — must be function returning `ccdigest_info*`; `final` @+0x38 |
+| Soft `ccdigest_info` + `strtod`/`modf`/`posix_madvise`/`nothrow` | **landed** for libtapi / UUID |
+| **G4 link + run `g4-mini`** | **pass** (Docker Colima, Mach-O arm64 product, exit 0) |
 
 ### Next (trace-first)
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| G4: link guest product and run under `kh` | freestanding + ld | After G3 `.o`; may need more libc++ / linker surface |
 | Harder `-cc1` / more libc++ | freestanding | On demand from missing-symbol log |
+| Full RTTI / exception unwind | freestanding | Soft `dynamic_cast` is hierarchy walk only; real catch still aborts |
 
 Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
@@ -96,8 +109,26 @@ working `xcrun`.
 # G1 smoke (build kh, ensure bottle, install CLT if needed, run clang --version)
 ./scripts/docker-clang.sh --version
 
-# Arbitrary guest args after --
+# Guest args are passed through (do **not** add an extra leading `--` — it
+# becomes a clang argv that ends option parsing).
 ./scripts/docker-clang.sh -cc1 -help
+
+# G3 object compile
+./scripts/docker-clang.sh -x c -c \
+  /Volumes/linux/src/tests/clang-probe/return_zero.c \
+  -o /Volumes/linux/out/return_zero.o
+
+# G4 multi-file link + product under guest (ld-classic + SDK TBDs)
+./scripts/docker-clang.sh \
+  -O0 -std=c11 -arch arm64 \
+  --ld-path=/Library/Developer/CommandLineTools/usr/bin/ld-classic \
+  -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/calc.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/report.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/words.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/main.c \
+  -o /Volumes/linux/out/g4-mini
+# then:  kh run /Volumes/linux/out/g4-mini   →  g4-mini PASS
 ```
 
 Process notes for PRs: internet allowed for catalog/install; clippy `-D warnings`

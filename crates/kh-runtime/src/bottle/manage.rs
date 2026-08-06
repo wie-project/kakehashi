@@ -289,6 +289,8 @@ pub fn ensure(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
 fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError> {
     layout::ensure_libcxx_symlink(path)?;
     layout::ensure_libcurl_symlink(path)?;
+    layout::ensure_libxar_symlink(path)?;
+    layout::ensure_libz_symlink(path)?;
     layout::ensure_dev_nodes(path)?;
     layout::ensure_host_ssh_bridge(path)?;
     layout::ensure_host_bin_bridges(path)?;

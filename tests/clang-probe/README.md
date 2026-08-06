@@ -10,6 +10,7 @@ free of a macOS toolchain.
 | `return_zero` | `return_zero.c` | (none; `return` only) | exit 0 via dyld-like host exit |
 | `puts_hello` | `puts_hello.c` | `_puts` | stdout `hello\n`, exit 0 |
 | `printf_hello` | `printf_hello.c` | `_printf` (no `%`) | stdout `hello\n`, exit 0 |
+| `g4-mini/` | multi-file C (calc/report/words/main) | freestanding stdio/string | `g4-mini PASS`, exit 0 (G4 link probe) |
 | `7zz.bin` | upstream 7-Zip (universal Mach-O) | full freestanding libSystem | see below |
 
 ```bash

@@ -2166,6 +2166,46 @@ pub(crate) unsafe extern "C" fn clock_gettime(clock_id: c_int, tp: *mut c_void) 
     0
 }
 
+/// Darwin `mach_absolute_time` → nlist `_mach_absolute_time`.
+///
+/// Returns nanoseconds-as-ticks. Pair with [`mach_timebase_info`] (1/1) so
+/// `ticks * numer / denom` is wall-ish ns. Observed: Apple `ld-classic` (G4).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mach_absolute_time() -> u64 {
+    let mut tv = [0_u8; 16];
+    let ret = unsafe { sys::syscall2(SYS_GETTIMEOFDAY, ptr_u64(tv.as_mut_ptr().cast()), 0) };
+    if ret < 0 {
+        return 0;
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let usec = u64::from(u32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]));
+    sec.saturating_mul(1_000_000_000).saturating_add(usec.saturating_mul(1_000))
+}
+
+/// Darwin `mach_timebase_info` → nlist `_mach_timebase_info`.
+///
+/// Soft 1/1 with [`mach_absolute_time`] ns ticks. `info` is
+/// `{ uint32_t numer; uint32_t denom; }`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mach_timebase_info(info: *mut u32) -> c_int {
+    if info.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // SAFETY: caller buffer for two u32s.
+    unsafe {
+        info.write(1);
+        info.add(1).write(1);
+    }
+    0
+}
+
+/// Darwin `mach_continuous_time` → nlist `_mach_continuous_time` (same as absolute).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mach_continuous_time() -> u64 {
+    unsafe { mach_absolute_time() }
+}
+
 /// C `qsort` → nlist `_qsort` (**heapsort**, O(n log n) worst case).
 ///
 /// Former insertion sort was O(n²): Apple `git index-pack` `qsort`s the full

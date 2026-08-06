@@ -45,6 +45,7 @@ mod libcxx_error;
 mod libcxx_shared;
 mod libcxx_string;
 mod libcxx_sync;
+mod ld_surface;
 mod locale;
 mod net;
 mod posix;

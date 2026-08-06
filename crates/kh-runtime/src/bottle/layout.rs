@@ -39,10 +39,25 @@ pub const GUEST_LIBCURL_REL: &str = "usr/lib/libcurl.4.dylib";
 /// Relative symlink target of [`GUEST_LIBCURL_REL`].
 pub const GUEST_LIBCURL_TARGET: &str = "libSystem.B.dylib";
 
+/// Guest path for `libxar.1.dylib` (Apple `ld-classic` LC_LOAD_DYLIB).
+///
+/// Soft `xar_*` exports live in freestanding libSystem (`ld_surface`).
+pub(crate) const GUEST_LIBXAR_REL: &str = "usr/lib/libxar.1.dylib";
+
+/// Relative symlink target of [`GUEST_LIBXAR_REL`].
+pub(crate) const GUEST_LIBXAR_TARGET: &str = "libSystem.B.dylib";
+
+/// Guest path for `libz.1.dylib` (zlib; freestanding exports in `zlib` module).
+pub(crate) const GUEST_LIBZ_REL: &str = "usr/lib/libz.1.dylib";
+
+/// Relative symlink target of [`GUEST_LIBZ_REL`].
+pub(crate) const GUEST_LIBZ_TARGET: &str = "libSystem.B.dylib";
+
 /// Empty directories that form the post-install macOS root skeleton.
 ///
 /// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`,
-/// `usr/lib/libcurl.4.dylib`) are created separately.
+/// `usr/lib/libcurl.4.dylib`, `usr/lib/libxar.1.dylib`, `usr/lib/libz.1.dylib`)
+/// are created separately.
 const DIRS: &[&str] = &[
     "Applications",
     "Library/Application Support",
@@ -114,6 +129,9 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     ensure_libcxx_symlink(root)?;
     // Git HTTPS: guest `/usr/lib/libcurl.4.dylib` → same freestanding dylib.
     ensure_libcurl_symlink(root)?;
+    // ld-classic (clang G4): libxar + libz → freestanding surface.
+    ensure_libxar_symlink(root)?;
+    ensure_libz_symlink(root)?;
 
     // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
     let volumes_linux = root.join(VOLUMES_LINUX);
@@ -139,7 +157,9 @@ pub fn materialize(root: &Path) -> io::Result<()> {
 }
 
 /// Host device basenames exposed under bottle `dev/` via `Volumes/linux`.
-const DEV_HOST_NODES: &[&str] = &["null", "zero", "urandom", "random", "tty", "stdin", "stdout", "stderr"];
+const DEV_HOST_NODES: &[&str] = &[
+    "null", "zero", "urandom", "random", "tty", "stdin", "stdout", "stderr",
+];
 
 /// Ensure guest `/dev/{null,zero,…}` exist as symlinks to the host devices.
 ///
@@ -277,6 +297,16 @@ pub fn has_libcurl_symlink(root: &Path) -> bool {
     }
 }
 
+/// Ensures `usr/lib/libxar.1.dylib` → freestanding libSystem (ld-classic / G4).
+pub(crate) fn ensure_libxar_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBXAR_REL, GUEST_LIBXAR_TARGET, true)
+}
+
+/// Ensures `usr/lib/libz.1.dylib` → freestanding libSystem.
+pub(crate) fn ensure_libz_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBZ_REL, GUEST_LIBZ_TARGET, true)
+}
+
 /// Shared install-name alias helper (libc++ / libcurl → freestanding libSystem).
 ///
 /// When `replace_file` is true, a non-symlink file is removed and replaced.
@@ -381,10 +411,7 @@ mod tests {
         assert_eq!(target, Path::new("/"));
 
         let null = fs::read_link(root.join("dev/null")).expect("dev/null");
-        assert_eq!(
-            null,
-            Path::new(&format!("../{VOLUMES_LINUX}/dev/null"))
-        );
+        assert_eq!(null, Path::new(&format!("../{VOLUMES_LINUX}/dev/null")));
 
         // Idempotent ensure after materialize.
         ensure_libcxx_symlink(&root).expect("ensure again");

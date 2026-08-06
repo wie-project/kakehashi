@@ -318,6 +318,61 @@ int vprintf(const char *fmt, va_list ap) {
   return (int)w;
 }
 
+/* sprintf / asprintf — ld-classic and clang diagnostics (G4). */
+extern void *malloc(size_t);
+extern void free(void *);
+
+int vsprintf(char *dst, const char *fmt, va_list ap) {
+  /* Unbounded write; caller must size correctly (classic sprintf contract). */
+  return vsnprintf_impl(dst, (size_t)-1 / 2, fmt, ap);
+}
+
+int sprintf(char *dst, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsprintf(dst, fmt, ap);
+  va_end(ap);
+  return n;
+}
+
+int vasprintf(char **ret, const char *fmt, va_list ap) {
+  if (!ret)
+    return -1;
+  *ret = 0;
+  char stack[4096];
+  va_list ap2;
+  va_copy(ap2, ap);
+  int n = vsnprintf_impl(stack, sizeof(stack), fmt, ap2);
+  va_end(ap2);
+  if (n < 0)
+    return -1;
+  size_t need = (size_t)n + 1;
+  char *p = (char *)malloc(need);
+  if (!p)
+    return -1;
+  if ((size_t)n < sizeof(stack)) {
+    size_t i;
+    for (i = 0; i < need; i++)
+      p[i] = stack[i];
+  } else {
+    int n2 = vsnprintf_impl(p, need, fmt, ap);
+    if (n2 < 0) {
+      free(p);
+      return -1;
+    }
+  }
+  *ret = p;
+  return n;
+}
+
+int asprintf(char **ret, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vasprintf(ret, fmt, ap);
+  va_end(ap);
+  return n;
+}
+
 int putchar(int c) {
   unsigned char b = (unsigned char)(c & 0xff);
   if (write(1, &b, 1) < 0)

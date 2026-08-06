@@ -560,6 +560,39 @@ pub(crate) unsafe extern "C" fn string_insert_n_char(
     this
 }
 
+/// `insert(__wrap_iter<char const*>, char)` → returns iterator (pointer).
+///
+/// Observed: libtapi / `ld-classic` TBD parse (G4). `__wrap_iter` is a
+/// pointer-sized iterator over the string buffer.
+#[unsafe(export_name = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertENS_11__wrap_iterIPKcEEc")]
+pub(crate) unsafe extern "C" fn string_insert_iter_char(
+    this: *mut c_void,
+    pos_it: *const c_char,
+    ch: c_char,
+) -> *mut c_char {
+    if this.is_null() {
+        return core::ptr::null_mut();
+    }
+    let data = current_data(this);
+    let len = current_len(this);
+    let pos = if pos_it.is_null() || data.is_null() {
+        len
+    } else {
+        let off = pos_it.addr().saturating_sub(data.addr());
+        off.min(len)
+    };
+    let one = [ch as u8];
+    unsafe {
+        let _ = string_insert_ptr_len(this, pos, one.as_ptr().cast(), 1);
+    }
+    // Return iterator to inserted char.
+    let new_data = current_data(this);
+    if new_data.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { new_data.add(pos).cast_mut().cast() }
+}
+
 /// `erase(size_t, size_t)`
 #[unsafe(export_name = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm")]
 pub(crate) unsafe extern "C" fn string_erase(
@@ -650,6 +683,16 @@ pub(crate) unsafe extern "C" fn string_append_substr(
 #[repr(C)]
 pub(crate) struct StringRep {
     bytes: [u8; REP_SIZE],
+}
+
+impl StringRep {
+    /// Empty short string (all zeros under Apple alternate layout).
+    #[inline]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            bytes: [0_u8; REP_SIZE],
+        }
+    }
 }
 
 /// `operator+` free: `string operator+(char const*, string const&)`
@@ -773,6 +816,109 @@ pub(crate) unsafe extern "C" fn to_string_ull(v: u64) -> StringRep {
 #[unsafe(export_name = "_ZNSt3__19to_stringEx")]
 pub(crate) unsafe extern "C" fn to_string_ll(v: i64) -> StringRep {
     string_from_i64(v)
+}
+
+/// `std::stoi(string const&, size_t* idx, int base)` — Apple `ld-classic` (G4).
+///
+/// Mangled: `_ZNSt3__14stoiERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPmi`
+#[unsafe(export_name = "_ZNSt3__14stoiERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPmi")]
+pub(crate) unsafe extern "C" fn stoi_string(
+    s: *const c_void,
+    idx: *mut usize,
+    base: i32,
+) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    let data = current_data(s);
+    let len = current_len(s);
+    let (val, consumed) = parse_i32_prefix(data, len, base);
+    if !idx.is_null() {
+        unsafe {
+            idx.write(consumed);
+        }
+    }
+    val
+}
+
+/// Parse a C++ `stoi`-style integer prefix from `data[0..len]`.
+fn parse_i32_prefix(data: *const u8, len: usize, base: i32) -> (i32, usize) {
+    if data.is_null() || len == 0 {
+        return (0, 0);
+    }
+    let mut i = 0_usize;
+    // skip whitespace
+    while i < len {
+        let b = unsafe { data.add(i).read() };
+        if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c') {
+            break;
+        }
+        i = i.saturating_add(1);
+    }
+    let start = i;
+    let mut neg = false;
+    if i < len {
+        let b = unsafe { data.add(i).read() };
+        if b == b'+' || b == b'-' {
+            neg = b == b'-';
+            i = i.saturating_add(1);
+        }
+    }
+    let mut base_u = base;
+    if base_u == 0 {
+        if i < len && unsafe { data.add(i).read() } == b'0' {
+            if i + 1 < len {
+                let n = unsafe { data.add(i + 1).read() };
+                if n == b'x' || n == b'X' {
+                    base_u = 16;
+                    i = i.saturating_add(2);
+                } else {
+                    base_u = 8;
+                }
+            } else {
+                base_u = 8;
+            }
+        } else {
+            base_u = 10;
+        }
+    } else if base_u == 16
+        && i + 1 < len
+        && unsafe { data.add(i).read() } == b'0'
+        && matches!(unsafe { data.add(i + 1).read() }, b'x' | b'X')
+    {
+        i = i.saturating_add(2);
+    }
+    if !(2..=36).contains(&base_u) {
+        return (0, start);
+    }
+    let radix = base_u as u32;
+    let mut acc: i64 = 0;
+    let mut any = false;
+    while i < len {
+        let b = unsafe { data.add(i).read() };
+        let digit = match b {
+            b'0'..=b'9' => u32::from(b - b'0'),
+            b'a'..=b'z' => u32::from(b - b'a') + 10,
+            b'A'..=b'Z' => u32::from(b - b'A') + 10,
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        any = true;
+        acc = acc
+            .saturating_mul(i64::from(radix))
+            .saturating_add(i64::from(digit));
+        i = i.saturating_add(1);
+    }
+    if !any {
+        return (0, start);
+    }
+    if neg {
+        acc = -acc;
+    }
+    let clamped = acc.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    (clamped, i)
 }
 
 /// `std::__1::__next_prime(size_t)` — bucket count helper for unordered_* .

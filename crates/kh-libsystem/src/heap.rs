@@ -592,6 +592,36 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     fresh
 }
 
+/// C `reallocf` → nlist `_reallocf` (BSD: free original on failure).
+///
+/// Observed: Apple `ld-classic` (G4 multi-file link).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn reallocf(ptr: *mut c_void, size: usize) -> *mut c_void {
+    // SAFETY: same contract as realloc; on failure free the original when non-null.
+    let p = unsafe { realloc(ptr, size) };
+    if p.is_null() && !ptr.is_null() && size != 0 {
+        unsafe {
+            free(ptr);
+        }
+    }
+    p
+}
+
+/// Darwin `malloc_size` → nlist `_malloc_size` (usable size of allocation).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn malloc_size(ptr: *const c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let h = hdr_from_user(ptr.cast_mut());
+    // SAFETY: only valid for freestanding heap pointers.
+    let magic = unsafe { (*h).magic };
+    if magic != MAGIC_ARENA && magic != MAGIC_MMAP {
+        return 0;
+    }
+    unsafe { (*h).size }
+}
+
 fn allocate(size: usize) -> *mut c_void {
     let need = if size == 0 { 1 } else { size };
     let need = align_up(need, ALIGN);

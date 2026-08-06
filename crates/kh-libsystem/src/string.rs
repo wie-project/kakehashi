@@ -436,6 +436,47 @@ pub(crate) unsafe extern "C" fn wmemcpy(
     dst
 }
 
+/// C `wmemchr` → nlist `_wmemchr`.
+///
+/// Observed: Apple clang driver when linking multi-file products (G4).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wmemchr(s: *const Wchar, c: Wchar, n: usize) -> *mut Wchar {
+    if s.is_null() || n == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: caller guarantees `n` readable wide chars.
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            if s.add(i).read() == c {
+                return s.add(i).cast_mut();
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// C `wmemcmp` → nlist `_wmemcmp` (pair with `wmemchr` for wide mem surface).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wmemcmp(s1: *const Wchar, s2: *const Wchar, n: usize) -> c_int {
+    if n == 0 || s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            let a = s1.add(i).read();
+            let b = s2.add(i).read();
+            if a != b {
+                return a.wrapping_sub(b);
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    0
+}
+
 // ── curl G1 string surface (from Docker unresolved list) ────────────────────
 
 /// C `strdup` → nlist `_strdup`.
@@ -879,6 +920,131 @@ unsafe fn strto_i64(s: *const c_char, endp: *mut *mut c_char, base: c_int) -> i6
             endp.write(p.cast_mut());
         }
         acc.saturating_mul(sign)
+    }
+}
+
+/// C `strtod` → nlist `_strtod` (decimal; enough for YAML/tapi numbers).
+///
+/// Observed: Apple `libtapi` undefined import (G4 TBD parse).
+#[allow(clippy::many_single_char_names)]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strtod(s: *const c_char, endp: *mut *mut c_char) -> f64 {
+    if s.is_null() {
+        if !endp.is_null() {
+            unsafe {
+                endp.write(core::ptr::null_mut());
+            }
+        }
+        return 0.0;
+    }
+    let mut p = s;
+    unsafe {
+        // skip whitespace
+        loop {
+            let b = p.read().cast_unsigned();
+            if b == 0 {
+                if !endp.is_null() {
+                    endp.write(p.cast_mut());
+                }
+                return 0.0;
+            }
+            if isspace(c_int::from(b)) != 0 {
+                p = p.add(1);
+                continue;
+            }
+            break;
+        }
+        let start = p;
+        let mut sign = 1.0_f64;
+        let b0 = p.read().cast_unsigned();
+        if b0 == b'+' {
+            p = p.add(1);
+        } else if b0 == b'-' {
+            sign = -1.0;
+            p = p.add(1);
+        }
+        let mut int_part = 0.0_f64;
+        let mut any = false;
+        loop {
+            let b = p.read().cast_unsigned();
+            if !b.is_ascii_digit() {
+                break;
+            }
+            any = true;
+            int_part = int_part * 10.0 + f64::from(b.wrapping_sub(b'0'));
+            p = p.add(1);
+        }
+        let mut frac = 0.0_f64;
+        let mut scale = 1.0_f64;
+        if p.read().cast_unsigned() == b'.' {
+            p = p.add(1);
+            loop {
+                let b = p.read().cast_unsigned();
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                any = true;
+                scale *= 10.0;
+                frac = frac * 10.0 + f64::from(b.wrapping_sub(b'0'));
+                p = p.add(1);
+            }
+        }
+        let mut exp_sign = 1_i32;
+        let mut exp_val = 0_i32;
+        let e = p.read().cast_unsigned();
+        if e == b'e' || e == b'E' {
+            let after_e = p.add(1);
+            let mut q = after_e;
+            let eb = q.read().cast_unsigned();
+            if eb == b'+' {
+                q = q.add(1);
+            } else if eb == b'-' {
+                exp_sign = -1;
+                q = q.add(1);
+            }
+            let mut exp_any = false;
+            loop {
+                let b = q.read().cast_unsigned();
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                exp_any = true;
+                exp_val = exp_val
+                    .saturating_mul(10)
+                    .saturating_add(i32::from(b.wrapping_sub(b'0')));
+                q = q.add(1);
+            }
+            if exp_any {
+                p = q;
+            }
+        }
+        if !any {
+            if !endp.is_null() {
+                endp.write(s.cast_mut());
+            }
+            return 0.0;
+        }
+        if !endp.is_null() {
+            endp.write(p.cast_mut());
+        }
+        let mut v = (int_part + frac / scale) * sign;
+        let e_tot = exp_val.saturating_mul(exp_sign);
+        if e_tot != 0 {
+            // pow10 via multiply loop (small exponents from YAML).
+            let mut eabs = e_tot.unsigned_abs().min(308);
+            let mut p10 = 1.0_f64;
+            while eabs > 0 {
+                p10 *= 10.0;
+                eabs = eabs.saturating_sub(1);
+            }
+            if e_tot > 0 {
+                v *= p10;
+            } else {
+                v /= p10;
+            }
+        }
+        let _ = start;
+        v
     }
 }
 

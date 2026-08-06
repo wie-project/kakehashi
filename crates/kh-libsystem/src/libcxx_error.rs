@@ -6,7 +6,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::trace;
+use crate::libcxx_string::StringRep;
 
 // ── category object + soft vtable ───────────────────────────────────────────
 //
@@ -210,15 +210,20 @@ pub(crate) unsafe extern "C" fn error_category_equivalent_code_int(
     unsafe { cat_equivalent_code_int(this, code, cond) }
 }
 
-/// `error_category::~error_category()`
+/// `error_category::~error_category()` (complete object dtor D1).
 #[unsafe(export_name = "_ZNSt3__114error_categoryD1Ev")]
 pub(crate) unsafe extern "C" fn error_category_dtor(_this: *mut c_void) {}
 
-/// `error_code::message() const` — soft: empty string via AAPCS64 `x8` sret is
-/// not expressible in pure Rust extern "C"; provide a no-op that guests rarely
-/// need on the `--version` path. If a path requires a real string, extend with
-/// a helper that writes 24 zero bytes to a known out-pointer convention.
+/// `error_category::~error_category()` base object dtor D2 (same soft no-op).
+/// Observed: Apple `libtapi` (G4).
+#[unsafe(export_name = "_ZNSt3__114error_categoryD2Ev")]
+pub(crate) unsafe extern "C" fn error_category_dtor_base(_this: *mut c_void) {}
+
+/// `error_code::message() const` — empty `basic_string` by value (AArch64 sret).
+///
+/// Observed: Apple `libtapi` (G4). Returning an uninitialized rep used to leave
+/// garbage strings after error paths.
 #[unsafe(export_name = "_ZNKSt3__110error_code7messageEv")]
-pub(crate) unsafe extern "C" fn error_code_message(_this: *const c_void) {
-    trace::note(b"[kh-libsystem] error_code::message soft no-op\n");
+pub(crate) unsafe extern "C" fn error_code_message(_this: *const c_void) -> StringRep {
+    StringRep::empty()
 }

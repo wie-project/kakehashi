@@ -7,11 +7,32 @@
 //! [`export_name`] so the linker emits the exact strings guests import from
 //! `libc++.1.dylib` (aliased to this dylib in the bottle).
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
 use crate::heap::{free, malloc};
 use crate::process::exit_now;
 use crate::trace;
+
+/// `std::nothrow` → nlist `__ZSt7nothrow` (empty tag object).
+///
+/// Observed: Apple `libtapi` / `ld-classic` (G4).
+#[unsafe(export_name = "_ZSt7nothrow")]
+#[used]
+static STD_NOTHROW: u8 = 0;
+
+/// `std::__1::__libcpp_verbose_abort(char const*, ...)` — fatal libc++ assert.
+/// Observed: Apple `libtapi` (G4). Extra varargs ignored (aarch64).
+#[unsafe(export_name = "_ZNSt3__122__libcpp_verbose_abortEPKcz")]
+pub(crate) unsafe extern "C" fn libcpp_verbose_abort(fmt: *const c_char) -> ! {
+    trace::force_note(b"[kh-libsystem] __libcpp_verbose_abort: ");
+    if !fmt.is_null() {
+        force_note_cstr(fmt.cast::<u8>(), 200);
+    }
+    trace::force_note(b"\n");
+    unsafe {
+        exit_now(1);
+    }
+}
 
 // ── operators new / delete ──────────────────────────────────────────────────
 
@@ -471,6 +492,23 @@ pub(crate) unsafe extern "C" fn this_thread_sleep_for_ns(dur: *const i64) {
 }
 
 /// `___cxa_pure_virtual` → nlist `___cxa_pure_virtual`.
+///
+/// `__dynamic_cast` → nlist `___dynamic_cast` (Itanium ABI).
+///
+/// Walks guest typeinfo (see `rtti`). G4 history:
+/// * always-null → `indirect dylib … is not a dylib` (reexport TBD chain)
+/// * always-src → wrong `Resolver::doFile` branch → SEGV
+#[unsafe(export_name = "__dynamic_cast")]
+pub(crate) unsafe extern "C" fn dynamic_cast_stub(
+    src_ptr: *const c_void,
+    src_type: *const c_void,
+    dst_type: *const c_void,
+    src2dst: isize,
+) -> *mut c_void {
+    // SAFETY: pointers from guest C++; walk is bounded.
+    unsafe { crate::rtti::dynamic_cast(src_ptr, src_type, dst_type, src2dst) }
+}
+
 #[unsafe(export_name = "__cxa_pure_virtual")]
 pub(crate) unsafe extern "C" fn cxa_pure_virtual() -> ! {
     trace::note(b"[kh-libsystem] ___cxa_pure_virtual\n");
@@ -498,16 +536,159 @@ pub(crate) unsafe extern "C" fn cxa_free_exception(ptr: *mut c_void) {
 }
 
 /// `___cxa_throw` → nlist `___cxa_throw` (no unwind; abort).
+///
+/// Dumps typeinfo name + a best-effort message so G4 (ld-classic/libtapi) can
+/// show *why* a throw happened (TBD parse, string, etc.). Real catch/unwind is
+/// still out of scope — freestanding aborts after the note.
 #[unsafe(export_name = "__cxa_throw")]
 pub(crate) unsafe extern "C" fn cxa_throw(
-    _exception: *mut c_void,
-    _tinfo: *mut c_void,
+    exception: *mut c_void,
+    tinfo: *mut c_void,
     _dest: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> ! {
-    trace::note(b"[kh-libsystem] ___cxa_throw (stub abort)\n");
+    trace::force_note(b"[kh-libsystem] ___cxa_throw (stub abort)");
+    // Itanium `std::type_info`: vptr @0, `const char* __type_name` @8.
+    if !tinfo.is_null() {
+        // SAFETY: guest typeinfo from the throwing image; name is a C string.
+        let name_ptr = unsafe { tinfo.cast::<*const u8>().add(1).read() };
+        if !name_ptr.is_null() {
+            trace::force_note(b" type=");
+            force_note_cstr(name_ptr, 160);
+        }
+    }
+    if !exception.is_null() {
+        // `throw "literal"` / `throwf`: object is often a `char const*` value,
+        // or a small struct whose first word is a C string.
+        // SAFETY: exception blob written by throw site after allocate_exception.
+        let as_ptr = unsafe { exception.cast::<*const u8>().read() };
+        if cstr_looks_printable(as_ptr, 200) {
+            trace::force_note(b" msg=");
+            force_note_cstr(as_ptr, 200);
+        } else if cstr_looks_printable(exception.cast::<u8>(), 200) {
+            // Object itself is inline C string bytes (rare).
+            trace::force_note(b" msg=");
+            force_note_cstr(exception.cast::<u8>(), 200);
+        }
+    }
+    // Return address helps map to libtapi / ld-classic text.
+    let ra = return_addr();
+    if ra != 0 {
+        trace::force_note(b" ra=0x");
+        force_note_hex(ra);
+    }
+    trace::force_note(b"\n");
     unsafe {
         exit_now(1);
     }
+}
+
+/// Best-effort return address of the throw site (LR at entry to this stub).
+#[inline]
+fn return_addr() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut lr: usize;
+        // SAFETY: read link register only; diagnostics.
+        unsafe {
+            core::arch::asm!(
+                "mov {0}, x30",
+                out(reg) lr,
+                options(nostack, nomem, preserves_flags)
+            );
+        }
+        lr
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
+}
+
+fn force_note_cstr(p: *const u8, max: usize) {
+    if p.is_null() {
+        return;
+    }
+    let mut buf = [0_u8; 208];
+    let mut n = 0_usize;
+    while n < max && n < buf.len() {
+        // SAFETY: bounded walk of a guest C string.
+        let b = unsafe { p.add(n).read() };
+        if b == 0 {
+            break;
+        }
+        // Keep printable ASCII + tab/newline; replace others.
+        let ch = if (0x20..0x7f).contains(&b) || b == b'\t' || b == b'\n' {
+            b
+        } else {
+            b'?'
+        };
+        if let Some(slot) = buf.get_mut(n) {
+            *slot = ch;
+        }
+        n = n.saturating_add(1);
+    }
+    if n > 0
+        && let Some(slice) = buf.get(..n)
+    {
+        trace::force_note(slice);
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation
+)]
+fn force_note_hex(mut v: usize) {
+    let mut tmp = [0_u8; 16];
+    let mut i = 0_usize;
+    if v == 0 {
+        trace::force_note(b"0");
+        return;
+    }
+    while v > 0 && i < tmp.len() {
+        let d = (v & 0xf) as u8;
+        let ch = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        if let Some(slot) = tmp.get_mut(i) {
+            *slot = ch;
+        }
+        i = i.saturating_add(1);
+        v >>= 4;
+    }
+    // reverse
+    let mut out = [0_u8; 16];
+    let mut j = 0_usize;
+    while i > 0 && j < out.len() {
+        i = i.saturating_sub(1);
+        if let (Some(dst), Some(src)) = (out.get_mut(j), tmp.get(i)) {
+            *dst = *src;
+        }
+        j = j.saturating_add(1);
+    }
+    if let Some(slice) = out.get(..j) {
+        trace::force_note(slice);
+    }
+}
+
+fn cstr_looks_printable(p: *const u8, max: usize) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    let mut n = 0_usize;
+    let mut any = false;
+    while n < max {
+        // SAFETY: bounded probe; null-terminated or stop at max.
+        let b = unsafe { p.add(n).read() };
+        if b == 0 {
+            return any && n >= 3;
+        }
+        if !((0x20..0x7f).contains(&b) || b == b'\t' || b == b'\n') {
+            return false;
+        }
+        any = true;
+        n = n.saturating_add(1);
+    }
+    any
 }
 
 /// `___cxa_begin_catch` → nlist `___cxa_begin_catch`.
