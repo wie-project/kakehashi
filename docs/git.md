@@ -16,6 +16,9 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
 | G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote`, shallow + full small `clone`) |
 | G5 | Remote over SSH (host OpenSSH bridge) | **pass** (Docker local sshd: `ls-remote` + `clone`; see `scripts/docker-git-ssh.sh`) |
+| G6 | Push + branches to private remote | **pass** (Docker: private bare `0700` + SSH; branch / `push -u` / FF / merge+push main; see `scripts/docker-git-push.sh`) |
+| G7 | Plain `http://` on socket path (freestanding) | **pass** (Docker smart HTTP: `ls-remote` + `clone` + `push`; see `scripts/docker-git-http.sh`) |
+| G8 | Authenticated GitHub under Docker | **pass** (private repo: SSH force-push + HTTPS Basic userinfo `ls-remote`/`clone`; see `scripts/docker-git-github.sh`) |
 
 ### G5 notes (SSH / host OpenSSH bridge)
 
@@ -58,6 +61,7 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 | `curl_*` C ABI | freestanding `kh-libsystem` (`src/curl.rs`) — clean-room, not upstream libcurl |
 | Bottle alias | `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` ([`layout::ensure_libcurl_symlink`](../crates/kh-runtime/src/bottle/layout.rs)) |
 | HTTPS I/O (path B) | `KH_HELPER_TLS_CONNECT` → host TCP + **rustls**; guest `read`/`write` on TLS-wrapped FD are **plaintext**; freestanding builds HTTP/1.1 and streams body into `write_fn` (no multi‑GiB guest buffer) |
+| Plain HTTP (path B) | same helper + **`TLS_FLAG_PLAIN`** (bit1): TCP only, no rustls; same HTTP/1.1 streamer — **G7** |
 | Legacy | `KH_HELPER_HTTP` (host `curl` CLI + 64 MiB body cap) kept for tools that still call it; freestanding `easy_perform` no longer uses it for HTTPS |
 | Loader alias fix | map `install_name` from **LC_LOAD** (not only LC_ID) so two-level ordinals against `libcurl.4.dylib` resolve |
 
@@ -136,7 +140,8 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
 12. **HTTPS path B (TLS guest FD + freestanding HTTP/1.1)** — replaces host
     `curl` CLI + 64 MiB body cap for freestanding `easy_perform`:
     - `KH_HELPER_TLS_CONNECT` (`0x4B48_0011`): host TCP + rustls handshake
-      (bottle CA); returns guest FD.
+      (bottle CA); returns guest FD. **G7:** `TLS_FLAG_PLAIN` (bit1) skips
+      rustls for `http://` (same HTTP/1.1 streamer on a raw TCP guest FD).
     - Host `read`/`write` on that FD decrypt/encrypt via rustls; guest sees
       plaintext (same as a completed TLS socket from the app’s POV).
     - Freestanding builds request, parses response headers, streams body
@@ -194,9 +199,75 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     GitHub needs keys + `known_hosts` (plain `ls-remote git@…` reaches OpenSSH:
     host-key / publickey errors, not missing `ssh`).
 
+### G6 notes (push / private bare / branches)
+
+Push reuses the G5 host OpenSSH bridge (`git-receive-pack` over `ssh://`).
+No new freestanding network stack: clean-room host client only.
+
+| Piece | Detail |
+| --- | --- |
+| Private remote | Host `git clone --bare` + `chmod 700`; SSH pubkey only (no password) |
+| Why not GitHub | Smoke needs no account/token; local bare stands in for a private remote |
+| Branches | `checkout -b`, commit, `push -u origin <branch>`, FF push, merge + `push main` |
+| Docker helper | `scripts/docker-git-push.sh` |
+
+```text
+./scripts/docker-git-push.sh
+# → clone private bare over SSH → feature branch → push -u → FF push →
+#   merge to main → push main; verifies refs on the bare remote
+```
+
+**Provenance (G6):** observed Apple `git push` → `execvp(ssh)` → host OpenSSH
+→ `git-receive-pack` on bare; no Darling; no proprietary paste. Surface already
+covered by G3 (spawn/FS) + G5 (SSH bridge).
+
+**Not in G6:** authenticated push to GitHub/GitLab (needs developer keys + token
+policy); HTTPS `git-receive-pack` against public hosts (clone path is green; push
+over HTTPS is the same freestanding curl path — also exercised by G7 over
+`http://`).
+
+### G7 notes (plain `http://` socket path)
+
+Freestanding libcurl previously rejected `http://` (`only https supported on
+socket TLS path`). G7 adds **`TLS_FLAG_PLAIN`** on `KH_HELPER_TLS_CONNECT`:
+
+| Piece | Detail |
+| --- | --- |
+| Host | `tls_fd::connect` with plain flag → TCP, guest FD **without** rustls slot |
+| Guest | freestanding `perform_easy` calls the same HTTP/1.1 path as HTTPS |
+| Smoke | local `git-http-backend` CGI on `127.0.0.1` — no public network |
+| Docker helper | `scripts/docker-git-http.sh` |
+
+```text
+./scripts/docker-git-http.sh
+# → ls-remote http://127.0.0.1:…/repo.git → clone → branch → push
+```
+
+**Provenance (G7):** observed need from failed `ls-remote http://…` under kh;
+POSIX/HTTP/1.1 + existing path B; clean-room host TCP; no Darling.
+
+### G8 notes (authenticated GitHub under Docker)
+
+| Piece | Detail |
+| --- | --- |
+| SSH | Host `~/.ssh` → container `/root/.ssh:ro`; `GIT_SSH_COMMAND` + writable `known_hosts` |
+| HTTPS Basic | URL userinfo `https://x-access-token:TOKEN@github.com/…` → freestanding `Authorization: Basic` (base64) |
+| Private remote | Host `gh` creates/reuses `OWNER/kh-kakehashi-smoke` (private); smoke force-pushes |
+| Token | Host `gh auth token` → docker env only; never printed |
+| Docker helper | `scripts/docker-git-github.sh` |
+
+```text
+# Host: gh auth login (repo scope); SSH key on GitHub
+./scripts/docker-git-github.sh
+# → private create/reuse → SSH push → HTTPS ls-remote/clone of private
+```
+
+**Provenance (G8):** G5 SSH bridge + freestanding path B; userinfo/Basic from
+RFC 7617 / curl man page contracts; no Darling. Optional delete needs
+`delete_repo` (`gh auth refresh -h github.com -s delete_repo` + `KH_DELETE_REPO=1`).
+
 **Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
-time budget; push; plain `http://` on the socket path; authenticated GitHub
-SSH under Docker. Stage freestanding with **release** dylib (`cargo build -p
+time budget. Stage freestanding with **release** dylib (`cargo build -p
 kh-libsystem --release --target aarch64-apple-darwin` then
 `./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
 release over a newer debug build.

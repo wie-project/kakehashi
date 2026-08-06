@@ -251,9 +251,10 @@ pub(crate) const KH_HELPER_REGFREE: u32 = KH_HELPER_BASE | 0x10;
 /// u32 magic = 0x4B48_544C  // "KHTL"
 /// u32 version = 1
 /// u32 flags    // bit0 = verify peer (TLS_FLAG_VERIFY)
+///              // bit1 = plain TCP only (TLS_FLAG_PLAIN; freestanding http://)
 /// u32 port
 /// u64 hostname_va, hostname_len
-/// u64 ca_path_va   // 0 → bottle CA when verify
+/// u64 ca_path_va   // 0 → bottle CA when verify; ignored when PLAIN
 /// u64 out_fd_va    // writes i32 guest fd
 /// u64 errbuf_va, errbuf_cap
 /// ```

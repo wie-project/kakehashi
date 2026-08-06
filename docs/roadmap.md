@@ -61,7 +61,7 @@ Priority is **guest surface**, not shaving another tenth off an already ~×1.2 m
 | Priority | Direction | Notes |
 | --- | --- | --- |
 | 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| 2 | **git** / **xcode-tools** | **G4 met** (HTTPS). **G5 met** (SSH via host OpenSSH bridge; local sshd clone). Polish: multi‑GiB monorepos, push, GitHub SSH under Docker — [git.md](git.md) |
+| 2 | **git** / **xcode-tools** | **G4–G8 met** (HTTPS; SSH; push; plain `http://`; authenticated GitHub private). Polish: multi‑GiB monorepos under time budget — [git.md](git.md) |
 | — | Optional polish | `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen; not gates |
 
 Rationale: curl was the smaller vertical slice that forced network ABI on top

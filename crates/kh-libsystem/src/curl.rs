@@ -2,8 +2,9 @@
 //!
 //! Bottle install name `/usr/lib/libcurl.4.dylib` is a **symlink** to freestanding
 //! `libSystem.B.dylib` (same pattern as `libc++.1.dylib`). Symbols live here;
-//! HTTPS uses host [`crate::KH_HELPER_TLS_CONNECT`] (TCP + rustls) and streams
-//! HTTP/1.1 over the TLS guest FD (plaintext `read`/`write`).
+//! network I/O uses host [`crate::KH_HELPER_TLS_CONNECT`]:
+//! - `https://` — TCP + rustls; guest `read`/`write` are plaintext over the TLS FD
+//! - `http://` — plain TCP (`TLS_FLAG_PLAIN`); same HTTP/1.1 streamer on the FD
 //!
 //! Clean-room: public curl man-page contracts + observed git usage.
 
@@ -99,9 +100,11 @@ type ReadCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> us
 const MAGIC_EASY: u32 = 0x4B48_4359; // KHCY
 const MAGIC_MULTI: u32 = 0x4B48_434D; // KHCM
 const MAGIC_SLIST: u32 = 0x4B48_4353; // KHCS
-/// Host TLS connect request (`KH_HELPER_TLS_CONNECT`); LE, 64 bytes.
+/// Host TLS/TCP connect request (`KH_HELPER_TLS_CONNECT`); LE, 64 bytes.
 const KHTLS_MAGIC: u32 = 0x4B48_544C; // KHTL
 const TLS_FLAG_VERIFY: u32 = 1;
+/// Plain TCP only (no rustls) — freestanding `http://` remotes.
+const TLS_FLAG_PLAIN: u32 = 2;
 
 const MAX_HDR_BLOB: usize = 8 * 1024;
 /// Streaming I/O chunk for HTTP body (multi‑GiB packs never fully buffered).
@@ -404,7 +407,10 @@ unsafe extern "C" fn default_write(
     size.saturating_mul(nmemb)
 }
 
-/// Parsed `https://host[:port]/path` (http:// also accepted for local tests).
+/// Parsed `https://[userinfo@]host[:port]/path` (http:// also for local tests).
+///
+/// `userinfo` is `user:pass` for HTTP Basic (GitHub: `x-access-token:gho_…` or
+/// `oauth2:TOKEN`). Empty `userinfo_len` means unauthenticated.
 struct ParsedUrl {
     https: bool,
     host: [u8; 256],
@@ -413,6 +419,9 @@ struct ParsedUrl {
     /// Path beginning with `/` (default `/`).
     path: [u8; 2048],
     path_len: usize,
+    /// Raw `user:password` (not base64); max 512 bytes.
+    userinfo: [u8; 512],
+    userinfo_len: usize,
 }
 
 fn parse_url(url: *const c_char) -> Option<ParsedUrl> {
@@ -437,28 +446,46 @@ fn parse_url(url: *const c_char) -> Option<ParsedUrl> {
     if authority.is_empty() {
         return None;
     }
-    // host[:port] — no userinfo for git remotes.
-    let (host_s, port) = if let Some(colon) = authority.iter().rposition(|&b| b == b':') {
-        let h = authority.get(..colon)?;
-        let p = authority.get(colon.saturating_add(1)..)?;
-        if h.is_empty() || p.is_empty() {
+
+    // Optional userinfo: user[:pass]@host…
+    let (userinfo_s, hostport) = if let Some(at) = authority.iter().position(|&b| b == b'@') {
+        let ui = authority.get(..at)?;
+        let hp = authority.get(at.saturating_add(1)..)?;
+        if ui.is_empty() || hp.is_empty() {
             return None;
         }
-        let mut v: u32 = 0;
-        for &c in p {
-            if !c.is_ascii_digit() {
-                return None;
-            }
-            v = v.saturating_mul(10).saturating_add(u32::from(c - b'0'));
-            if v > 65535 {
-                return None;
-            }
-        }
-        (h, v as u16)
+        (ui, hp)
     } else {
-        (authority, 0)
+        (&[][..], authority)
     };
-    if host_s.len() >= 256 {
+    if userinfo_s.len() > 512 {
+        return None;
+    }
+
+    // host[:port] — port only when suffix is all digits (not user:pass).
+    let (host_s, port) = if let Some(colon) = hostport.iter().rposition(|&b| b == b':') {
+        let h = hostport.get(..colon)?;
+        let p = hostport.get(colon.saturating_add(1)..)?;
+        if h.is_empty() {
+            return None;
+        }
+        if !p.is_empty() && p.iter().all(u8::is_ascii_digit) {
+            let mut v: u32 = 0;
+            for &c in p {
+                v = v.saturating_mul(10).saturating_add(u32::from(c - b'0'));
+                if v > 65535 {
+                    return None;
+                }
+            }
+            (h, v as u16)
+        } else {
+            // Colon but not a port (unusual host) — treat whole as host.
+            (hostport, 0)
+        }
+    } else {
+        (hostport, 0)
+    };
+    if host_s.is_empty() || host_s.len() >= 256 {
         return None;
     }
     let mut out = ParsedUrl {
@@ -466,14 +493,23 @@ fn parse_url(url: *const c_char) -> Option<ParsedUrl> {
         host: [0; 256],
         host_len: host_s.len(),
         port: if port == 0 {
-            if https { 443 } else { 80 }
+            if https {
+                443
+            } else {
+                80
+            }
         } else {
             port
         },
         path: [0; 2048],
         path_len: 0,
+        userinfo: [0; 512],
+        userinfo_len: userinfo_s.len(),
     };
     out.host[..host_s.len()].copy_from_slice(host_s);
+    if !userinfo_s.is_empty() {
+        out.userinfo[..userinfo_s.len()].copy_from_slice(userinfo_s);
+    }
     let path = if path_raw.is_empty() { b"/" } else { path_raw };
     if path.len() >= out.path.len() {
         return None;
@@ -481,6 +517,48 @@ fn parse_url(url: *const c_char) -> Option<ParsedUrl> {
     out.path[..path.len()].copy_from_slice(path);
     out.path_len = path.len();
     Some(out)
+}
+
+/// RFC 4648 base64 (no padding strip; always pads). Returns encoded length.
+fn base64_encode(src: &[u8], dst: &mut [u8]) -> Option<usize> {
+    const T: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let n = src.len();
+    let out_len = n.div_ceil(3).saturating_mul(4);
+    if dst.len() < out_len {
+        return None;
+    }
+    let mut o = 0_usize;
+    let mut i = 0_usize;
+    while i + 3 <= n {
+        let b0 = src[i];
+        let b1 = src[i + 1];
+        let b2 = src[i + 2];
+        dst[o] = T[(b0 >> 2) as usize];
+        dst[o + 1] = T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        dst[o + 2] = T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize];
+        dst[o + 3] = T[(b2 & 0x3f) as usize];
+        o = o.saturating_add(4);
+        i = i.saturating_add(3);
+    }
+    let rem = n.saturating_sub(i);
+    if rem == 1 {
+        let b0 = src[i];
+        dst[o] = T[(b0 >> 2) as usize];
+        dst[o + 1] = T[((b0 & 0x03) << 4) as usize];
+        dst[o + 2] = b'=';
+        dst[o + 3] = b'=';
+        o = o.saturating_add(4);
+    } else if rem == 2 {
+        let b0 = src[i];
+        let b1 = src[i + 1];
+        dst[o] = T[(b0 >> 2) as usize];
+        dst[o + 1] = T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize];
+        dst[o + 2] = T[((b1 & 0x0f) << 2) as usize];
+        dst[o + 3] = b'=';
+        o = o.saturating_add(4);
+    }
+    Some(o)
 }
 
 fn append_bytes(dst: &mut [u8], off: &mut usize, src: &[u8]) -> bool {
@@ -530,13 +608,23 @@ fn headers_contain(blob: &[u8], name: &[u8]) -> bool {
     false
 }
 
-fn tls_connect_fd(easy: &Easy, host: &[u8], port: u16) -> Result<c_int, c_int> {
+/// Connect guest FD for freestanding HTTP(S): TLS (https) or plain TCP (http).
+fn socket_connect_fd(easy: &Easy, host: &[u8], port: u16, https: bool) -> Result<c_int, c_int> {
     let mut err_local = [0_u8; ERRBUF_LEN];
     let mut out_fd: i32 = -1;
     let mut flags = 0_u32;
-    if easy.flags & EF_SSL_VERIFY != 0 {
-        flags |= TLS_FLAG_VERIFY;
+    if https {
+        if easy.flags & EF_SSL_VERIFY != 0 {
+            flags |= TLS_FLAG_VERIFY;
+        }
+    } else {
+        flags |= TLS_FLAG_PLAIN;
     }
+    let ca_path = if https && ptr_live(easy.ca_info.cast()) {
+        easy.ca_info as u64
+    } else {
+        0
+    };
     let req = KhTlsConnect {
         magic: KHTLS_MAGIC,
         version: 1,
@@ -544,11 +632,7 @@ fn tls_connect_fd(easy: &Easy, host: &[u8], port: u16) -> Result<c_int, c_int> {
         port: u32::from(port),
         hostname: host.as_ptr() as u64,
         hostname_len: host.len() as u64,
-        ca_path: if ptr_live(easy.ca_info.cast()) {
-            easy.ca_info as u64
-        } else {
-            0
-        },
+        ca_path,
         out_fd: core::ptr::from_mut(&mut out_fd) as u64,
         errbuf: err_local.as_mut_ptr() as u64,
         errbuf_cap: ERRBUF_LEN as u64,
@@ -557,8 +641,10 @@ fn tls_connect_fd(easy: &Easy, host: &[u8], port: u16) -> Result<c_int, c_int> {
     if rc < 0 {
         let msg: &[u8] = if err_local[0] != 0 {
             &err_local
-        } else {
+        } else if https {
             b"tls connect failed\0"
+        } else {
+            b"tcp connect failed\0"
         };
         set_err(easy, msg);
         return Err(match (-rc) as i32 {
@@ -568,7 +654,7 @@ fn tls_connect_fd(easy: &Easy, host: &[u8], port: u16) -> Result<c_int, c_int> {
         });
     }
     if out_fd < 0 {
-        set_err(easy, b"tls connect bad fd\0");
+        set_err(easy, b"connect bad fd\0");
         return Err(CURLE_COULDNT_CONNECT);
     }
     Ok(out_fd)
@@ -693,16 +779,9 @@ fn perform_easy(easy: &mut Easy) -> c_int {
         return easy.result;
     };
 
-    // Path B: HTTPS over host rustls + guest FD. Plain HTTP is rare for git remotes.
-    if !url.https {
-        set_err(easy, b"only https supported on socket TLS path\0");
-        easy.result = CURLE_UNSUPPORTED_PROTOCOL;
-        easy.flags |= EF_DONE;
-        return easy.result;
-    }
-
+    // Path B: HTTP/1.1 over host TCP guest FD (rustls for https://, plain for http://).
     let host = &url.host[..url.host_len];
-    let fd = match tls_connect_fd(easy, host, url.port) {
+    let fd = match socket_connect_fd(easy, host, url.port, url.https) {
         Ok(f) => f,
         Err(code) => {
             easy.result = code;
@@ -721,8 +800,6 @@ fn perform_easy(easy: &mut Easy) -> c_int {
     }
     result
 }
-
-const CURLE_UNSUPPORTED_PROTOCOL: c_int = 1;
 
 /// Gathered POST/PUT body: optional freestanding-owned buffer.
 struct PostBody {
@@ -947,6 +1024,29 @@ fn perform_http_on_fd(easy: &mut Easy, fd: c_int, url: &ParsedUrl) -> c_int {
             let _ = append_u64(req_slice, &mut off, u64::from(url.port));
         }
         let _ = append_bytes(req_slice, &mut off, b"\r\n");
+    }
+    // URL userinfo → HTTP Basic (git often embeds x-access-token:… for HTTPS).
+    if url.userinfo_len > 0 && !headers_contain(user_hdrs, b"authorization") {
+        let mut b64 = [0_u8; 700];
+        let Some(b64_n) = base64_encode(&url.userinfo[..url.userinfo_len], &mut b64) else {
+            unsafe {
+                free(req_buf.cast());
+            }
+            body.free_owned();
+            set_err(easy, b"auth encode overflow\0");
+            return CURLE_OUT_OF_MEMORY;
+        };
+        if !append_bytes(req_slice, &mut off, b"Authorization: Basic ")
+            || !append_bytes(req_slice, &mut off, &b64[..b64_n])
+            || !append_bytes(req_slice, &mut off, b"\r\n")
+        {
+            unsafe {
+                free(req_buf.cast());
+            }
+            body.free_owned();
+            set_err(easy, b"auth header overflow\0");
+            return CURLE_OUT_OF_MEMORY;
+        }
     }
     if !headers_contain(user_hdrs, b"user-agent") {
         if ptr_live(easy.user_agent.cast()) {

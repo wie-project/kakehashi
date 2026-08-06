@@ -131,15 +131,22 @@ kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
 # full / large clones stream over TLS guest FDs (path B; no 64 MiB body cap)
 # kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
 # Docker stress: ./scripts/docker-git.sh clone --depth 1 --single-branch https://github.com/torvalds/linux.git
+# Push + branches to a private bare remote over SSH (local sshd; no GitHub token):
+# ./scripts/docker-git-push.sh
+# Plain http:// smart HTTP (ls-remote / clone / push; local git-http-backend):
+# ./scripts/docker-git-http.sh
+# Authenticated GitHub private (needs host gh + SSH key):
+# ./scripts/docker-git-github.sh
 ```
 
-See [`docs/git.md`](docs/git.md) for gates (G0–G4). Docker: `scripts/docker-git.sh`.
+See [`docs/git.md`](docs/git.md) for gates (G0–G8). Docker: `scripts/docker-git.sh`,
+`docker-git-ssh.sh`, `docker-git-push.sh`, `docker-git-http.sh`, `docker-git-github.sh`.
 
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, full git (push, multi‑GiB monorepo time
-budgets), GUI, codesign.
+real Apple Security.framework, multi‑GiB monorepo clone time budgets, GUI,
+codesign.
 
 ## Crates
 
@@ -306,6 +313,10 @@ Bottle bridges the Linux FS as `/Volumes/linux/…`:
 | `scripts/docker-curl-probe.sh`   | `KH_CURL_PROBE=1` wrapper (logs → `.tmp/kh-curl-probe`)                               |
 | `scripts/docker-curl-options.sh` | Tiered curl flag smoke (`tier1`…`tier10`, `tier9-10`, `all` → `.tmp/kh-curl-options`) |
 | `scripts/docker-git.sh`          | Apple `git` from CLT under `kh` (swscan + `.kh/data` cache)                           |
+| `scripts/docker-git-ssh.sh`      | Git SSH smoke: local sshd + bare + `ls-remote` / `clone`                              |
+| `scripts/docker-git-push.sh`     | Git push smoke: private bare + branches + `push` over SSH                             |
+| `scripts/docker-git-http.sh`      | Git plain `http://` smoke: smart HTTP `ls-remote` / `clone` / `push`                  |
+| `scripts/docker-git-github.sh`    | Authenticated GitHub private: SSH push + HTTPS Basic clone (host `gh` + keys)         |
 | `scripts/bench-fair-local.sh`    | Native vs kh compress (artifacts → `.tmp/kh-bench-fair`)                              |
 
 ## License

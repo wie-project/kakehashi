@@ -38,6 +38,11 @@ use rustls::{
 
 /// Flag: verify peer certificate against CA bundle (matches freestanding curl).
 pub const TLS_FLAG_VERIFY: u32 = 1;
+/// Flag: plain TCP only (no rustls). Freestanding libcurl uses this for `http://`.
+///
+/// Mutually exclusive with TLS semantics: when set, peer verify / CA are ignored
+/// and the guest FD is a normal socket (not a TLS-wrapped plaintext view).
+pub const TLS_FLAG_PLAIN: u32 = 2;
 
 struct TlsSlot {
     conn: ClientConnection,
@@ -84,7 +89,12 @@ fn has_pending_in(gfd: i32) -> bool {
     with_slots(|m| m.get(&gfd).is_some_and(|s| !s.pending_in.is_empty()))
 }
 
-/// TCP + rustls handshake; install guest FD (plaintext `read`/`write`).
+/// TCP connect (+ optional rustls handshake); install guest FD.
+///
+/// - Default / `TLS_FLAG_VERIFY`: TCP + rustls; guest `read`/`write` are
+///   **plaintext** (TLS-wrapped host socket).
+/// - `TLS_FLAG_PLAIN`: raw TCP only (for freestanding `http://`); no rustls
+///   slot — guest sees wire bytes directly.
 ///
 /// On success returns guest FD. Host socket is non-blocking; guest flag starts
 /// **blocking** so freestanding HTTP can `read` without a poll loop.
@@ -101,18 +111,18 @@ pub fn connect(
         return Err("invalid port".into());
     }
 
+    if flags & TLS_FLAG_PLAIN != 0 {
+        return connect_plain(hostname, port);
+    }
+
     let config = build_config((flags & TLS_FLAG_VERIFY) != 0, ca_pem)?;
     let server_name =
         ServerName::try_from(hostname.to_owned()).map_err(|e| format!("server name: {e}"))?;
     let mut conn = ClientConnection::new(Arc::new(config), server_name)
         .map_err(|e| format!("tls client: {e}"))?;
 
-    let addr = format!("{hostname}:{port}");
-    let mut sock = TcpStream::connect(&addr).map_err(|e| format!("tcp connect {addr}: {e}"))?;
-    sock.set_read_timeout(Some(Duration::from_secs(600)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    sock.set_write_timeout(Some(Duration::from_secs(600)))
-        .map_err(|e| format!("set write timeout: {e}"))?;
+    let mut sock = tcp_connect_stream(hostname, port)?;
+    // Handshake needs blocking I/O.
     sock.set_nonblocking(false)
         .map_err(|e| format!("set blocking: {e}"))?;
     while conn.is_handshaking() {
@@ -123,6 +133,62 @@ pub fn connect(
 
     sock.set_nonblocking(true)
         .map_err(|e| format!("set nonblocking: {e}"))?;
+    apply_socket_opts(&sock);
+
+    let host_fd = sock.into_raw_fd();
+    let Some(gfd) = crate::process::fd_alloc(host_fd) else {
+        let _ = unsafe { libc::close(host_fd) };
+        return Err("guest fd table full".into());
+    };
+    crate::process::fd_set_guest_nonblock(gfd, false);
+    crate::process::fd_set_tls(gfd, true);
+
+    with_slots(|m| {
+        m.insert(
+            gfd,
+            TlsSlot {
+                conn,
+                pending_out: Vec::new(),
+                pending_in: Vec::new(),
+            },
+        );
+    });
+
+    tracing::debug!(%hostname, port, gfd, host_fd, "tls_fd connect ok");
+    Ok(gfd)
+}
+
+/// Plain TCP → guest FD (no TLS slot). Used for freestanding `http://`.
+fn connect_plain(hostname: &str, port: u16) -> Result<i32, String> {
+    let sock = tcp_connect_stream(hostname, port)?;
+    sock.set_nonblocking(true)
+        .map_err(|e| format!("set nonblocking: {e}"))?;
+    apply_socket_opts(&sock);
+
+    let host_fd = sock.into_raw_fd();
+    let Some(gfd) = crate::process::fd_alloc(host_fd) else {
+        let _ = unsafe { libc::close(host_fd) };
+        return Err("guest fd table full".into());
+    };
+    crate::process::fd_set_guest_nonblock(gfd, false);
+    // Explicit: not a TLS FD (default is false; keep clear for clarity).
+    crate::process::fd_set_tls(gfd, false);
+
+    tracing::debug!(%hostname, port, gfd, host_fd, "tcp plain connect ok");
+    Ok(gfd)
+}
+
+fn tcp_connect_stream(hostname: &str, port: u16) -> Result<TcpStream, String> {
+    let addr = format!("{hostname}:{port}");
+    let sock = TcpStream::connect(&addr).map_err(|e| format!("tcp connect {addr}: {e}"))?;
+    sock.set_read_timeout(Some(Duration::from_secs(600)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    sock.set_write_timeout(Some(Duration::from_secs(600)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    Ok(sock)
+}
+
+fn apply_socket_opts(sock: &TcpStream) {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -174,28 +240,6 @@ pub fn connect(
             )
         };
     }
-
-    let host_fd = sock.into_raw_fd();
-    let Some(gfd) = crate::process::fd_alloc(host_fd) else {
-        let _ = unsafe { libc::close(host_fd) };
-        return Err("guest fd table full".into());
-    };
-    crate::process::fd_set_guest_nonblock(gfd, false);
-    crate::process::fd_set_tls(gfd, true);
-
-    with_slots(|m| {
-        m.insert(
-            gfd,
-            TlsSlot {
-                conn,
-                pending_out: Vec::new(),
-                pending_in: Vec::new(),
-            },
-        );
-    });
-
-    tracing::debug!(%hostname, port, gfd, host_fd, "tls_fd connect ok");
-    Ok(gfd)
 }
 
 /// Plaintext read from a TLS guest FD (emulates blocking when guest NB is clear).
