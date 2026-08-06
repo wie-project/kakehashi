@@ -149,6 +149,11 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     TLS FDs. Verified Docker: `ls-remote`, Hello-World full clone, this repo
     shallow clone, **facebook/folly** full clone (~75 s, 3075 files); default in
     `scripts/docker-git.sh` is now `protocol.version=2` (v1 remains if set).
+16. **`qsort` heapsort** — freestanding `_qsort` was insertion sort O(n²). After
+    `Resolving deltas: 100%`, `index-pack` sorts the object table; wine
+    (~1.37M objects) hung for hours in pure CPU with no `.idx`. Replaced with
+    heapsort O(n log n). Verified: `kh` `index-pack -v` on wine pack → exit 0
+    in ~112 s, 37 MiB `.idx` (native ~135 s).
 
 **Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
 time budget; push; plain `http://` on the socket path. Stage freestanding with

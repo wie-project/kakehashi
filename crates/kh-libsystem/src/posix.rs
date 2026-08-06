@@ -1815,7 +1815,12 @@ pub(crate) unsafe extern "C" fn clock_gettime(clock_id: c_int, tp: *mut c_void) 
     0
 }
 
-/// C `qsort` → nlist `_qsort` (simple insertion sort).
+/// C `qsort` → nlist `_qsort` (**heapsort**, O(n log n) worst case).
+///
+/// Former insertion sort was O(n²): Apple `git index-pack` `qsort`s the full
+/// object table after “Resolving deltas: 100%”. On wine (~1.37M objects) that
+/// became multi‑hour pure-CPU hang (no I/O, no `.idx`). Folly-scale (~1e5)
+/// was merely slow enough to still finish under clone time budgets.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn qsort(
     base: *mut c_void,
@@ -1829,30 +1834,102 @@ pub(crate) unsafe extern "C" fn qsort(
     let Some(cmp) = compar else {
         return;
     };
-    // SAFETY: guest buffer of nel*width; insertion sort.
+    // SAFETY: guest buffer of nel*width; heapsort in place.
     unsafe {
-        let mut idx = 1_usize;
-        while idx < nel {
-            let mut jdx = idx;
-            while jdx > 0 {
-                let cur = base.cast::<u8>().add(jdx.saturating_mul(width));
-                let prev = base
-                    .cast::<u8>()
-                    .add(jdx.saturating_sub(1).saturating_mul(width));
-                if cmp(cur.cast(), prev.cast()) >= 0 {
-                    break;
-                }
-                // swap width bytes
-                let mut off = 0_usize;
-                while off < width {
-                    let tmp = cur.add(off).read();
-                    cur.add(off).write(prev.add(off).read());
-                    prev.add(off).write(tmp);
-                    off = off.saturating_add(1);
-                }
-                jdx = jdx.saturating_sub(1);
+        qsort_heapsort(base.cast::<u8>(), nel, width, cmp);
+    }
+}
+
+/// Swap `width` bytes at `a` and `b` (may overlap only if a == b — no-op).
+unsafe fn qsort_swap(a: *mut u8, b: *mut u8, width: usize) {
+    if a == b {
+        return;
+    }
+    let mut off = 0_usize;
+    while off < width {
+        // SAFETY: caller guarantees a, b point to width bytes in the array.
+        let tmp = unsafe { a.add(off).read() };
+        unsafe {
+            a.add(off).write(b.add(off).read());
+            b.add(off).write(tmp);
+        }
+        off = off.saturating_add(1);
+    }
+}
+
+/// Element pointer for index `i` in array `base` of `width`-byte records.
+#[inline]
+unsafe fn qsort_at(base: *mut u8, width: usize, i: usize) -> *mut u8 {
+    // SAFETY: i < nel checked by caller.
+    unsafe { base.add(i.saturating_mul(width)) }
+}
+
+/// Sift down at `start` within heap of length `end` (exclusive).
+unsafe fn qsort_sift_down(
+    base: *mut u8,
+    width: usize,
+    start: usize,
+    end: usize,
+    cmp: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int,
+) {
+    let mut root = start;
+    loop {
+        let left = root.saturating_mul(2).saturating_add(1);
+        if left >= end {
+            break;
+        }
+        let mut swap = root;
+        // SAFETY: indices < end ≤ nel.
+        let root_p = unsafe { qsort_at(base, width, root) };
+        let left_p = unsafe { qsort_at(base, width, left) };
+        if unsafe { cmp(left_p.cast(), root_p.cast()) } > 0 {
+            swap = left;
+        }
+        let right = left.saturating_add(1);
+        if right < end {
+            let swap_p = unsafe { qsort_at(base, width, swap) };
+            let right_p = unsafe { qsort_at(base, width, right) };
+            if unsafe { cmp(right_p.cast(), swap_p.cast()) } > 0 {
+                swap = right;
             }
-            idx = idx.saturating_add(1);
+        }
+        if swap == root {
+            break;
+        }
+        let a = unsafe { qsort_at(base, width, root) };
+        let b = unsafe { qsort_at(base, width, swap) };
+        unsafe {
+            qsort_swap(a, b, width);
+        }
+        root = swap;
+    }
+}
+
+/// In-place heapsort — no recursion, O(1) extra stack, O(n log n) time.
+unsafe fn qsort_heapsort(
+    base: *mut u8,
+    nel: usize,
+    width: usize,
+    cmp: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int,
+) {
+    // Build max-heap: sift from last parent (nel/2 - 1) down to 0.
+    #[allow(clippy::integer_division)]
+    let mut i = nel / 2;
+    while i > 0 {
+        i = i.saturating_sub(1);
+        unsafe {
+            qsort_sift_down(base, width, i, nel, cmp);
+        }
+    }
+    // Repeatedly move max to end and restore heap.
+    let mut end = nel;
+    while end > 1 {
+        end = end.saturating_sub(1);
+        let a = unsafe { qsort_at(base, width, 0) };
+        let b = unsafe { qsort_at(base, width, end) };
+        unsafe {
+            qsort_swap(a, b, width);
+            qsort_sift_down(base, width, 0, end, cmp);
         }
     }
 }
