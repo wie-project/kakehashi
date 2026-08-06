@@ -15,6 +15,37 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | G2 | Missing surface from probes | **mostly met** (HTTPS helper / freestanding libcurl; polish remains) |
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
 | G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote`, shallow + full small `clone`) |
+| G5 | Remote over SSH (host OpenSSH bridge) | **pass** (Docker local sshd: `ls-remote` + `clone`; see `scripts/docker-git-ssh.sh`) |
+
+### G5 notes (SSH / host OpenSSH bridge)
+
+Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
+(`git@host:path`, `ssh://…`) call `execvp("ssh")`. Product approach:
+
+| Piece | Location |
+| --- | --- |
+| Guest `/usr/bin/ssh` | Bottle symlink → host `/usr/bin/ssh` via `Volumes/linux` ([`layout::ensure_host_ssh_bridge`](../crates/kh-runtime/src/bottle/layout.rs)) |
+| Guest `/bin/sh` | Host shell bridge ([`layout::ensure_host_bin_bridges`](../crates/kh-runtime/src/bottle/layout.rs)) — required for `GIT_SSH_COMMAND` (`sh -c`) |
+| `execve` of host ELF | `reexec_direct` — native Linux OpenSSH (not nested `kh`) |
+| Host env rewrite | `HOME=/Volumes/linux…` → real host `HOME` so `~/.ssh` works |
+| Soft env | `GIT_SSH` / `GIT_SSH_COMMAND` seeded from host (same as other `GIT_*`) |
+| Docker image | `openssh-client` (+ `openssh-server` for local smoke) |
+
+**Not** a freestanding SSH protocol stack (clean-room: host client only).
+
+```text
+# Local full path (sshd + keys inside the container; no GitHub account):
+./scripts/docker-git-ssh.sh
+# → ls-remote + clone over ssh://127.0.0.1:2222/… ; README in .tmp/kh-out/ssh-smoke
+
+# Against GitHub — host OpenSSH needs a **file** key under ~/.ssh (agent-only
+# keys on macOS launchd do not reach Colima). docker-git.sh bind-mounts
+# ~/.ssh → /root/.ssh. Generate + register once if missing:
+#   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+#   # add ~/.ssh/id_ed25519.pub at https://github.com/settings/keys
+./scripts/docker-git.sh clone git@github.com:octocat/Hello-World.git
+# Public repos without a key still fail: Permission denied (publickey).
+```
 
 ### G4 notes (HTTPS / freestanding libcurl)
 
@@ -155,11 +186,20 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     heapsort O(n log n). Verified: `kh` `index-pack -v` on wine pack → exit 0
     in ~112 s, 37 MiB `.idx` (native ~135 s).
 
+17. **SSH host bridge (G5)** — guest `/usr/bin/ssh` → host OpenSSH
+    (`../../Volumes/linux/usr/bin/ssh`); guest `/bin/sh` for `GIT_SSH_COMMAND`;
+    `HOME` bridge rewrite on host-native `execve`; `GIT_SSH` /
+    `GIT_SSH_COMMAND` in soft-env seed. Local Docker smoke:
+    `scripts/docker-git-ssh.sh` (sshd + bare repo + `ls-remote` + `clone`).
+    GitHub needs keys + `known_hosts` (plain `ls-remote git@…` reaches OpenSSH:
+    host-key / publickey errors, not missing `ssh`).
+
 **Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
-time budget; push; plain `http://` on the socket path. Stage freestanding with
-**release** dylib (`cargo build -p kh-libsystem --release --target
-aarch64-apple-darwin` then `./scripts/stage-libsystem.sh`) so `stage-libsystem`
-does not pick a stale release over a newer debug build.
+time budget; push; plain `http://` on the socket path; authenticated GitHub
+SSH under Docker. Stage freestanding with **release** dylib (`cargo build -p
+kh-libsystem --release --target aarch64-apple-darwin` then
+`./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
+release over a newer debug build.
 
 Local G3 remains green. Curl options **tier1** is green after the `fcntl`
 varargs fix.

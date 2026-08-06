@@ -290,6 +290,8 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_libcxx_symlink(path)?;
     layout::ensure_libcurl_symlink(path)?;
     layout::ensure_dev_nodes(path)?;
+    layout::ensure_host_ssh_bridge(path)?;
+    layout::ensure_host_bin_bridges(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {

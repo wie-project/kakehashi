@@ -12,6 +12,8 @@ RUN apt-get update \
         libarchive-tools \
         cpio \
         gzip \
+        openssh-client \
+        openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add clippy rustfmt

@@ -171,12 +171,26 @@ fn is_macho(path: &Path) -> bool {
     )
 }
 
-fn inject_kh_env(envp: &[String]) -> Vec<CString> {
+/// Whether the post-`execve` image is still a guest under `kh` or a host binary.
+#[derive(Clone, Copy)]
+enum ExecEnvKind {
+    /// Nested `kh run` (Mach-O helper): keep guest `/Volumes/linux…` paths.
+    NestedKh,
+    /// Host ELF / host shell script: rewrite bridge paths so OpenSSH etc. see
+    /// real host `HOME` (`~/.ssh`, `~/.gitconfig` layout on the host FS).
+    HostNative,
+}
+
+fn inject_kh_env(envp: &[String], kind: ExecEnvKind) -> Vec<CString> {
     let mut out: Vec<CString> = Vec::with_capacity(envp.len().saturating_add(8));
     let mut have_data = false;
     let mut have_config = false;
     let mut have_root = false;
     for e in envp {
+        let e = match kind {
+            ExecEnvKind::NestedKh => e.clone(),
+            ExecEnvKind::HostNative => rewrite_guest_bridge_env(e),
+        };
         if e.starts_with("KAKEHASHI_DATA_DIR=") {
             have_data = true;
         }
@@ -240,6 +254,30 @@ fn inject_kh_env(envp: &[String]) -> Vec<CString> {
     out
 }
 
+/// Map a single `KEY=value` entry: if `value` is a guest host-bridge path
+/// (`/Volumes/linux…`), rewrite to the real host absolute path.
+///
+/// Only whole-value rewrites (not embedded substrings) so we never mangle
+/// odd config strings. Used for host-native `execve` (OpenSSH, host shells).
+fn rewrite_guest_bridge_env(entry: &str) -> String {
+    let Some((key, val)) = entry.split_once('=') else {
+        return entry.to_owned();
+    };
+    match guest_bridge_value_to_host(val) {
+        Some(host) => format!("{key}={host}"),
+        None => entry.to_owned(),
+    }
+}
+
+fn guest_bridge_value_to_host(val: &str) -> Option<String> {
+    const VOL: &str = "/Volumes/linux";
+    if val == VOL {
+        return Some("/".to_owned());
+    }
+    val.strip_prefix("/Volumes/linux/")
+        .map(|rest| format!("/{rest}"))
+}
+
 fn env_ptrs(env: &[CString]) -> Vec<*const libc::c_char> {
     let mut v: Vec<*const libc::c_char> = env.iter().map(|c| c.as_ptr()).collect();
     v.push(core::ptr::null());
@@ -270,7 +308,7 @@ fn reexec_kh_macho(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
 
-    let env_c = inject_kh_env(envp);
+    let env_c = inject_kh_env(envp, ExecEnvKind::NestedKh);
     let env_ptrs = env_ptrs(&env_c);
 
     let Some(path0) = args_c.first() else {
@@ -290,7 +328,10 @@ fn try_exec_script(host_path: &Path, argv: &[String], envp: &[String]) -> Option
     if bytes.first().copied() != Some(b'#') || bytes.get(1).copied() != Some(b'!') {
         return None; // not a script
     }
-    let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
     let line = bytes.get(2..line_end)?;
     let line = std::str::from_utf8(line).ok()?.trim();
     if line.is_empty() {
@@ -323,7 +364,8 @@ fn try_exec_script(host_path: &Path, argv: &[String], envp: &[String]) -> Option
     }
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
-    let env_c = inject_kh_env(envp);
+    // Host shell + host script path (or nested Mach-O handled below).
+    let env_c = inject_kh_env(envp, ExecEnvKind::HostNative);
     let env_ptrs = env_ptrs(&env_c);
 
     // If interpreter is itself Mach-O in the bottle, re-exec via kh.
@@ -367,7 +409,8 @@ fn reexec_direct(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
     }
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
-    let env_c = inject_kh_env(envp);
+    // Host OpenSSH / other native ELFs: real host HOME for keys and config.
+    let env_c = inject_kh_env(envp, ExecEnvKind::HostNative);
     let env_ptrs = env_ptrs(&env_c);
     unsafe { host::execve_host(path_c.as_c_str(), &argv_ptrs, &env_ptrs) }
 }
@@ -378,7 +421,10 @@ pub(crate) fn handle_setsid() -> SyscallResult {
     // SAFETY: well-defined; may fail if already session leader.
     let rc = unsafe { libc::setsid() };
     if rc < 0 {
-        SyscallResult::err(name, host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)))
+        SyscallResult::err(
+            name,
+            host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)),
+        )
     } else {
         SyscallResult::ok(name, u64::try_from(rc).unwrap_or(0))
     }
@@ -392,7 +438,10 @@ pub(crate) fn handle_setpgid(args: SyscallArgs) -> SyscallResult {
     // SAFETY: host setpgid.
     let rc = unsafe { libc::setpgid(pid, pgid) };
     if rc < 0 {
-        SyscallResult::err(name, host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)))
+        SyscallResult::err(
+            name,
+            host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)),
+        )
     } else {
         SyscallResult::ok(name, 0)
     }
@@ -404,7 +453,10 @@ pub(crate) fn handle_getpgrp() -> SyscallResult {
     // SAFETY: host getpgrp.
     let rc = unsafe { libc::getpgrp() };
     if rc < 0 {
-        SyscallResult::err(name, host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)))
+        SyscallResult::err(
+            name,
+            host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)),
+        )
     } else {
         SyscallResult::ok(name, u64::try_from(rc).unwrap_or(0))
     }
@@ -418,7 +470,10 @@ pub(crate) fn handle_kill(args: SyscallArgs) -> SyscallResult {
     // SAFETY: host kill; guest signals are best-effort.
     let rc = unsafe { libc::kill(pid, sig) };
     if rc < 0 {
-        SyscallResult::err(name, host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)))
+        SyscallResult::err(
+            name,
+            host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)),
+        )
     } else {
         SyscallResult::ok(name, 0)
     }
@@ -468,4 +523,40 @@ pub(crate) fn handle_getppid() -> SyscallResult {
 /// `issetugid` — always 0 (not setuid in the translator).
 pub(crate) fn handle_issetugid() -> SyscallResult {
     SyscallResult::ok("issetugid", 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod bridge_env_tests {
+    use super::{guest_bridge_value_to_host, rewrite_guest_bridge_env};
+
+    #[test]
+    fn rewrites_home_under_volumes_linux() {
+        assert_eq!(
+            rewrite_guest_bridge_env("HOME=/Volumes/linux/root"),
+            "HOME=/root"
+        );
+        assert_eq!(
+            rewrite_guest_bridge_env("HOME=/Volumes/linux/Users/me"),
+            "HOME=/Users/me"
+        );
+        assert_eq!(
+            guest_bridge_value_to_host("/Volumes/linux"),
+            Some("/".into())
+        );
+    }
+
+    #[test]
+    fn leaves_guest_only_and_host_paths() {
+        assert_eq!(
+            rewrite_guest_bridge_env("PATH=/usr/bin:/bin"),
+            "PATH=/usr/bin:/bin"
+        );
+        assert_eq!(rewrite_guest_bridge_env("HOME=/var/root"), "HOME=/var/root");
+        // Embedded bridge substring must not be rewritten.
+        assert_eq!(
+            rewrite_guest_bridge_env("NOTE=see /Volumes/linux/tmp later"),
+            "NOTE=see /Volumes/linux/tmp later"
+        );
+    }
 }

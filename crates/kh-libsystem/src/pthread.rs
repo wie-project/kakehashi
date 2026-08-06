@@ -162,6 +162,7 @@ fn trampoline_va() -> u64 {
     // Function-item → code address for `bsdthread_register`.
     // rustc requires `fn-item as *const () as usize` (no freestanding alternative).
     #[allow(
+        unknown_lints,
         clippy::as_conversions,
         clippy::fn_to_numeric_cast_with_truncation,
         function_casts_as_integer

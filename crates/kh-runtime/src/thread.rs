@@ -323,7 +323,7 @@ mod linux {
         }
     }
 
-    #[allow(clippy::as_conversions, function_casts_as_integer)]
+    #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
     fn host_thread_exit_pc() -> u64 {
         u64::try_from(host_thread_exit as usize).unwrap_or(0)
     }

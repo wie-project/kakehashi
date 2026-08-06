@@ -197,7 +197,7 @@ fn clear_icache(ptr: *mut u8, len: usize) {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-#[allow(clippy::as_conversions, function_casts_as_integer)]
+#[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
 fn trampoline_rust_entry_addr() -> u64 {
     u64::try_from(kh_trampoline_dispatch as usize).unwrap_or(0)
 }
@@ -463,7 +463,7 @@ unsafe extern "C" {
 #[must_use]
 pub fn hypercall_entry_addr() -> u64 {
     ensure_neon_tramp();
-    #[allow(clippy::as_conversions, function_casts_as_integer)]
+    #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
     {
         u64::try_from(kh_hypercall_entry as usize).unwrap_or(0)
     }
@@ -599,7 +599,7 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_flags = libc::SA_SIGINFO;
-            #[allow(clippy::as_conversions, function_casts_as_integer)]
+            #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
             {
                 sa.sa_sigaction = trap_sigaction as *const () as usize;
             }
@@ -612,7 +612,7 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
             // Guest faults: print PC/addr so `kh run` diagnoses unbound GOT / bad heap.
             let mut fault: libc::sigaction = std::mem::zeroed();
             fault.sa_flags = libc::SA_SIGINFO;
-            #[allow(clippy::as_conversions, function_casts_as_integer)]
+            #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
             {
                 fault.sa_sigaction = guest_fault_sigaction as *const () as usize;
             }

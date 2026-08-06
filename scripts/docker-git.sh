@@ -11,6 +11,11 @@
 #   ./scripts/docker-git.sh status
 #   ./scripts/docker-git.sh clone https://github.com/torvalds/linux.git
 #     → writes to guest /Volumes/linux/out/linux  ↔  host <repo>/.tmp/kh-out/linux
+#   ./scripts/docker-git.sh ls-remote git@github.com:octocat/Hello-World.git
+#     → needs host OpenSSH in the image (`openssh-client`); bottle bridges
+#       guest /usr/bin/ssh → host. GitHub needs a registered key under
+#       ~/.ssh (mounted into the container as /root/.ssh). Full local SSH
+#       clone without GitHub keys: ./scripts/docker-git-ssh.sh
 #
 # Env:
 #   KAKEHASHI_XCODE_TOOLS_VERSION  pin catalog title substring (e.g. 26.6)
@@ -21,6 +26,8 @@
 #                                  set empty for an unoptimized kh: KH_EXTRA_CARGO_ARGS=
 #   KH_OUT                         durable guest /out (default: <repo>/.tmp/kh-out)
 #   KH_CLONE_IN_SRC=1              do not rewrite bare `clone <url>` into /out
+#   GIT_SSH_COMMAND                passed through to the guest (host OpenSSH flags)
+#   KH_NO_SSH_MOUNT=1              do not bind-mount host ~/.ssh → /root/.ssh
 
 set -euo pipefail
 
@@ -42,11 +49,13 @@ GUEST_ARGS=("$@")
 if [[ "${KH_CLONE_IN_SRC:-}" != "1" ]] \
   && [[ ${#GUEST_ARGS[@]} -eq 2 ]] \
   && [[ "${GUEST_ARGS[0]}" == "clone" ]] \
-  && [[ "${GUEST_ARGS[1]}" == https://* || "${GUEST_ARGS[1]}" == http://* || "${GUEST_ARGS[1]}" == git@* ]]; then
+  && [[ "${GUEST_ARGS[1]}" == https://* || "${GUEST_ARGS[1]}" == http://* \
+        || "${GUEST_ARGS[1]}" == git@* || "${GUEST_ARGS[1]}" == ssh://* ]]; then
   url="${GUEST_ARGS[1]}"
   base="${url%/}"
   base="${base%.git}"
   base="${base##*/}"
+  # ssh://user@host:port/path/repo.git → last path segment
   if [[ -z "$base" || "$base" == "*" ]]; then
     base="repo"
   fi
@@ -80,8 +89,17 @@ DOCKER_VOLS=(
 )
 DOCKER_ENVS=()
 
+# Host OpenSSH runs as root inside the container. Mount the developer's
+# `~/.ssh` so `git@github.com:…` can use id_ed25519 / config / known_hosts.
+# (Mac launchd SSH_AUTH_SOCK does not work inside Colima/Linux — use files.)
+if [[ "${KH_NO_SSH_MOUNT:-}" != "1" ]] && [[ -d "${HOME}/.ssh" ]]; then
+  DOCKER_VOLS+=(-v "${HOME}/.ssh:/root/.ssh:ro")
+  echo "==> SSH identities: host ${HOME}/.ssh → container /root/.ssh (ro)"
+fi
+
 for e in KAKEHASHI_XCODE_TOOLS_VERSION KAKEHASHI_FORCE_DOWNLOAD \
-  KAKEHASHI_BOUNDARY_STATS KAKEHASHI_FUTEX_STATS KAKEHASHI_HEAP_STATS; do
+  KAKEHASHI_BOUNDARY_STATS KAKEHASHI_FUTEX_STATS KAKEHASHI_HEAP_STATS \
+  GIT_SSH_COMMAND; do
   if [[ -n "${!e:-}" ]]; then
     DOCKER_ENVS+=(-e "${e}=${!e}")
   fi
@@ -103,6 +121,11 @@ docker run --rm \
   "${IMAGE}" \
   bash -c '
 set -euo pipefail
+if ! command -v ssh >/dev/null 2>&1; then
+  echo "error: host OpenSSH client missing (apt install openssh-client;" >&2
+  echo "       rebuild image: docker build -t kakehashi:dev -f Dockerfile.dev .)" >&2
+  exit 1
+fi
 cargo build -p kakehashi ${KH_EXTRA_CARGO_ARGS:-}
 if [[ "${KH_EXTRA_CARGO_ARGS:-}" == *"--release"* ]]; then
   KH=./target/release/kh

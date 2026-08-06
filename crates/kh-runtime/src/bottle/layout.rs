@@ -129,6 +129,10 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     // work without mknod (containers often lack CAP_MKNOD). Needed by Apple
     // `git` (`/dev/null`) and many other CLI tools.
     ensure_dev_nodes(root)?;
+    // Git SSH remotes: guest `execvp("ssh")` → host OpenSSH (not in CLT).
+    // `GIT_SSH_COMMAND` runs via `sh -c`, so `/bin/sh` must exist too.
+    ensure_host_ssh_bridge(root)?;
+    ensure_host_bin_bridges(root)?;
 
     fs::write(root.join(MARKER_NAME), format!("{MARKER_MAGIC}\n"))?;
     Ok(())
@@ -151,6 +155,86 @@ pub fn ensure_dev_nodes(root: &Path) -> io::Result<()> {
         }
         // From `dev/X` → `../Volumes/linux/dev/X` → host `/dev/X`.
         let target = format!("../{VOLUMES_LINUX}/dev/{name}");
+        std::os::unix::fs::symlink(target, &link_path)?;
+    }
+    Ok(())
+}
+
+/// Guest-relative path for the OpenSSH client bridge (`PATH` includes `/usr/bin`).
+pub const GUEST_SSH_REL: &str = "usr/bin/ssh";
+
+/// Relative symlink target: host `/usr/bin/ssh` via the Linux bridge.
+/// From `usr/bin/ssh` → two levels up to bottle root, then into the bridge.
+const GUEST_SSH_TARGET: &str = "../../Volumes/linux/usr/bin/ssh";
+
+/// Ensure guest `/usr/bin/ssh` → host OpenSSH (`/usr/bin/ssh`).
+///
+/// Apple CLT does not ship OpenSSH (base macOS does). Git SSH remotes
+/// (`git@host:path`, `ssh://…`) `execvp("ssh")`. Bridging to the **host**
+/// client is clean-room product policy: we do not reimplement the SSH protocol
+/// in freestanding libSystem. Nested Mach-O helpers still re-exec via `kh`;
+/// this path is a native host ELF (see `reexec_direct` + host env rewrite).
+///
+/// Idempotent. Does not require host `ssh` to exist at ensure time (broken
+/// symlink → guest `ENOENT` on exec, same as missing binary).
+pub fn ensure_host_ssh_bridge(root: &Path) -> io::Result<()> {
+    let link_path = root.join(GUEST_SSH_REL);
+    if let Ok(meta) = link_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&link_path)?;
+            if target == Path::new(GUEST_SSH_TARGET) {
+                return Ok(());
+            }
+            // Wrong target: replace so bottle ensure always lands the bridge.
+            fs::remove_file(&link_path)?;
+        } else {
+            // Real file (e.g. user-dropped binary) — leave alone.
+            return Ok(());
+        }
+    }
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(GUEST_SSH_TARGET, &link_path)
+}
+
+/// Returns `true` if the bottle has the host OpenSSH bridge symlink.
+#[must_use]
+pub fn has_host_ssh_bridge(root: &Path) -> bool {
+    let link_path = root.join(GUEST_SSH_REL);
+    match fs::read_link(&link_path) {
+        Ok(target) => target == Path::new(GUEST_SSH_TARGET),
+        Err(_) => false,
+    }
+}
+
+/// Host ELF bridges under guest `/bin` (shell for `GIT_SSH_COMMAND`, etc.).
+const HOST_BIN_BRIDGES: &[(&str, &str)] = &[
+    // `git` runs `GIT_SSH_COMMAND` as `sh -c '…' "$@"` — needs a real shell.
+    ("bin/sh", "../Volumes/linux/bin/sh"),
+    ("bin/bash", "../Volumes/linux/bin/bash"),
+];
+
+/// Ensure guest `/bin/sh` (and friends) → host shells via the Linux bridge.
+///
+/// Idempotent. Skips paths that already exist as non-symlink files.
+pub fn ensure_host_bin_bridges(root: &Path) -> io::Result<()> {
+    for &(rel, target) in HOST_BIN_BRIDGES {
+        let link_path = root.join(rel);
+        if let Ok(meta) = link_path.symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                let cur = fs::read_link(&link_path)?;
+                if cur == Path::new(target) {
+                    continue;
+                }
+                fs::remove_file(&link_path)?;
+            } else {
+                continue;
+            }
+        }
+        if let Some(parent) = link_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         std::os::unix::fs::symlink(target, &link_path)?;
     }
     Ok(())
@@ -283,10 +367,15 @@ mod tests {
         assert!(root.join(VOLUMES_LINUX).is_symlink());
         assert!(has_libcxx_symlink(&root));
         assert!(has_libcurl_symlink(&root));
+        assert!(has_host_ssh_bridge(&root));
         let cxx = fs::read_link(root.join(GUEST_LIBCXX_REL)).expect("libcxx readlink");
         assert_eq!(cxx, Path::new(GUEST_LIBCXX_TARGET));
         let curl = fs::read_link(root.join(GUEST_LIBCURL_REL)).expect("libcurl readlink");
         assert_eq!(curl, Path::new(GUEST_LIBCURL_TARGET));
+        let ssh = fs::read_link(root.join(GUEST_SSH_REL)).expect("ssh readlink");
+        assert_eq!(ssh, Path::new(GUEST_SSH_TARGET));
+        let sh = fs::read_link(root.join("bin/sh")).expect("bin/sh readlink");
+        assert_eq!(sh, Path::new("../Volumes/linux/bin/sh"));
 
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));
@@ -300,6 +389,8 @@ mod tests {
         // Idempotent ensure after materialize.
         ensure_libcxx_symlink(&root).expect("ensure again");
         ensure_dev_nodes(&root).expect("dev nodes again");
+        ensure_host_ssh_bridge(&root).expect("ssh bridge again");
+        ensure_host_bin_bridges(&root).expect("bin bridges again");
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

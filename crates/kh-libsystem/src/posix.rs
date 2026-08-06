@@ -1497,6 +1497,9 @@ fn soft_env_seed_git_from_host() {
         b"GIT_QUARANTINE_PATH\0",
         b"GIT_DEFAULT_HASH\0",
         b"GIT_SHALLOW_FILE\0",
+        // SSH remotes: host OpenSSH flags / alternate client (G5).
+        b"GIT_SSH\0",
+        b"GIT_SSH_COMMAND\0",
     ];
     let mut val_buf = [0_u8; SOFT_ENV_WIDTH];
     for key in KEYS {
@@ -1512,13 +1515,7 @@ fn soft_env_seed_git_from_host() {
         if n <= 1 {
             continue;
         }
-        let _ = unsafe {
-            soft_env_set(
-                key.as_ptr().cast(),
-                val_buf.as_ptr().cast(),
-                1,
-            )
-        };
+        let _ = unsafe { soft_env_set(key.as_ptr().cast(), val_buf.as_ptr().cast(), 1) };
     }
 }
 
