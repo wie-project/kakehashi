@@ -95,9 +95,17 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
 
 fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
     if !registry_check_range(path_ptr, 1, false) {
+        tracing::warn!(
+            path_ptr = format_args!("0x{path_ptr:x}"),
+            "{name} EFAULT: path ptr not in guest registry (G5 tapi dig)"
+        );
         return SyscallResult::err(name, EFAULT);
     }
     let Some(path) = bottle::read_c_string(path_ptr, 4096) else {
+        tracing::warn!(
+            path_ptr = format_args!("0x{path_ptr:x}"),
+            "{name} EFAULT: read_c_string failed (unterminated or unmapped)"
+        );
         return SyscallResult::err(name, EFAULT);
     };
     open_translated(&path, flags, name)

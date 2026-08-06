@@ -60,18 +60,69 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | `ccsha256_di` was **data** symbol | **fixed** — must be function returning `ccdigest_info*`; `final` @+0x38 |
 | Soft `ccdigest_info` + `strtod`/`modf`/`posix_madvise`/`nothrow` | **landed** for libtapi / UUID |
 | **G4 link + run `g4-mini`** | **pass** (Docker Colima, Mach-O arm64 product, exit 0) |
+| Soft libobjc / `os_unfair_lock` (`objc_surface`) for modern `ld` | **landed** — pool/retain/`msgSend` nil; class data stubs |
+| Soft libc++ iostream ZTV/ZTT + `ios_base`/`locale` (`libcxx_iostream`) | **landed** — fixes `ld::Options::parse` stringstream construction; `ld -v` **pass** |
+| Soft `_dyld_image_count` / image name | **landed** |
+| Soft `std::filesystem` path ops (`libcxx_fs`) | **landed** — path component methods return **view `{ptr,len}` in x0/x1** (ld call sites: no sret; `cbz x1`) |
+| Soft `operator new(align)` / `_simple_*` / `vm_allocate` | **landed** — modern ld missing surface |
+| Soft streambuf `xsputn` writes stderr + returns `n` | **landed** — was spin (return 0) / empty `ld: ` errors |
+| **G5 standard link** (default `ld`, no `ld-classic`) | **in progress** — past SEGV/`__ZnwmSt11align_val_t`/`_simple_salloc`/`vm_allocate`; modern `ld` still exits 1 with sparse diagnostics; product path remains `ld-classic` |
+| G4 regression after G5 soft surface | **pass** (Docker: classic link + `g4-mini PASS`) |
+
+### Standard path (modern `ld` + ObjC) — inventory
+
+Default CLT driver uses **`ld`**, which links:
+
+| Load | Role |
+| --- | --- |
+| `@rpath/libtapi` / `libLTO` / `libcodedirectory` / `libswiftDemangle` | Present in CLT `usr/lib` (loaded) |
+| `/usr/lib/libobjc.A.dylib` | **Absent** in bottle → flat bind → freestanding soft |
+| `Foundation` / `CoreFoundation` / `CoreAnalytics` | **Absent** → skip + freestanding soft |
+| `libc++.1` / `libSystem.B` | Aliased → freestanding |
+
+**Static undef of modern `ld` (arm64):** 308 imports. After freestanding
+exports + rpath dylibs, the freestanding-relevant holes that matter for G5
+are roughly:
+
+| Bucket | ~count | Notes |
+| --- | ---: | --- |
+| ObjC runtime | 9 | pool / retain / `msgSend` / opts — **soft landed** |
+| `OBJC_CLASS_$_NS*` | 6 | class data stubs — **soft landed** |
+| `os_unfair_lock*` / os_log / signpost | ~8 | lock soft landed; log/signpost soft |
+| libc++ iostream / filesystem | ~40 | still missing (ifstream, locale, `std::fs`) |
+| LTO / thinLTO / libcd | many | resolve via `@rpath` dylibs when those load |
+| tapi C++ API | many | via `libtapi` when loaded |
+| other C (`vm_*`, `getrusage`, `uuid_*`, …) | ~20+ | on demand |
+
+**BSD syscalls (kh-runtime table):**
+
+| Metric | Value |
+| --- | ---: |
+| Logical `BsdSyscall` variants (all have dispatch arms) | **77** |
+| Unique Darwin numbers in lookup (aliases / nocancel) | **95** |
+| Host helpers `KH_HELPER_*` | **19** |
+| XNU `syscalls.master` scale (approx primary slots) | ~500–550 |
+| Static “not in table” (ENOSYS if called) | **~400+** numbers |
+
+**Observed on G5 Docker probe (`KAKEHASHI_BOUNDARY_STATS=1`):** **0 unknown
+BSD syscalls**. Top buckets were known (`kh_wake`, `sigaction`, `stat`,
+`fork`/`wait4`, …). Failure mode is **guest symbols / soft ObjC layout**, not
+missing `svc` numbers.
 
 ### Next (trace-first)
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| Harder `-cc1` / more libc++ | freestanding | On demand from missing-symbol log |
+| Modern `ld` SEGV after soft objc (pc in `ld` text) | freestanding ObjC/Foundation | Dig selector/`isa` use; grow soft Foundation methods or keep **G4 `ld-classic`** as product path |
+| libc++ iostream / `std::filesystem` for modern `ld` | freestanding | On demand from missing-symbol log |
+| Harder `-cc1` / more libc++ | freestanding | On demand |
 | Full RTTI / exception unwind | freestanding | Soft `dynamic_cast` is hierarchy walk only; real catch still aborts |
 
 Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
 **not** ship Apple libc++; we grow freestanding C++ runtime stubs only as the
-guest path requires.
+guest path requires. Product multi-file link remains **`--ld-path=…/ld-classic`**
+until G5 modern `ld` is green.
 
 ## Method (trace-first)
 

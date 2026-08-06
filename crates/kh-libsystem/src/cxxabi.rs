@@ -91,29 +91,22 @@ pub(crate) unsafe extern "C" fn op_new_nothrow(size: usize, _nt: *const c_void) 
     p
 }
 
-/// `void* operator new(size_t, align_val_t, nothrow_t const&)` →
-/// nlist `__ZnwmSt11align_val_tRKSt9nothrow_t`.
-///
-/// Freestanding heap is already well-aligned for typical `align_val_t`; we
-/// over-allocate when `align > 16` and return an aligned address (original
-/// base is not recovered — aligned `delete` below still calls `free` on the
-/// pointer the guest was given; heap tolerates free of interior pointers only
-/// if we stash the base. Soft path: over-alloc + store base immediately before
-/// the returned pointer.
-#[unsafe(export_name = "_ZnwmSt11align_val_tRKSt9nothrow_t")]
-pub(crate) unsafe extern "C" fn op_new_aligned_nothrow(
-    size: usize,
-    align: usize,
-    _nt: *const c_void,
-) -> *mut c_void {
+/// Shared aligned-new body (throwing and nothrow).
+unsafe fn op_new_aligned_inner(size: usize, align: usize, nothrow: bool) -> *mut c_void {
     let align = align.max(1).next_power_of_two().max(8);
     let size = size.max(1);
     // header (base ptr) + padding + payload
     let total = size.saturating_add(align).saturating_add(8);
     let raw = unsafe { malloc(total) };
     if raw.is_null() {
-        trace::note(b"[kh-libsystem] operator new(align,nothrow) OOM\n");
-        return core::ptr::null_mut();
+        if nothrow {
+            trace::note(b"[kh-libsystem] operator new(align,nothrow) OOM\n");
+            return core::ptr::null_mut();
+        }
+        trace::note(b"[kh-libsystem] operator new(align) OOM\n");
+        unsafe {
+            exit_now(1);
+        }
     }
     let raw_addr = raw.addr();
     let payload = raw_addr
@@ -129,6 +122,40 @@ pub(crate) unsafe extern "C" fn op_new_aligned_nothrow(
         stash.write(raw);
     }
     out
+}
+
+/// `void* operator new(size_t, align_val_t)` → nlist `__ZnwmSt11align_val_t`.
+///
+/// Observed: modern Apple `ld` (clang G5).
+#[unsafe(export_name = "_ZnwmSt11align_val_t")]
+pub(crate) unsafe extern "C" fn op_new_aligned(size: usize, align: usize) -> *mut c_void {
+    trace::note_size(b"operator new(align)", size);
+    unsafe { op_new_aligned_inner(size, align, false) }
+}
+
+/// `void* operator new[](size_t, align_val_t)` → nlist `__ZnamSt11align_val_t`.
+#[unsafe(export_name = "_ZnamSt11align_val_t")]
+pub(crate) unsafe extern "C" fn op_new_array_aligned(size: usize, align: usize) -> *mut c_void {
+    trace::note_size(b"operator new[](align)", size);
+    unsafe { op_new_aligned_inner(size, align, false) }
+}
+
+/// `void* operator new(size_t, align_val_t, nothrow_t const&)` →
+/// nlist `__ZnwmSt11align_val_tRKSt9nothrow_t`.
+///
+/// Freestanding heap is already well-aligned for typical `align_val_t`; we
+/// over-allocate when `align > 16` and return an aligned address (original
+/// base is not recovered — aligned `delete` below still calls `free` on the
+/// pointer the guest was given; heap tolerates free of interior pointers only
+/// if we stash the base. Soft path: over-alloc + store base immediately before
+/// the returned pointer.
+#[unsafe(export_name = "_ZnwmSt11align_val_tRKSt9nothrow_t")]
+pub(crate) unsafe extern "C" fn op_new_aligned_nothrow(
+    size: usize,
+    align: usize,
+    _nt: *const c_void,
+) -> *mut c_void {
+    unsafe { op_new_aligned_inner(size, align, true) }
 }
 
 /// `std::set_new_handler` → nlist `__ZSt15set_new_handlerPFvvE` (returns old).

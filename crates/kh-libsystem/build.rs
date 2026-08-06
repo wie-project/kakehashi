@@ -64,6 +64,9 @@ fn main() {
         "___snprintf_chk",
         "___vsnprintf_chk",
         "___assert_rtn",
+        // modern `ld` mach_o::Error message path (printf_fmt.c).
+        // C identifier is `_simple_vsprintf` → Darwin Mach-O `__simple_vsprintf`.
+        "__simple_vsprintf",
         "_curl_easy_setopt",
         "_curl_easy_getinfo",
         "_fcntl",

@@ -83,6 +83,14 @@ fn trunc_i64_to_c_int(v: i64) -> c_int {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int {
     if path.is_null() {
+        // G5 dig: tapi/modern ld EFAULT often means open(NULL) via bad string.c_str().
+        crate::trace::force_note(b"[kh-libsystem] open(NULL) -> EFAULT\n");
+        errno::set_errno(14);
+        return -1;
+    }
+    // Also reject PAGEZERO / unrebased path pointers (same class of bug).
+    if path.addr() < crate::stdio::PAGEZERO_END {
+        crate::trace::force_note(b"[kh-libsystem] open(PAGEZERO ptr) -> EFAULT\n");
         errno::set_errno(14);
         return -1;
     }
@@ -94,6 +102,10 @@ pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_
             u64::from(mode.cast_unsigned()),
         )
     };
+    if ret == -14 {
+        // Runtime: path not readable as C string (unterminated / unmapped). G5 tapi dig.
+        crate::trace::force_note(b"[kh-libsystem] open syscall EFAULT (bad path bytes)\n");
+    }
     ret_c_int(ret)
 }
 
@@ -2179,7 +2191,8 @@ pub(crate) unsafe extern "C" fn mach_absolute_time() -> u64 {
     }
     let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
     let usec = u64::from(u32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]));
-    sec.saturating_mul(1_000_000_000).saturating_add(usec.saturating_mul(1_000))
+    sec.saturating_mul(1_000_000_000)
+        .saturating_add(usec.saturating_mul(1_000))
 }
 
 /// Darwin `mach_timebase_info` → nlist `_mach_timebase_info`.
@@ -2461,6 +2474,103 @@ pub(crate) unsafe extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mlock(_addr: *const c_void, _len: usize) -> c_int {
     0
+}
+
+// ── Mach VM soft (modern Apple `ld`) ────────────────────────────────────────
+//
+// Observed: modern ld imports `vm_allocate` / `mach_task_self_`. Map to
+// anonymous `mmap` / `munmap`. KERN_SUCCESS = 0.
+
+const KERN_SUCCESS: c_int = 0;
+const KERN_INVALID_ARGUMENT: c_int = 4;
+const KERN_NO_SPACE: c_int = 3;
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_PRIVATE: c_int = 0x0002;
+const MAP_ANON: c_int = 0x1000;
+
+/// `mach_task_self_` data → soft task port token.
+#[unsafe(export_name = "mach_task_self_")]
+#[used]
+static mut MACH_TASK_SELF: usize = 1;
+
+/// `mach_task_self()` → same soft token.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mach_task_self() -> usize {
+    1
+}
+
+/// `vm_page_mask` data → page_size-1 (page size also in `ld_surface::vm_page_size`).
+#[unsafe(export_name = "vm_page_mask")]
+#[used]
+static mut VM_PAGE_MASK: usize = 0x3fff; // 16 KiB page mask (matches ld_surface)
+
+/// `vm_allocate(task, *addr, size, flags)` → anonymous RW map.
+///
+/// `flags` bit0 = anywhere (1) vs fixed (0). Soft: always anywhere via mmap.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn vm_allocate(
+    _task: usize,
+    addr: *mut *mut c_void,
+    size: usize,
+    _flags: c_int,
+) -> c_int {
+    if addr.is_null() || size == 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let p = unsafe {
+        mmap(
+            core::ptr::null_mut(),
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p.addr() == usize::MAX {
+        return KERN_NO_SPACE;
+    }
+    unsafe {
+        addr.write(p);
+    }
+    KERN_SUCCESS
+}
+
+/// `vm_deallocate(task, addr, size)`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn vm_deallocate(
+    _task: usize,
+    addr: *mut c_void,
+    size: usize,
+) -> c_int {
+    if addr.is_null() || size == 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let rc = unsafe { munmap(addr, size) };
+    if rc != 0 {
+        KERN_INVALID_ARGUMENT
+    } else {
+        KERN_SUCCESS
+    }
+}
+
+/// `vm_remap` — soft: allocate fresh anonymous region (no real remap).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn vm_remap(
+    _target_task: usize,
+    target_address: *mut *mut c_void,
+    size: usize,
+    _mask: usize,
+    _flags: c_int,
+    _src_task: usize,
+    _src_address: *mut c_void,
+    _copy: c_int,
+    _cur_protection: *mut c_int,
+    _max_protection: *mut c_int,
+    _inheritance: c_int,
+) -> c_int {
+    unsafe { vm_allocate(1, target_address, size, 1) }
 }
 
 // ── PRNG ────────────────────────────────────────────────────────────────────

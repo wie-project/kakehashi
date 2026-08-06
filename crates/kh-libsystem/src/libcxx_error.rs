@@ -3,6 +3,16 @@
 //! Soft stubs so C++ guests (clang / LLVM) can resolve `system_category()` and
 //! friends. Not a full `<system_error>` implementation.
 
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_ptr_alignment,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::ptr_as_ptr
+)]
+
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -66,13 +76,32 @@ unsafe extern "C" fn cat_equivalent_code_int(
     0
 }
 
-/// `message(int)` — write empty `basic_string` into `out` (sret-style).
-unsafe extern "C" fn cat_message(_this: *mut c_void, _ev: c_int, out: *mut c_void) {
-    if !out.is_null() {
-        unsafe {
-            core::ptr::write_bytes(out.cast::<u8>(), 0, 24);
-        }
+/// Soft `message(int)` — short static text into freestanding `basic_string` `out`.
+///
+/// Apple `libtapi` surfaces `error_code::message()` in `tapi error: %s in '…'`.
+/// Empty soft strings left modern `ld` diagnostics blank after the colon.
+unsafe extern "C" fn cat_message(_this: *mut c_void, ev: c_int, out: *mut c_void) {
+    if out.is_null() {
+        return;
     }
+    // Keep messages static (no heap digit loops) — enough to identify errno-ish codes.
+    let s: &[u8] = match ev {
+        0 => b"success",
+        1 => b"EPERM",
+        2 => b"ENOENT",
+        5 => b"EIO",
+        9 => b"EBADF",
+        12 => b"ENOMEM",
+        13 => b"EACCES",
+        14 => b"EFAULT",
+        17 => b"EEXIST",
+        20 => b"ENOTDIR",
+        21 => b"EISDIR",
+        22 => b"EINVAL",
+        28 => b"ENOSPC",
+        _ => b"system_error",
+    };
+    crate::libcxx_string::string_assign_bytes(out, s.as_ptr(), s.len());
 }
 
 #[repr(C)]
@@ -219,11 +248,33 @@ pub(crate) unsafe extern "C" fn error_category_dtor(_this: *mut c_void) {}
 #[unsafe(export_name = "_ZNSt3__114error_categoryD2Ev")]
 pub(crate) unsafe extern "C" fn error_category_dtor_base(_this: *mut c_void) {}
 
-/// `error_code::message() const` — empty `basic_string` by value (AArch64 sret).
+/// `error_code::message() const` — soft string from `value` (AArch64 sret).
 ///
-/// Observed: Apple `libtapi` (G4). Returning an uninitialized rep used to leave
-/// garbage strings after error paths.
+/// Layout (Apple arm64 libc++): `{ int32 value; int32 pad; const error_category* cat }`.
+/// Observed: `libtapi` → modern `ld` `tapi error: %s in '…'` (G5).
 #[unsafe(export_name = "_ZNKSt3__110error_code7messageEv")]
-pub(crate) unsafe extern "C" fn error_code_message(_this: *const c_void) -> StringRep {
-    StringRep::empty()
+pub(crate) unsafe extern "C" fn error_code_message(this: *const c_void) -> StringRep {
+    let mut out = StringRep::empty();
+    if this.is_null() {
+        return out;
+    }
+    let ev = unsafe { this.cast::<c_int>().read() };
+    let out_p = core::ptr::from_mut(&mut out).cast::<c_void>();
+    // arm64 layout: value@0, pad@4, cat@8.
+    let cat = unsafe { this.cast::<u8>().add(8).cast::<*mut c_void>().read() };
+    if !cat.is_null() {
+        // Soft FnTable: slot 6 = message(int) writing into out pointer.
+        let vptr = unsafe { cat.cast::<*const MessageFn>().read() };
+        if !vptr.is_null() {
+            let msg_fn = unsafe { vptr.add(6).read() };
+            unsafe {
+                msg_fn(cat, ev, out_p);
+            }
+            return out;
+        }
+    }
+    unsafe {
+        cat_message(core::ptr::null_mut(), ev, out_p);
+    }
+    out
 }

@@ -263,6 +263,39 @@ int __vsnprintf_chk(char *dst, size_t cap, int flag, size_t slen,
 
 int vfprintf(void *stream, const char *fmt, va_list ap) {
   char buf[4096];
+  /* G5 dig: recover empty `ld: %s` bodies — dump fmt + first %s peek. */
+  if (fmt && fmt[0] == 'l' && fmt[1] == 'd' && fmt[2] == ':') {
+    va_list ap2;
+    va_copy(ap2, ap);
+    /* Most ld diagnostics: "ld: %s" or "ld: %s\n" — first arg is char*. */
+    const char *s = 0;
+    const char *p = fmt;
+    while (*p && *p != '%')
+      p++;
+    if (p[0] == '%' && p[1] == 's') {
+      s = va_arg(ap2, const char *);
+    }
+    va_end(ap2);
+    write(2, "[kh-fprintf] fmt=", 17);
+    if (fmt) {
+      size_t fl = 0;
+      while (fmt[fl] && fl < 80)
+        fl++;
+      write(2, fmt, fl);
+    }
+    write(2, " s=", 3);
+    if (!s) {
+      write(2, "<null>", 6);
+    } else if (!s[0]) {
+      write(2, "<empty>", 7);
+    } else {
+      size_t sl = 0;
+      while (s[sl] && sl < 200)
+        sl++;
+      write(2, s, sl);
+    }
+    write(2, "\n", 1);
+  }
   int n = vsnprintf_impl(buf, sizeof(buf), fmt, ap);
   if (n < 0)
     return -1;
@@ -391,4 +424,67 @@ void __assert_rtn(const char *func, const char *file, int line,
   /* exit via guest _exit if linked; else spin */
   extern void _exit(int) __attribute__((noreturn));
   _exit(134);
+}
+
+/* ── Apple `_simple_vsprintf` (modern ld mach_o::Error) ─────────────────────
+ *
+ * Soft handle layout (must match extra_stubs.rs):
+ *   struct { char *buf; size_t cap; size_t len; }  — 3× pointer-sized words.
+ *
+ * `_simple_salloc` / `_simple_string` / `_simple_sfree` live in Rust; this C
+ * body formats with the same `vsnprintf_impl` used by fprintf so `va_list`
+ * ABI matches Apple arm64 (Error C1 passes a stack va_list into here).
+ */
+int _simple_vsprintf(void *h, const char *fmt, va_list ap) {
+  if (!h || !fmt)
+    return -1;
+  char stack[4096];
+  int n = vsnprintf_impl(stack, sizeof(stack), fmt, ap);
+  if (n < 0)
+    return -1;
+  size_t add = (size_t)n;
+  if (add >= sizeof(stack))
+    add = sizeof(stack) - 1;
+
+  size_t *words = (size_t *)h;
+  char *buf = (char *)words[0];
+  size_t cap = words[1];
+  size_t len = words[2];
+  size_t need = len + add + 1;
+  if (need > cap) {
+    size_t ncap = cap < 64 ? 64 : cap;
+    while (ncap < need) {
+      size_t next = ncap * 2;
+      if (next < ncap) {
+        ncap = need;
+        break;
+      }
+      ncap = next;
+    }
+    char *nbuf = (char *)malloc(ncap);
+    if (!nbuf)
+      return -1;
+    if (buf && len > 0) {
+      size_t i;
+      for (i = 0; i < len; i++)
+        nbuf[i] = buf[i];
+    }
+    if (buf)
+      free(buf);
+    buf = nbuf;
+    cap = ncap;
+    words[0] = (size_t)buf;
+    words[1] = cap;
+  }
+  if (!buf)
+    return -1;
+  {
+    size_t i;
+    for (i = 0; i < add; i++)
+      buf[len + i] = stack[i];
+  }
+  len += add;
+  buf[len] = 0;
+  words[2] = len;
+  return n;
 }

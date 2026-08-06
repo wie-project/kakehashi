@@ -495,6 +495,8 @@ unsafe fn take_from_free(h: *mut Hdr, take: usize) -> *mut c_void {
 /// C `malloc` → nlist `_malloc`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+    // Soft iostream ZTT/ZTV absolute pointers (modern ld stringstream).
+    crate::libcxx_iostream::ensure_iostream_vtables();
     // Resolve mode early so first-alloc digs count fully.
     let _ = stats_mode();
     if stats_on_fast() {

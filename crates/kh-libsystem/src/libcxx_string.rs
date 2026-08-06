@@ -162,6 +162,49 @@ fn assign_bytes(this: *mut c_void, s: *const u8, len: usize) {
     }
 }
 
+/// Length of a freestanding `basic_string` (for `std::filesystem::path`).
+pub(crate) fn string_len(this: *const c_void) -> usize {
+    if this.is_null() {
+        0
+    } else {
+        current_len(this)
+    }
+}
+
+/// Data pointer (not necessarily NUL-terminated beyond `string_len`).
+pub(crate) fn string_data(this: *const c_void) -> *const u8 {
+    if this.is_null() {
+        core::ptr::null()
+    } else {
+        current_data(this)
+    }
+}
+
+/// Assign bytes into a freestanding `basic_string`.
+pub(crate) fn string_assign_bytes(this: *mut c_void, s: *const u8, len: usize) {
+    assign_bytes(this, s, len);
+}
+
+/// Copy-construct / assign string contents from another string.
+pub(crate) fn string_copy_from(dst: *mut c_void, src: *const c_void) {
+    if dst.is_null() {
+        return;
+    }
+    if src.is_null() {
+        assign_bytes(dst, core::ptr::null(), 0);
+        return;
+    }
+    assign_bytes(dst, current_data(src), current_len(src));
+}
+
+/// Empty short string into `this`.
+pub(crate) fn string_clear(this: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    dispose(this);
+}
+
 fn cstr_len(s: *const c_char) -> usize {
     if s.is_null() {
         return 0;
