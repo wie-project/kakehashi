@@ -1,5 +1,9 @@
 # Git / Xcode Command Line Tools milestone
 
+**Status: milestone met** (G0–G8). Same class as [curl](curl.md): day-to-day
+Apple CLT `git` under `kh` on Linux aarch64 is usable; remaining work is polish,
+not open gates.
+
 Product goal: run **Apple `git`** (from official Command Line Tools) under `kh`
 on Linux aarch64. Clean-room ABI; trace-first. Clippy + unit tests; Docker
 Colima first.
@@ -12,13 +16,37 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | --- | --- | --- |
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/git` | **pass** (swscan, no Apple ID) |
 | G1 | `kh run git -- --version` banner + exit 0 | **pass** (Docker + UTM: `git version 2.50.1 (Apple Git-155)`) |
-| G2 | Missing surface from probes | **mostly met** (HTTPS helper / freestanding libcurl; polish remains) |
+| G2 | Missing surface from probes | **met** for product paths (HTTPS freestanding libcurl + SSH host bridge) |
 | G3 | Local repo: `init` / `status` / `add` / `commit` | **pass** (Docker + UTM; commit exit 0) |
-| G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote`, shallow + full small `clone`) |
-| G5 | Remote over SSH (host OpenSSH bridge) | **pass** (Docker local sshd: `ls-remote` + `clone`; see `scripts/docker-git-ssh.sh`) |
-| G6 | Push + branches to private remote | **pass** (Docker: private bare `0700` + SSH; branch / `push -u` / FF / merge+push main; see `scripts/docker-git-push.sh`) |
-| G7 | Plain `http://` on socket path (freestanding) | **pass** (Docker smart HTTP: `ls-remote` + `clone` + `push`; see `scripts/docker-git-http.sh`) |
-| G8 | Authenticated GitHub under Docker | **pass** (private repo: SSH force-push + HTTPS Basic userinfo `ls-remote`/`clone`; see `scripts/docker-git-github.sh`) |
+| G4 | Remote over HTTPS (reuse curl network path) | **pass** (Docker: `ls-remote`, shallow + full clones) |
+| G5 | Remote over SSH (host OpenSSH bridge) | **pass** (local sshd + real GitHub/GitLab; see below) |
+| G6 | Push + branches to private remote | **pass** (Docker: private bare `0700` + SSH; see `scripts/docker-git-push.sh`) |
+| G7 | Plain `http://` on socket path (freestanding) | **pass** (Docker smart HTTP; see `scripts/docker-git-http.sh`) |
+| G8 | Authenticated GitHub under Docker | **pass** (private SSH push + HTTPS Basic; see `scripts/docker-git-github.sh`) |
+
+### Verified large / real-world clones
+
+| Guest command (under `kh` / Docker) | Host / remote | Result |
+| --- | --- | --- |
+| Full history `clone` of **Wine** | GitHub and GitLab remotes | **pass** (full history; multi‑M objects / large pack path) |
+| `clone --depth 1` **llvm/llvm-project** | `git@github.com:llvm/llvm-project.git` | **pass** (Docker; SSH) |
+| `clone --depth 1` linux kernel | HTTPS GitHub | **pass** (~279 MiB pack, ~2 GiB tree) |
+| Full `clone` facebook/folly | HTTPS GitHub | **pass** (~97 MiB, ~3k files) |
+| Full `clone` small + mid repos | HTTPS (Hello-World, this repo, …) | **pass** |
+
+Full multi‑GiB monorepos (e.g. complete llvm history) are **not** a release
+blocker: when the network/host rate-limits the pack, abort is external, not an
+ABI gap. Shallow llvm + full Wine already exercise the heavy `index-pack` /
+streaming path.
+
+```text
+# Large shallow monorepo over SSH (host keys + known_hosts)
+./scripts/docker-git.sh clone --depth 1 git@github.com:llvm/llvm-project.git
+
+# Wine full history (HTTPS or SSH; GitHub or GitLab URL)
+# ./scripts/docker-git.sh clone https://github.com/wine-mirror/wine.git
+# ./scripts/docker-git.sh clone https://gitlab.winehq.org/wine/wine.git
+```
 
 ### G5 notes (SSH / host OpenSSH bridge)
 
@@ -79,6 +107,8 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 | `git clone https://…` (full, ~9 MiB pack) | **pass** (Docker; this repo after inflate fix) |
 | `git clone --depth 1` linux kernel | **pass** (Docker; ~279 MiB pack, ~2 GiB tree; path B streaming) |
 | `git clone` facebook/folly (full, v2) | **pass** (Docker; ~97 MiB, ~3k files) |
+| Full **Wine** history (GitHub + GitLab) | **pass** (full clone; large object table / heapsort path) |
+| `git clone --depth 1` llvm-project (SSH) | **pass** (Docker; `git@github.com:llvm/llvm-project.git`) |
 
 ```text
 # capabilities
@@ -221,10 +251,9 @@ No new freestanding network stack: clean-room host client only.
 → `git-receive-pack` on bare; no Darling; no proprietary paste. Surface already
 covered by G3 (spawn/FS) + G5 (SSH bridge).
 
-**Not in G6:** authenticated push to GitHub/GitLab (needs developer keys + token
-policy); HTTPS `git-receive-pack` against public hosts (clone path is green; push
-over HTTPS is the same freestanding curl path — also exercised by G7 over
-`http://`).
+**Related:** authenticated GitHub private push/clone is **G8**. HTTPS
+`git-receive-pack` uses the same freestanding path as clone (also exercised by
+G7 over plain `http://`).
 
 ### G7 notes (plain `http://` socket path)
 
@@ -266,14 +295,22 @@ POSIX/HTTP/1.1 + existing path B; clean-room host TCP; no Darling.
 RFC 7617 / curl man page contracts; no Darling. Optional delete needs
 `delete_repo` (`gh auth refresh -h github.com -s delete_repo` + `KH_DELETE_REPO=1`).
 
-**Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
-time budget. Stage freestanding with **release** dylib (`cargo build -p
-kh-libsystem --release --target aarch64-apple-darwin` then
-`./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
-release over a newer debug build.
+### What remains (git polish, not blockers)
 
-Local G3 remains green. Curl options **tier1** is green after the `fcntl`
-varargs fix.
+| Item | Notes |
+| --- | --- |
+| Full multi‑GiB monorepo soak under wall-clock budget | Wine full history + llvm shallow already green; unlimited full llvm-class clones depend on host/network rate limits |
+| Credential helper noise | Host `credential.helper=osxkeychain` may WARN under Linux bottle (harmless; smoke scripts clear it) |
+| Broader remote helpers | LFS, `git svn`, rare helpers — not product gates |
+
+Stage freestanding with **release** dylib when changing `kh-libsystem`:
+
+```bash
+cargo build -p kh-libsystem --release --target aarch64-apple-darwin
+./scripts/stage-libsystem.sh
+```
+
+(so `stage-libsystem` does not pick a stale release over a newer debug build).
 
 ### G3 notes (path, uid, zlib, printf)
 
@@ -399,13 +436,14 @@ Host image needs `p7zip-full` / `7z` for pkg peel (`Dockerfile.dev`).
 | (built-in) | XAR + pbzx + odc for Software Update `.pkg` |
 | `7z` / `7zz` | optional fallback for `.dmg` wrappers only |
 
-## What is out of scope (for now)
+## What is out of scope
 
 - Full Xcode.app / simulators / GUI
 - Codesign / notarization
 - Vendoring Apple SDKs or blobs in the git tree
 - Darling-derived code
 - Authenticated developer.apple.com portal downloads
+- Every git extension (LFS, `git svn`, every credential helper)
 
 ## Method
 

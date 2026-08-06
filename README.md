@@ -4,7 +4,7 @@ Userspace **macOS ARM64 → Linux aarch64** translation layer (CLI-first, no JIT
 
 Load Darwin Mach-O on Linux aarch64, map a freestanding `libSystem`, translate
 BSD syscalls, and run real guests (clang probes, **7-Zip `7zz`**, **curl**,
-threads).
+**Apple `git`**, threads).
 
 |                    |                                                   |
 | ------------------ | ------------------------------------------------- |
@@ -22,8 +22,9 @@ cargo install kakehashi
 cargo install --path crates/kh-cli --force
 
 kh bottle ensure
-kh install 7zip    # Darwin 7zz → guest /usr/local/bin/7zz
-kh install curl    # Darwin curl → guest /usr/local/bin/curl
+kh install 7zip         # Darwin 7zz → guest /usr/local/bin/7zz
+kh install curl         # Darwin curl → guest /usr/local/bin/curl
+kh install xcode-tools  # Apple CLT git (public swscan; no Apple ID)
 ```
 
 Relative `-o` / archive paths resolve against the **host CWD** of the `kh`
@@ -120,6 +121,9 @@ Details and gates: [`docs/curl.md`](docs/curl.md).
 
 ### Apple `git` (CLT)
 
+**Milestone met** (G0–G8). Day-to-day remotes work: local commits, HTTPS/SSH
+clone and push, plain `http://`, private GitHub. Large clones verified below.
+
 ```bash
 kh install xcode-tools   # public swscan; no Apple ID
 # Default is protocol v2 (also set by scripts/docker-git.sh):
@@ -130,23 +134,42 @@ kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
 # full / large clones stream over TLS guest FDs (path B; no 64 MiB body cap)
 # kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
-# Docker stress: ./scripts/docker-git.sh clone --depth 1 --single-branch https://github.com/torvalds/linux.git
-# Push + branches to a private bare remote over SSH (local sshd; no GitHub token):
+```
+
+**Verified large clones** (Docker / Colima):
+
+| What | How | Notes |
+| --- | --- | --- |
+| **Wine** full history | GitHub and GitLab remotes | Full clone (not shallow); large object / `index-pack` path |
+| **llvm/llvm-project** | `git@github.com:llvm/llvm-project.git` | `--depth 1` over SSH |
+| linux kernel | HTTPS | `--depth 1` (~279 MiB pack) |
+| facebook/folly | HTTPS | full clone |
+
+```bash
+# Shallow monorepo over SSH (host ~/.ssh key registered on GitHub)
+./scripts/docker-git.sh clone --depth 1 git@github.com:llvm/llvm-project.git
+
+# Wine full history (pick a mirror)
+# ./scripts/docker-git.sh clone https://github.com/wine-mirror/wine.git
+# ./scripts/docker-git.sh clone https://gitlab.winehq.org/wine/wine.git
+
+# Push / plain HTTP / private GitHub smokes (local or host gh):
 # ./scripts/docker-git-push.sh
-# Plain http:// smart HTTP (ls-remote / clone / push; local git-http-backend):
 # ./scripts/docker-git-http.sh
-# Authenticated GitHub private (needs host gh + SSH key):
 # ./scripts/docker-git-github.sh
 ```
 
-See [`docs/git.md`](docs/git.md) for gates (G0–G8). Docker: `scripts/docker-git.sh`,
-`docker-git-ssh.sh`, `docker-git-push.sh`, `docker-git-http.sh`, `docker-git-github.sh`.
+Details and gates: [`docs/git.md`](docs/git.md). Docker helpers:
+`scripts/docker-git.sh`, `docker-git-ssh.sh`, `docker-git-push.sh`,
+`docker-git-http.sh`, `docker-git-github.sh`.
 
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, multi‑GiB monorepo clone time budgets, GUI,
-codesign.
+real Apple Security.framework, every git extension (LFS, `git svn`, …),
+GUI, codesign. Unlimited full multi‑GiB monorepo clones under a fixed wall
+budget remain **best-effort** (network/host rate limits); Wine full + llvm
+shallow already green.
 
 ## Crates
 

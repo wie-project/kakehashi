@@ -43,6 +43,8 @@ parity with native is **not** a ship blocker (see README CI economics).
 | Zip MT deadlock | PRIVATE park/wake, 50 ms safety timeout, heap/mutex/cond fixes |
 | Freestanding size-class freelist | First-fit O(n²) → power-of-two LIFO bins; multi-file ~×5.2 → ~×1.24 |
 | Heap / boundary dig stats | `kh heap stats` dump; `KAKEHASHI_BOUNDARY_STATS` (M0) |
+| Curl milestone | **Met** (G0–G5) — [curl.md](curl.md) |
+| Git / CLT milestone | **Met** (G0–G8); Wine full (GH+GL), llvm `--depth 1` SSH — [git.md](git.md) |
 
 ## Failed prototypes (do not re-land)
 
@@ -61,12 +63,12 @@ Priority is **guest surface**, not shaving another tenth off an already ~×1.2 m
 | Priority | Direction | Notes |
 | --- | --- | --- |
 | 1 | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| 2 | **git** / **xcode-tools** | **G4–G8 met** (HTTPS; SSH; push; plain `http://`; authenticated GitHub private). Polish: multi‑GiB monorepos under time budget — [git.md](git.md) |
-| — | Optional polish | `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen; not gates |
+| 2 | **git** / **xcode-tools** | **Milestone met** (G0–G8). Verified: Wine full history (GitHub + GitLab), llvm-project `--depth 1` over SSH, push/private/auth — [git.md](git.md) |
+| — | Optional polish | multi‑GiB monorepo soak budgets; `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen — not gates |
 
 Rationale: curl was the smaller vertical slice that forced network ABI on top
-of FS/threads. Git is larger (process model, more POSIX) but remotes can reuse
-the curl network path.
+of FS/threads. Git is larger (process model, more POSIX) but remotes reuse the
+curl network path + host OpenSSH bridge.
 
 ### Curl milestone — **done** (trace-first)
 
@@ -86,6 +88,27 @@ Method and commands: [curl.md](curl.md). User-facing recipes:
 
 Process notes for curl polish PRs: internet allowed; clippy `-D warnings`;
 keep `7zz -mmt=4` green; clean-room only — see [legal-method.md](legal-method.md).
+
+### Git milestone — **done** (trace-first)
+
+Method and gates: [git.md](git.md). User-facing recipes:
+[README — Apple git](../README.md#apple-git-clt).
+
+| Slice | State |
+| --- | --- |
+| `kh install xcode-tools` (public swscan) | done |
+| Local `init` / `commit` / branches (G3) | **pass** |
+| HTTPS remotes + freestanding libcurl (G4) | **pass** |
+| SSH host OpenSSH bridge (G5) | **pass** |
+| Push + private bare (G6) | **pass** |
+| Plain `http://` (G7) | **pass** |
+| Authenticated GitHub private (G8) | **pass** |
+| **Wine** full history (GitHub + GitLab) | **pass** |
+| **llvm-project** `--depth 1` over SSH | **pass** |
+| Remaining | polish only (multi‑GiB soak under wall budget; quieter credential noise) |
+
+Process notes for git polish PRs: same as curl — internet allowed; clippy
+`-D warnings`; keep `7zz -mmt=4` green; clean-room — [legal-method.md](legal-method.md).
 
 ## Process
 

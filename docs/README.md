@@ -13,9 +13,9 @@ history when changing runtime, threading, or the guest/host boundary.
 | [Roadmap](roadmap.md) | Perf status, next work, process |
 | [Optimization process](roadmap2.md) | Strict measure-first perf process, plates, hard cost rules |
 | [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |
-| [Git / CLT milestone](git.md) | Apple `git` via `kh install xcode-tools`, public swscan + cache |
+| [Git / CLT milestone](git.md) | Apple `git` via `kh install xcode-tools` (milestone met; Wine full, llvm shallow, …) |
 
-User-facing install, **what works** (7zz + curl recipes), and CI economics:
+User-facing install, **what works** (7zz + curl + git recipes), and CI economics:
 root [`README.md`](../README.md).
 
 ## Sources of truth (code)
