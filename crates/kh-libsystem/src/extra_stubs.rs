@@ -68,6 +68,40 @@ pub(crate) unsafe extern "C" fn backtrace_symbols_fd(
 ) {
 }
 
+// ── kdebug soft (Apple clang / LLVM Support tracing) ────────────────────────
+
+/// C `kdebug_trace_string` → nlist `_kdebug_trace_string`.
+///
+/// Soft: accept and return 0 (no kernel trace facility under kh).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn kdebug_trace_string(
+    _debugid: u32,
+    _str_id: u64,
+    _str: *const c_char,
+) -> c_int {
+    0
+}
+
+/// C `kdebug_trace` → nlist `_kdebug_trace` (soft success).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn kdebug_trace(
+    _debugid: u32,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+) -> c_int {
+    0
+}
+
+/// C `kdebug_is_enabled` → nlist `_kdebug_is_enabled` (always off).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn kdebug_is_enabled(_debugid: u32) -> c_int {
+    0
+}
+
+// `arc4random*` lives in `net.rs` (curl-era buf + clang scalar).
+
 // ── setjmp / longjmp / ucontext soft ────────────────────────────────────────
 
 /// C `setjmp` → always 0 (context not restored by our soft `longjmp`).

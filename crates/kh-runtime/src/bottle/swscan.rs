@@ -5,7 +5,12 @@
 //! 1. Fetch a public `*.sucatalog` from `swscan.apple.com`
 //! 2. Find products that ship `CLTools_Executables*.pkg`
 //! 3. Read the English `.dist` for a human title (`suDisabledGroupID`)
-//! 4. Download the executables package from `swcdn.apple.com` into the cache
+//! 4. Download from `swcdn.apple.com` into the cache:
+//!    - `CLTools_Executables*.pkg` (toolchain)
+//!    - `CLTools_macOSNMOS_SDK.pkg` (current MacOSX.sdk headers)
+//!
+//! Not downloaded: empty `CLTools_macOS_SDK.pkg` marker, previous-major
+//! `CLTools_macOSLMOS_SDK.pkg`, `*_DevSDK_Remove_*`, Swift back-deploy.
 //!
 //! This is the same CDN path macOS `softwareupdate` / `xcode-select --install`
 //! use for CLT — not the authenticated developer.apple.com portal.
@@ -56,8 +61,19 @@ pub(crate) struct CltPackage {
     pub executables_url: String,
     /// Package file basename for the cache.
     pub executables_name: String,
+    /// Current-major SDK package (`CLTools_macOSNMOS_SDK.pkg`), if listed.
+    pub nmos_sdk: Option<CltSdkPackage>,
     /// Catalog `PostDate` as Unix seconds (0 if missing).
     pub post_date: i64,
+}
+
+/// One SDK `.pkg` shipped next to CLT executables on `swcdn.apple.com`.
+#[derive(Debug, Clone)]
+pub(crate) struct CltSdkPackage {
+    /// Basename, e.g. `CLTools_macOSNMOS_SDK.pkg`.
+    pub name: String,
+    /// Direct CDN URL.
+    pub url: String,
 }
 
 /// Full path: catalog → select → download executables pkg. Returns (meta, path).
@@ -66,6 +82,17 @@ pub(crate) fn download_selected_clt() -> Result<(CltPackage, PathBuf), SwscanErr
     let pkg = select_clt_package(&list)?;
     let path = ensure_clt_archive(&pkg)?;
     Ok((pkg, path))
+}
+
+/// Download (or reuse) the current-major MacOSX SDK for a selected CLT product.
+///
+/// Always installs NMOS only (not LMOS / previous major). Returns empty when
+/// the catalog product has no NMOS package.
+pub(crate) fn ensure_clt_sdk_archives(pkg: &CltPackage) -> Result<Vec<PathBuf>, SwscanError> {
+    let Some(sdk) = pkg.nmos_sdk.as_ref() else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![ensure_named_archive(&sdk.name, &sdk.url)?])
 }
 
 /// List CLT products from a cached/fetched Software Update catalog.
@@ -125,32 +152,39 @@ pub(crate) fn select_clt_package(packages: &[CltPackage]) -> Result<CltPackage, 
 
 /// Download (or reuse) the executables package for `pkg`.
 pub(crate) fn ensure_clt_archive(pkg: &CltPackage) -> Result<PathBuf, SwscanError> {
-    let dest = download_cache::download_path(&pkg.executables_name).map_err(SwscanError::Io)?;
+    let dest = ensure_named_archive(&pkg.executables_name, &pkg.executables_url)?;
     let alias = download_cache::download_path(CLT_EXEC_ALIAS).map_err(SwscanError::Io)?;
+    write_meta(&dest, pkg)?;
+    mirror_alias(&dest, &alias)?;
+    Ok(dest)
+}
+
+/// Download (or reuse) any CLT-related flat package by basename + URL.
+fn ensure_named_archive(name: &str, url: &str) -> Result<PathBuf, SwscanError> {
+    let dest = download_cache::download_path(name).map_err(SwscanError::Io)?;
 
     if !download_cache::force_download() && download_cache::is_nonempty_file(&dest) {
-        write_meta(&dest, pkg)?;
-        mirror_alias(&dest, &alias)?;
         return Ok(dest);
     }
 
-    download_cache::ensure_url(&pkg.executables_url, &dest).map_err(cache_to_swscan)?;
+    download_cache::ensure_url(url, &dest).map_err(cache_to_swscan)?;
     // Reject tiny non-xar responses (HTML error pages, empty stubs).
     let meta = fs::metadata(&dest).map_err(SwscanError::Io)?;
-    if meta.len() < 64 * 1024 {
-        let head = fs::read(&dest).unwrap_or_default();
-        let looks_xar = head.starts_with(b"xar!");
-        if !looks_xar {
-            drop(fs::remove_file(&dest));
-            return Err(SwscanError::Command(format!(
-                "CLT download is not a xar package ({} bytes); url={}",
-                meta.len(),
-                pkg.executables_url
-            )));
-        }
+    if meta.len() < 1024 {
+        drop(fs::remove_file(&dest));
+        return Err(SwscanError::Command(format!(
+            "CLT download too small ({} bytes); url={url}",
+            meta.len()
+        )));
     }
-    write_meta(&dest, pkg)?;
-    mirror_alias(&dest, &alias)?;
+    let head = fs::read(&dest).unwrap_or_default();
+    if !head.starts_with(b"xar!") {
+        drop(fs::remove_file(&dest));
+        return Err(SwscanError::Command(format!(
+            "CLT download is not a xar package ({} bytes); url={url}",
+            meta.len()
+        )));
+    }
     Ok(dest)
 }
 
@@ -250,6 +284,7 @@ fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanErro
         };
         let mut exec_url = None;
         let mut exec_name = None;
+        let mut nmos_sdk = None;
         for pkg in packages {
             let Some(pkg_dict) = pkg.as_dictionary() else {
                 continue;
@@ -261,7 +296,13 @@ fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanErro
             if is_executables_pkg_name(base) {
                 exec_url = Some(url.to_owned());
                 exec_name = Some(base.to_owned());
-                break;
+                continue;
+            }
+            if is_nmos_sdk_pkg_name(base) {
+                nmos_sdk = Some(CltSdkPackage {
+                    name: base.to_owned(),
+                    url: url.to_owned(),
+                });
             }
         }
         let (Some(executables_url), Some(executables_name)) = (exec_url, exec_name) else {
@@ -280,6 +321,7 @@ fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanErro
             product_id: product_id.clone(),
             executables_url,
             executables_name,
+            nmos_sdk,
             post_date,
             dist_url,
         });
@@ -313,6 +355,7 @@ fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanErro
             name,
             executables_url: r.executables_url,
             executables_name: r.executables_name,
+            nmos_sdk: r.nmos_sdk,
             post_date: r.post_date,
         });
     }
@@ -330,6 +373,7 @@ struct RawClt {
     product_id: String,
     executables_url: String,
     executables_name: String,
+    nmos_sdk: Option<CltSdkPackage>,
     post_date: i64,
     dist_url: Option<String>,
 }
@@ -340,6 +384,21 @@ fn is_executables_pkg_name(name: &str) -> bool {
         && Path::new(&n)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pkg"))
+}
+
+/// Current-major SDK only (`CLTools_macOSNMOS_SDK.pkg`).
+///
+/// LMOS (previous major), empty `CLTools_macOS_SDK.pkg`, and Remove/Swift
+/// packages are intentionally ignored.
+fn is_nmos_sdk_pkg_name(name: &str) -> bool {
+    if !Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pkg"))
+    {
+        return false;
+    }
+    name.to_ascii_lowercase()
+        .starts_with("cltools_macosnmos_sdk")
 }
 
 fn is_clt_name(name: &str) -> bool {
@@ -460,11 +519,13 @@ fn write_meta(archive: &Path, pkg: &CltPackage) -> Result<(), SwscanError> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(CLT_META_NAME);
+    let nmos = pkg.nmos_sdk.as_ref().map(|s| s.name.as_str());
     let body = serde_json::json!({
         "source": "swscan",
         "name": pkg.name,
         "product_id": pkg.product_id,
         "url": pkg.executables_url,
+        "nmos_sdk": nmos,
         "post_date": pkg.post_date,
         "archive": archive.display().to_string(),
         "fetched_unix": SystemTime::now()
@@ -549,6 +610,19 @@ mod tests {
     }
 
     #[test]
+    fn detects_nmos_sdk_only() {
+        assert!(is_nmos_sdk_pkg_name("CLTools_macOSNMOS_SDK.pkg"));
+        // Previous major / empty marker / remove / swift — not installed.
+        assert!(!is_nmos_sdk_pkg_name("CLTools_macOSLMOS_SDK.pkg"));
+        assert!(!is_nmos_sdk_pkg_name("CLTools_macOS_SDK.pkg"));
+        assert!(!is_nmos_sdk_pkg_name(
+            "CLTools_macOS_DevSDK_Remove_macOS14.pkg"
+        ));
+        assert!(!is_nmos_sdk_pkg_name("CLTools_SwiftBackDeploy.pkg"));
+        assert!(!is_nmos_sdk_pkg_name("CLTools_Executables.pkg"));
+    }
+
+    #[test]
     fn detects_clt_names() {
         assert!(is_clt_name("Command Line Tools for Xcode 16.4"));
         assert!(is_clt_name("Command Line Tools for Xcode 26.6"));
@@ -563,6 +637,7 @@ mod tests {
                 name: "Command Line Tools for Xcode 26.0 beta".into(),
                 executables_url: "https://example/a.pkg".into(),
                 executables_name: "a.pkg".into(),
+                nmos_sdk: None,
                 post_date: 200,
             },
             CltPackage {
@@ -570,6 +645,7 @@ mod tests {
                 name: "Command Line Tools for Xcode 16.4".into(),
                 executables_url: "https://example/b.pkg".into(),
                 executables_name: "b.pkg".into(),
+                nmos_sdk: None,
                 post_date: 100,
             },
         ];

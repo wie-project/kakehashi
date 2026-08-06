@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use kh_runtime::bottle::host_path_to_guest;
+use kh_runtime::process as proc_state;
 use kh_runtime::{
     AddressSpace, GuestPageSize, TrapConfig, TrapError, TrapEvent, bootstrap_stack, call_guest,
     call_guest_args, finish_with_exit_code, install_main_guest_tls, install_trap_handlers,
@@ -80,6 +82,12 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     }
 
     set_bottle_root(opts.root.clone());
+    // Guest-visible main path for `_NSGetExecutablePath` (clang -cc1 re-spawn).
+    let guest_exec = host_path_to_guest(path).or_else(|| {
+        // Bare host path outside bottle: still prefer an absolute guest-ish form.
+        path.to_str().map(str::to_owned)
+    });
+    proc_state::set_guest_executable_path(guest_exec.clone());
     // Drop any previous active address space (unmaps owned guest mmaps).
     drop(registry_take());
 
@@ -103,9 +111,18 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
 
     let mut stack = map_stack(host, DEFAULT_STACK_SIZE)?;
 
-    let argv0 = path.file_name().and_then(|s| s.to_str()).unwrap_or("guest");
+    // Prefer full guest absolute path as argv0 (Darwin-style); basename fallback.
+    let argv0 = guest_exec.as_deref().filter(|s| !s.is_empty()).map_or_else(
+        || {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("guest")
+                .to_owned()
+        },
+        str::to_owned,
+    );
     let mut argv_owned = Vec::with_capacity(opts.guest_args.len().saturating_add(1));
-    argv_owned.push(argv0.to_owned());
+    argv_owned.push(argv0);
     argv_owned.extend(opts.guest_args.iter().cloned());
     let argv_refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
     // Minimal macOS-like environment so guests see a real PATH under the bottle.
@@ -124,6 +141,12 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         home,
         "TMPDIR=/tmp".to_owned(),
     ];
+    // Apple clang without a working `xcrun` does not auto-pick
+    // `…/SDKs/MacOSX.sdk` (see `clang -v`: only CLT usr/include). Point the
+    // driver at the bottle SDK when `kh install xcode-tools` laid it down.
+    if let Some(sdk_env) = guest_sdk_env(opts.root.as_deref()) {
+        env_owned.extend(sdk_env);
+    }
     for (k, v) in std::env::vars() {
         if !k.starts_with("GIT_") || k.contains('\0') || v.contains('\0') {
             continue;
@@ -281,6 +304,44 @@ fn guest_home_env() -> String {
         }
         _ => "HOME=/var/root".to_owned(),
     }
+}
+
+/// Guest absolute default SDK path (CLT layout after `kh install xcode-tools`).
+const GUEST_DEFAULT_SDKROOT: &str = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+
+/// Guest absolute CLT developer dir.
+const GUEST_DEFAULT_DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
+
+/// `SDKROOT` + `DEVELOPER_DIR` when the bottle has MacOSX.sdk headers.
+///
+/// Apple clang's default search without a working `xcrun` omits the sysroot;
+/// setting these matches what `xcode-select` + `xcrun --show-sdk-path` provide
+/// on a real Mac with Command Line Tools only.
+fn guest_sdk_env(bottle: Option<&Path>) -> Option<Vec<String>> {
+    let bottle = bottle?;
+    let stdio = bottle
+        .join("Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h");
+    if !stdio.is_file() {
+        // Fall back: any MacOSX*.sdk with headers (symlink missing).
+        let sdks = bottle.join("Library/Developer/CommandLineTools/SDKs");
+        let Ok(entries) = std::fs::read_dir(&sdks) else {
+            return None;
+        };
+        let found = entries.flatten().any(|ent| {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("MacOSX")
+                && name.contains(".sdk")
+                && ent.path().join("usr/include/stdio.h").is_file()
+        });
+        if !found {
+            return None;
+        }
+    }
+    Some(vec![
+        format!("SDKROOT={GUEST_DEFAULT_SDKROOT}"),
+        format!("DEVELOPER_DIR={GUEST_DEFAULT_DEVELOPER_DIR}"),
+    ])
 }
 
 fn trap_to_load(err: TrapError) -> LoadError {

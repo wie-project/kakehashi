@@ -32,8 +32,6 @@ pub use guest_tools::{
     GUEST_CURL_REL, GUEST_PATH_DIRS, InstallPackage, InstallReport, ToolError, discover_7zz,
     discover_curl, guest_path_to_host, install_package, package_host_path, resolve_guest_program,
 };
-pub use swscan::ENV_XCODE_TOOLS_VERSION;
-pub use xcode_tools::{GUEST_CLT_REL, GUEST_GIT_PATH, GUEST_GIT_REL, bottle_has_git, discover_git};
 pub use layout::{
     GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_SSH_REL,
     MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX, ensure_dev_nodes, ensure_host_bin_bridges,
@@ -57,3 +55,5 @@ pub use registry::{
     active_file_path, clear_active, config_dir, data_dir, default_bottle_path, read_active,
     write_active,
 };
+pub use swscan::ENV_XCODE_TOOLS_VERSION;
+pub use xcode_tools::{GUEST_CLT_REL, GUEST_GIT_PATH, GUEST_GIT_REL, bottle_has_git, discover_git};

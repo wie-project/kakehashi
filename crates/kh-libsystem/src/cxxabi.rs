@@ -150,56 +150,83 @@ pub(crate) unsafe extern "C" fn op_delete_aligned(ptr: *mut c_void, _align: usiz
 // ── Darwin TLV (thread-local variables) ─────────────────────────────────────
 //
 // Guests import `__tlv_bootstrap` from libSystem. On first TLS access the
-// compiler stub leaves a `tlv_descriptor*` in `x0` and calls this. Soft model:
-// one process-wide 4 KiB block per descriptor (offset applied). Enough for
-// single-threaded clang `--version`; multi-thread TLV can refine later.
+// compiler leaves a `tlv_descriptor*` in `x0` and calls this; return is the
+// address of that variable's storage.
+//
+// Real dyld: one per-image TLV template; `key` groups descriptors, `offset`
+// is into that image block (can be tens of KiB for clang). Soft model:
+// one growable zeroed block **per key** (fallback: per-descriptor address).
+// Observed: 4 KiB clamp + per-descriptor blocks SEGV'd `SemaPPCallbacks::
+// FileChanged` (TLS pointer null / alias).
 
 #[repr(C)]
 struct TlvDescriptor {
     /// Rewritten by real dyld to `tlv_get_addr`; we leave as-is.
     _thunk: *mut c_void,
-    _key: u64,
+    /// Image / section key — shared by all TLVs in one image.
+    key: u64,
+    /// Byte offset into that image's TLV block.
     offset: u64,
 }
 
-const TLV_BLOCK: usize = 4096;
-const TLV_SLOTS: usize = 64;
+/// Soft per-key block size (covers large clang TLS templates).
+const TLV_BLOCK: usize = 1024 * 1024;
+const TLV_SLOTS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct TlvSlot {
-    desc: usize,
+    /// Grouping key (`descriptor.key`, or desc VA when key is 0).
+    key: u64,
     base: *mut u8,
+    /// Allocated size of `base`.
+    size: usize,
 }
 
 // SAFETY: freestanding single-writer soft table for soft TLS.
 static mut TLV_TABLE: [TlvSlot; TLV_SLOTS] = [TlvSlot {
-    desc: 0,
+    key: 0,
     base: core::ptr::null_mut(),
+    size: 0,
 }; TLV_SLOTS];
 static mut TLV_USED: usize = 0;
 
-/// `__tlv_bootstrap` → nlist `__tlv_bootstrap`.
-#[unsafe(export_name = "_tlv_bootstrap")]
-pub(crate) unsafe extern "C" fn tlv_bootstrap(desc: *mut c_void) -> *mut c_void {
+/// Real work for TLV; called from a register-preserving trampoline.
+///
+/// # Safety
+/// `desc` must be a guest `tlv_descriptor*`.
+/// Called only from the `__tlv_bootstrap` asm trampoline (`no_mangle` for `bl`).
+#[unsafe(no_mangle)]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn kh_tlv_bootstrap_impl(desc: *mut c_void) -> *mut c_void {
     if desc.is_null() {
         return core::ptr::null_mut();
     }
-    let key = desc.addr();
     // SAFETY: guest passes a live tlv_descriptor.
     let desc_s = unsafe { desc.cast::<TlvDescriptor>().as_ref() };
-    let off = desc_s.map_or(0, |d| usize::try_from(d.offset).unwrap_or(0));
-    let off = off.min(TLV_BLOCK.saturating_sub(1));
-    // Look up existing block.
+    let Some(d) = desc_s else {
+        return core::ptr::null_mut();
+    };
+    let off = usize::try_from(d.offset).unwrap_or(0);
+    if off.saturating_add(64) > TLV_BLOCK {
+        trace::force_note(b"[kh-libsystem] tlv_bootstrap offset beyond soft block\n");
+        return core::ptr::null_mut();
+    }
+    let group = if d.key != 0 {
+        d.key
+    } else {
+        u64::try_from(desc.addr()).unwrap_or(0)
+    };
+
     let used = unsafe { TLV_USED }.min(TLV_SLOTS);
-    // SAFETY: TLV_TABLE is process-local soft state.
     let table = core::ptr::addr_of!(TLV_TABLE);
     for slot in unsafe { (*table).iter().take(used) } {
-        if slot.desc == key && !slot.base.is_null() {
+        if slot.key == group && !slot.base.is_null() && off < slot.size {
             let addr = slot.base.addr().saturating_add(off);
             return core::ptr::with_exposed_provenance_mut(addr);
         }
     }
-    // Allocate new block.
+
+    // One large zeroed block per image key (offsets share the template).
     let base = unsafe { malloc(TLV_BLOCK) }.cast::<u8>();
     if base.is_null() {
         trace::force_note(b"[kh-libsystem] tlv_bootstrap OOM\n");
@@ -210,16 +237,60 @@ pub(crate) unsafe extern "C" fn tlv_bootstrap(desc: *mut c_void) -> *mut c_void 
     }
     let idx = unsafe { TLV_USED };
     if idx < TLV_SLOTS {
-        // SAFETY: exclusive soft table update.
         unsafe {
             if let Some(slot) = (*core::ptr::addr_of_mut!(TLV_TABLE)).get_mut(idx) {
-                *slot = TlvSlot { desc: key, base };
+                *slot = TlvSlot {
+                    key: group,
+                    base,
+                    size: TLV_BLOCK,
+                };
             }
             TLV_USED = idx.saturating_add(1);
         }
     }
     let addr = base.addr().saturating_add(off);
     core::ptr::with_exposed_provenance_mut(addr)
+}
+
+// Darwin TLV thunks are **not** standard C ABI: Apple clang codegen keeps
+// caller-saved GPRs (e.g. `w9`) live across the `blr` and only expects `x0`
+// to change (address of the TLS cell). A normal Rust `extern "C"` clobbers
+// `x9` → SEGV in `SemaPPCallbacks::FileChanged` after soft TLV.
+//
+// Naked trampoline (export nlist `__tlv_bootstrap`): save x1–x18 + lr, call
+// impl, restore. `export_name` matches guest imports (same as prior soft stub).
+#[unsafe(export_name = "_tlv_bootstrap")]
+#[unsafe(naked)]
+#[allow(unreachable_pub)]
+pub unsafe extern "C" fn tlv_bootstrap_entry() {
+    core::arch::naked_asm!(
+        // Save caller-saved GPRs we might clobber (keep x0 = desc).
+        "sub sp, sp, #160",
+        "stp x1, x2, [sp, #0]",
+        "stp x3, x4, [sp, #16]",
+        "stp x5, x6, [sp, #32]",
+        "stp x7, x8, [sp, #48]",
+        "stp x9, x10, [sp, #64]",
+        "stp x11, x12, [sp, #80]",
+        "stp x13, x14, [sp, #96]",
+        "stp x15, x16, [sp, #112]",
+        "stp x17, x18, [sp, #128]",
+        "str x30, [sp, #144]",
+        "bl {impl_}",
+        "ldr x30, [sp, #144]",
+        "ldp x17, x18, [sp, #128]",
+        "ldp x15, x16, [sp, #112]",
+        "ldp x13, x14, [sp, #96]",
+        "ldp x11, x12, [sp, #80]",
+        "ldp x9, x10, [sp, #64]",
+        "ldp x7, x8, [sp, #48]",
+        "ldp x5, x6, [sp, #32]",
+        "ldp x3, x4, [sp, #16]",
+        "ldp x1, x2, [sp, #0]",
+        "add sp, sp, #160",
+        "ret",
+        impl_ = sym kh_tlv_bootstrap_impl,
+    );
 }
 
 // ── libunwind ───────────────────────────────────────────────────────────────

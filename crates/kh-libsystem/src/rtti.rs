@@ -69,7 +69,13 @@ static TI_I: TypeInfoStub = EMPTY_TI;
 #[used]
 static TI_BAD_ALLOC: TypeInfoStub = EMPTY_TI;
 
+/// `typeinfo for std::__1::__shared_weak_count`
+#[unsafe(export_name = "_ZTINSt3__119__shared_weak_countE")]
+#[used]
+static TI_SHARED_WEAK_COUNT: TypeInfoStub = EMPTY_TI;
+
 const _: &TypeInfoStub = &TI_PKC;
 const _: &TypeInfoStub = &TI_PKW;
 const _: &TypeInfoStub = &TI_I;
 const _: &TypeInfoStub = &TI_BAD_ALLOC;
+const _: &TypeInfoStub = &TI_SHARED_WEAK_COUNT;

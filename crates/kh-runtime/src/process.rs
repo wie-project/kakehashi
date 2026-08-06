@@ -327,6 +327,12 @@ pub fn normalize_stdio_pipes_blocking() {
 /// Bottle root published for path translation (set once per run; rare updates).
 static BOTTLE_ROOT: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
 
+/// Guest absolute path of the main executable (`_NSGetExecutablePath`).
+///
+/// Set at `kh run` / nested re-exec start. Soft-git fallback lived in freestanding
+/// libSystem; clang spawn needs the real binary (not a hard-coded git path).
+static GUEST_EXECUTABLE: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
 /// Open `O_DIRECTORY` fd for the bottle root (`-1` = none).
 ///
 /// Hot path: absolute guest paths use `openat`/`fstatat` against this fd
@@ -553,6 +559,31 @@ pub fn with_bottle_root<R>(f: impl FnOnce(Option<&Path>) -> R) -> R {
     match BOTTLE_ROOT.read() {
         Ok(guard) => f(guard.as_ref().map(|a| a.as_path())),
         Err(poisoned) => f(poisoned.into_inner().as_ref().map(|a| a.as_path())),
+    }
+}
+
+/// Records the guest-visible main executable path for `_NSGetExecutablePath`.
+pub fn set_guest_executable_path(path: Option<String>) {
+    let next = path.filter(|s| !s.is_empty() && !s.contains('\0')).map(Arc::from);
+    match GUEST_EXECUTABLE.write() {
+        Ok(mut guard) => {
+            *guard = next;
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = next;
+        }
+    }
+}
+
+/// Guest absolute executable path, if set for this run.
+#[must_use]
+pub fn guest_executable_path() -> Option<String> {
+    match GUEST_EXECUTABLE.read() {
+        Ok(guard) => guard.as_ref().map(|s| s.as_ref().to_owned()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .map(|s| s.as_ref().to_owned()),
     }
 }
 

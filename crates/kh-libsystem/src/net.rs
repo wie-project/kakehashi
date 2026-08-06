@@ -85,8 +85,47 @@ pub(crate) unsafe extern "C" fn dladdr(_addr: *const c_void, _info: *mut c_void)
     0
 }
 
-/// Soft PRNG state for `arc4random_buf` (not crypto-grade; enough for curl G3 init).
+/// Soft PRNG state for `arc4random*` (not crypto-grade; curl init + clang temps).
 static mut ARC4_STATE: u64 = 0x4B48_4152_4334_0001;
+
+#[inline]
+fn arc4_next_u32() -> u32 {
+    // SAFETY: freestanding; races only scramble the stream.
+    let mut state = unsafe { core::ptr::addr_of_mut!(ARC4_STATE).read_volatile() };
+    if state == 0 {
+        state = 0x4B48_4152_4334_0001;
+    }
+    // xorshift64*
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    unsafe {
+        core::ptr::addr_of_mut!(ARC4_STATE).write_volatile(state);
+    }
+    u32::try_from(state >> 32).unwrap_or_else(|_| u32::try_from(state & 0xffff_ffff).unwrap_or(0))
+}
+
+/// C `arc4random` → nlist `_arc4random` (Apple clang temp names).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn arc4random() -> u32 {
+    arc4_next_u32()
+}
+
+/// C `arc4random_uniform` → nlist `_arc4random_uniform`.
+#[unsafe(no_mangle)]
+#[allow(clippy::arithmetic_side_effects)] // modular range reduction
+pub(crate) unsafe extern "C" fn arc4random_uniform(upper_bound: u32) -> u32 {
+    if upper_bound <= 1 {
+        return 0;
+    }
+    let min = upper_bound.wrapping_neg() % upper_bound;
+    loop {
+        let r = arc4_next_u32();
+        if r >= min {
+            return r % upper_bound;
+        }
+    }
+}
 
 /// C `arc4random_buf`.
 #[unsafe(no_mangle)]
@@ -94,21 +133,9 @@ pub(crate) unsafe extern "C" fn arc4random_buf(buf: *mut c_void, nbytes: usize) 
     if buf.is_null() || nbytes == 0 {
         return;
     }
-    // SAFETY: single-threaded init path; later races are acceptable for soft PRNG.
-    let mut state = unsafe { core::ptr::addr_of_mut!(ARC4_STATE).read_volatile() };
-    if state == 0 {
-        state = 0x4B48_4152_4334_0001;
-    }
     let out = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), nbytes) };
     for b in out.iter_mut() {
-        // xorshift64*
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *b = u8::try_from(state & 0xff).unwrap_or(0);
-    }
-    unsafe {
-        core::ptr::addr_of_mut!(ARC4_STATE).write_volatile(state);
+        *b = u8::try_from(arc4_next_u32() & 0xff).unwrap_or(0);
     }
 }
 

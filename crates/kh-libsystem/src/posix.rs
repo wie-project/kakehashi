@@ -14,7 +14,7 @@ use crate::sys::{
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::trace;
-use crate::{KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR};
+use crate::{KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR};
 
 const ENOSYS: i32 = 78;
 const ENOMEM: i32 = 12;
@@ -781,6 +781,27 @@ pub(crate) unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options:
     })
 }
 
+/// C `wait4` → nlist `_wait4` (rusage soft-zeroed by runtime when non-null).
+///
+/// Observed: Apple clang parent after `posix_spawn` of `-cc1`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wait4(
+    pid: c_int,
+    status: *mut c_int,
+    options: c_int,
+    rusage: *mut c_void,
+) -> c_int {
+    ret_c_int(unsafe {
+        sys::syscall4(
+            SYS_WAIT4,
+            u64::from(pid.cast_unsigned()),
+            ptr_u64(status.cast()),
+            u64::from(options.cast_unsigned()),
+            ptr_u64(rusage.cast_const()),
+        )
+    })
+}
+
 /// C `setsid` → nlist `_setsid` (new session; used by git maintenance).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn setsid() -> c_int {
@@ -993,6 +1014,297 @@ pub(crate) unsafe extern "C" fn execl(_path: *const c_char, _arg0: *const c_char
 pub(crate) unsafe extern "C" fn execlp(_file: *const c_char, _arg0: *const c_char) -> c_int {
     errno::set_errno(ENOSYS);
     -1
+}
+
+// ── posix_spawn (clang driver spawns -cc1; POSIX return = errno, not -1) ─────
+
+/// Soft: ignore `file_actions` / `attrp` (no chdir/dup2/close list yet).
+/// Observed: Apple clang G3 compile path hits `_posix_spawn` after G1 works.
+///
+/// Contract (POSIX / public man): **0** on success, error number on failure
+/// (does not use the `-1` + errno libc pattern).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn(
+    pid: *mut c_int,
+    path: *const c_char,
+    file_actions: *const c_void,
+    attrp: *const c_void,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if path.is_null() || argv.is_null() {
+        return EINVAL;
+    }
+    // Soft until a guest fails without redirects / spawn flags.
+    if !file_actions.is_null() {
+        trace::note(b"[kh-libsystem] posix_spawn: file_actions soft-ignored\n");
+    }
+    if !attrp.is_null() {
+        trace::note(b"[kh-libsystem] posix_spawn: attrp soft-ignored\n");
+    }
+    let env = if envp.is_null() {
+        soft_env_seed_defaults();
+        unsafe { environ.cast_const().cast() }
+    } else {
+        envp
+    };
+    let child = unsafe { fork() };
+    if child < 0 {
+        let e = errno::get_errno();
+        return if e == 0 {
+            11 /* EAGAIN */
+        } else {
+            e
+        };
+    }
+    if child == 0 {
+        // Child: image replace (runtime re-wraps Mach-O as `kh run`).
+        let _ = unsafe { execve(path, argv, env) };
+        // execve only returns on failure.
+        let e = errno::get_errno();
+        let code = if e == 0 { 127 } else { e.clamp(1, 127) };
+        unsafe { crate::process::exit_now(code) };
+    }
+    if !pid.is_null() {
+        unsafe {
+            pid.write(child);
+        }
+    }
+    0
+}
+
+/// C `posix_spawnp` → nlist `_posix_spawnp` (PATH search then [`posix_spawn`]).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnp(
+    pid: *mut c_int,
+    file: *const c_char,
+    file_actions: *const c_void,
+    attrp: *const c_void,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    if file.is_null() || argv.is_null() {
+        return EINVAL;
+    }
+    let has_slash = unsafe {
+        let mut p = file;
+        loop {
+            let b = *p;
+            if b == 0 {
+                break false;
+            }
+            if b == b'/'.cast_signed() {
+                break true;
+            }
+            p = p.add(1);
+        }
+    };
+    if has_slash {
+        return unsafe { posix_spawn(pid, file, file_actions, attrp, argv, envp) };
+    }
+    soft_env_seed_defaults();
+    let path_key: &[u8] = b"PATH\0";
+    let path_val = unsafe { getenv(path_key.as_ptr().cast()) };
+    if path_val.is_null() {
+        return 2; // ENOENT
+    }
+    let mut dir = path_val;
+    let mut candidate = [0_u8; 512];
+    let mut last_err = 2_i32; // ENOENT
+    loop {
+        let mut end = dir;
+        unsafe {
+            while *end != 0 && *end != b':'.cast_signed() {
+                end = end.add(1);
+            }
+        }
+        let dir_len = usize::try_from(unsafe { end.offset_from(dir) }.max(0)).unwrap_or(0);
+        let file_len = soft_env_c_str_len(file);
+        let need = dir_len
+            .max(1)
+            .saturating_add(1)
+            .saturating_add(file_len)
+            .saturating_add(1);
+        if need <= candidate.len() {
+            let mut n = if dir_len == 0 {
+                if let Some(slot) = candidate.get_mut(0) {
+                    *slot = b'.';
+                }
+                1_usize
+            } else {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        dir.cast::<u8>(),
+                        candidate.as_mut_ptr(),
+                        dir_len,
+                    );
+                }
+                dir_len
+            };
+            if let Some(slot) = candidate.get_mut(n) {
+                *slot = b'/';
+            }
+            n = n.saturating_add(1);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    file.cast::<u8>(),
+                    candidate.as_mut_ptr().add(n),
+                    file_len,
+                );
+            }
+            n = n.saturating_add(file_len);
+            if let Some(slot) = candidate.get_mut(n) {
+                *slot = 0;
+            }
+            let rc = unsafe {
+                posix_spawn(
+                    pid,
+                    candidate.as_ptr().cast(),
+                    file_actions,
+                    attrp,
+                    argv,
+                    envp,
+                )
+            };
+            if rc == 0 {
+                return 0;
+            }
+            // Keep trying on "not found"; surface other errors immediately.
+            if rc != 2 {
+                return rc;
+            }
+            last_err = rc;
+        }
+        unsafe {
+            if *end == 0 {
+                break;
+            }
+            dir = end.add(1);
+        }
+    }
+    last_err
+}
+
+/// Opaque `posix_spawnattr_t` / `posix_spawn_file_actions_t` are Darwin
+/// pointer typedefs (`void *` style). Soft: zero the caller's slot so destroy
+/// is a no-op; add* helpers no-op. Real apply lives in [`posix_spawn`] later.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_init(attr: *mut *mut c_void) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        attr.write(core::ptr::null_mut());
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_destroy(attr: *mut *mut c_void) -> c_int {
+    if attr.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        attr.write(core::ptr::null_mut());
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_setflags(
+    _attr: *mut *mut c_void,
+    _flags: c_int,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_getflags(
+    _attr: *const *mut c_void,
+    flags: *mut c_int,
+) -> c_int {
+    if !flags.is_null() {
+        unsafe {
+            flags.write(0);
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_setpgroup(
+    _attr: *mut *mut c_void,
+    _pgroup: c_int,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_setsigmask(
+    _attr: *mut *mut c_void,
+    _mask: *const c_void,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawnattr_setsigdefault(
+    _attr: *mut *mut c_void,
+    _mask: *const c_void,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn_file_actions_init(actions: *mut *mut c_void) -> c_int {
+    if actions.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        actions.write(core::ptr::null_mut());
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn_file_actions_destroy(
+    actions: *mut *mut c_void,
+) -> c_int {
+    if actions.is_null() {
+        return EINVAL;
+    }
+    unsafe {
+        actions.write(core::ptr::null_mut());
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn_file_actions_addclose(
+    _actions: *mut *mut c_void,
+    _fd: c_int,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn_file_actions_adddup2(
+    _actions: *mut *mut c_void,
+    _fd: c_int,
+    _newfd: c_int,
+) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn posix_spawn_file_actions_addopen(
+    _actions: *mut *mut c_void,
+    _fd: c_int,
+    _path: *const c_char,
+    _oflag: c_int,
+    _mode: c_int,
+) -> c_int {
+    0
 }
 
 /// C `getpid` → nlist `_getpid`.
@@ -1219,8 +1531,9 @@ pub(crate) unsafe extern "C" fn signal(_sig: c_int, _handler: *mut c_void) -> *m
 /// `export_name = "_NSGetExecutablePath"` so the linker emits the double-
 /// underscore form guests import.
 ///
-/// Soft path: bottle CLT layout. Enough for Apple `git --version`. Host may
-/// refine later via a helper if a guest needs the true argv0 path.
+/// Host helper supplies the real guest path for this `kh run` image (clang
+/// re-spawns itself as `-cc1` via this API). Fallback: soft CLT `git` path
+/// (historical; enough for `git --version` when the helper is unset).
 ///
 /// Returns 0 on success, −1 if `*bufsize` was too small (then updates size).
 #[unsafe(export_name = "_NSGetExecutablePath")]
@@ -1228,14 +1541,27 @@ pub(crate) unsafe extern "C" fn ns_get_executable_path(
     buf: *mut c_char,
     bufsize: *mut u32,
 ) -> c_int {
-    // Prefer a CLT-style path (matches `kh install xcode-tools` layout).
-    const PATH: &[u8] = b"/Library/Developer/CommandLineTools/usr/bin/git\0";
-    // Include trailing NUL in required size (Darwin semantics).
-    let need = u32::try_from(PATH.len()).unwrap_or(u32::MAX);
+    const FALLBACK: &[u8] = b"/Library/Developer/CommandLineTools/usr/bin/git\0";
     if bufsize.is_null() {
         errno::set_errno(EINVAL);
         return -1;
     }
+    let mut path_buf = [0_u8; 1024];
+    let helper_len = unsafe {
+        sys::helper2(
+            KH_HELPER_EXECUTABLE_PATH,
+            u64::try_from(path_buf.as_mut_ptr().addr()).unwrap_or(0),
+            u64::try_from(path_buf.len()).unwrap_or(0),
+        )
+    };
+    let path: &[u8] = if helper_len > 1 {
+        let n = usize::try_from(helper_len).unwrap_or(1).min(path_buf.len());
+        path_buf.get(..n).unwrap_or(FALLBACK)
+    } else {
+        FALLBACK
+    };
+    // Include trailing NUL in required size (Darwin semantics).
+    let need = u32::try_from(path.len()).unwrap_or(u32::MAX);
     let have = unsafe { *bufsize };
     if have < need || buf.is_null() {
         unsafe {
@@ -1244,7 +1570,7 @@ pub(crate) unsafe extern "C" fn ns_get_executable_path(
         return -1;
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(PATH.as_ptr(), buf.cast::<u8>(), PATH.len());
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buf.cast::<u8>(), path.len());
         *bufsize = need;
     }
     0
@@ -1455,10 +1781,16 @@ fn soft_env_seed_defaults() {
     } else {
         b"/var/root\0"
     };
+    // Default CLT SDK for Apple clang without a working `xcrun` (headers live
+    // under SDKs/MacOSX.sdk after `kh install xcode-tools`).
+    let sdkroot = b"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk\0";
+    let developer_dir = b"/Library/Developer/CommandLineTools\0";
     for (name, val) in [
         (b"PATH\0".as_slice(), path.as_slice()),
         (b"HOME\0".as_slice(), home),
         (b"TMPDIR\0".as_slice(), tmp.as_slice()),
+        (b"SDKROOT\0".as_slice(), sdkroot.as_slice()),
+        (b"DEVELOPER_DIR\0".as_slice(), developer_dir.as_slice()),
     ] {
         let _ = unsafe { soft_env_set(name.as_ptr().cast(), val.as_ptr().cast(), 1) };
     }
@@ -1466,7 +1798,29 @@ fn soft_env_seed_defaults() {
     // parent guest's soft environ (inject_kh_env). Pull them in so `getenv`
     // / `environ` walks see `GIT_DIR` (required for clone fetch).
     soft_env_seed_git_from_host();
+    // Prefer host-inherited SDKROOT/DEVELOPER_DIR when present (nested -cc1).
+    soft_env_seed_sdk_from_host();
     soft_env_rebuild_environ();
+}
+
+/// Pull SDKROOT / DEVELOPER_DIR from the host process (nested `kh run`).
+fn soft_env_seed_sdk_from_host() {
+    const KEYS: &[&[u8]] = &[b"SDKROOT\0", b"DEVELOPER_DIR\0"];
+    let mut val_buf = [0_u8; SOFT_ENV_WIDTH];
+    for key in KEYS {
+        let n = unsafe {
+            sys::helper3(
+                crate::KH_HELPER_GETENV,
+                u64::try_from(key.as_ptr().addr()).unwrap_or(0),
+                u64::try_from(val_buf.as_mut_ptr().addr()).unwrap_or(0),
+                u64::try_from(val_buf.len()).unwrap_or(0),
+            )
+        };
+        if n <= 1 {
+            continue;
+        }
+        let _ = unsafe { soft_env_set(key.as_ptr().cast(), val_buf.as_ptr().cast(), 1) };
+    }
 }
 
 /// Pull common `GIT_*` keys from the host process into soft environ.

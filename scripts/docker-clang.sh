@@ -12,7 +12,7 @@
 #   ./scripts/docker-clang.sh -- -x c -c /Volumes/linux/src/tests/clang-probe/puts_hello.c -o /Volumes/linux/out/puts.o
 #
 # Env:
-#   KAKEHASHI_XCODE_TOOLS_VERSION  pin catalog title substring
+#   KAKEHASHI_XCODE_TOOLS_VERSION  pin catalog title substring (e.g. 26.6)
 #   KAKEHASHI_FORCE_DOWNLOAD=1     re-fetch even if bottle/cache present
 #   KAKEHASHI_SMOKE_IMAGE          docker image (default: kakehashi:dev)
 #   KH_EXTRA_CARGO_ARGS            cargo flags for kh (default: --release)

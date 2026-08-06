@@ -40,7 +40,9 @@ mod errno;
 mod extra_stubs;
 mod heap;
 mod iconv;
+mod libcxx_algo;
 mod libcxx_error;
+mod libcxx_shared;
 mod libcxx_string;
 mod libcxx_sync;
 mod locale;
@@ -129,6 +131,8 @@ pub const KH_HELPER_REGFREE: u32 = 0x4B48_0010;
 /// Host-helper id: TCP (+ rustls) connect → guest FD for freestanding libcurl.
 /// Flags: bit0 verify peer; bit1 plain TCP only (`http://`).
 pub const KH_HELPER_TLS_CONNECT: u32 = 0x4B48_0011;
+/// Host-helper id: guest main executable path for `_NSGetExecutablePath`.
+pub const KH_HELPER_EXECUTABLE_PATH: u32 = 0x4B48_0012;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

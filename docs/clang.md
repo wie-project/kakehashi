@@ -17,8 +17,8 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | --- | --- | --- |
 | G0 | `kh install xcode-tools` → bottle has CLT + `…/usr/bin/clang` | **pass** (shared with git) |
 | G1 | `kh run clang -- --version` banner + exit 0 | **pass** (Docker Colima, 2026-08: `Apple clang version 21.0.0`) |
-| G2 | Missing surface list from `--version` / tiny C compile probes | open |
-| G3 | Compile trivial `hello.c` → object or executable under bottle | open |
+| G2 | Missing surface list from `--version` / tiny C compile probes | **pass** (trace log; see progress) |
+| G3 | Compile trivial `hello.c` → object or executable under bottle | **pass** (Docker: `return_zero.c` → Mach-O arm64 `.o`; also `stdio_hello.c` with SDK) |
 | G4 | Link + run guest binary produced by guest clang (optional stretch) | open |
 
 ### Progress log (Docker Colima, 2026-08)
@@ -37,14 +37,23 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | Broader `basic_string` (substr ctor, insert/erase/replace, `operator+`) | **landed** |
 | SIGSEGV in `operator+(char const*, string)` | **fixed** — AArch64 sret is `x8`, not first arg; return `StringRep` by value |
 | **G1 `clang --version`** | **pass** (Docker) |
+| `posix_spawn` + `wait4` (driver spawns `-cc1`) | **done** |
+| `_NSGetExecutablePath` real path (was hard-coded git) | **done** — helper + `kh run` records guest path |
+| `std::to_string`, soft `shared_ptr`, `kdebug_*`, `arc4random*` | **done** |
+| TLV: large per-key block + **register-preserving** `__tlv_bootstrap` | **done** — fixed SEGV in `SemaPPCallbacks::FileChanged` (`x9` live across thunk) |
+| `std::__sort` (`char`/`int`/`unsigned`/`ushort`) | **done** |
+| **G3 `clang -c return_zero.c -o ….o`** | **pass** (Docker, Mach-O arm64 object, exit 0) |
+| `clang -E` preprocess | **pass** |
+| `#include <stdio.h>` / SDK headers | **pass** — swscan SDKs + freestanding `SDKROOT`/`DEVELOPER_DIR` soft env |
+| CLT product **26.6** → `SDKs/MacOSX.sdk` → `MacOSX26.5.sdk` | **pass** (Docker install) |
+| `clang -c stdio_hello.c` | **pass** (Mach-O arm64 `.o`, 744 B) |
 
 ### Next (trace-first)
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| Hang / further missing after ~mod_init mid list | freestanding libc++ / POSIX | `KAKEHASHI_LOG=info` + post-`mod_init done`; implement only *called* symbols |
-| Remaining `basic_string` methods (insert/replace/erase/…) | `libcxx_string` | On demand from missing-symbol log |
-| `libz` / `libresolv` skipped soft | bottle | Only if G1 path needs them |
+| G4: link guest product and run under `kh` | freestanding + ld | After G3 `.o`; may need more libc++ / linker surface |
+| Harder `-cc1` / more libc++ | freestanding | On demand from missing-symbol log |
 
 Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
@@ -75,8 +84,11 @@ Observed / Spec / Impl / Not used — see [legal-method.md](legal-method.md).
 | **Host (default bottle)** | `~/.local/share/kakehashi/bottle/Library/Developer/CommandLineTools/usr/bin/clang` |
 | **Docker / repo bottle** | `<repo>/.kh/data/bottle/Library/Developer/CommandLineTools/usr/bin/clang` |
 
-Install is the same package as git: `kh install xcode-tools` (public Software
-Update catalog; no Apple ID).
+Install is the same product as git: `kh install xcode-tools` (public Software
+Update catalog; no Apple ID). That product also installs the current MacOSX
+SDK (`CLTools_macOSNMOS_SDK` only — not previous-major LMOS). Freestanding
+seeds `SDKROOT` + `DEVELOPER_DIR` so Apple clang finds headers without a
+working `xcrun`.
 
 ## Docker helpers
 

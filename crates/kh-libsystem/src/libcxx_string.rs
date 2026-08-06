@@ -674,6 +674,107 @@ pub(crate) unsafe extern "C" fn string_op_add_cstr_string(
     out
 }
 
+/// Format decimal into `buf` (NUL-terminated); returns length without NUL.
+fn fmt_u64_dec(mut v: u64, buf: &mut [u8]) -> usize {
+    // Max u64 decimal digits = 20 + NUL.
+    if buf.len() < 2 {
+        return 0;
+    }
+    let mut tmp = [0_u8; 20];
+    let mut n = 0_usize;
+    if v == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 && n < tmp.len() {
+            let d = (v % 10) as u8;
+            tmp[n] = b'0' + d;
+            n = n.saturating_add(1);
+            v /= 10;
+        }
+        // reverse digits in place
+        let mut i = 0;
+        let mut j = n.saturating_sub(1);
+        while i < j {
+            tmp.swap(i, j);
+            i = i.saturating_add(1);
+            j = j.saturating_sub(1);
+        }
+    }
+    let cap = buf.len().saturating_sub(1).min(n);
+    if cap > 0 {
+        buf[..cap].copy_from_slice(&tmp[..cap]);
+    }
+    if let Some(slot) = buf.get_mut(cap) {
+        *slot = 0;
+    }
+    cap
+}
+
+fn string_from_u64(v: u64) -> StringRep {
+    let mut out = StringRep {
+        bytes: [0_u8; REP_SIZE],
+    };
+    let mut digs = [0_u8; 24];
+    let n = fmt_u64_dec(v, &mut digs);
+    let p = out.bytes.as_mut_ptr().cast::<c_void>();
+    assign_bytes(p, digs.as_ptr(), n);
+    out
+}
+
+fn string_from_i64(v: i64) -> StringRep {
+    if v >= 0 {
+        return string_from_u64(v as u64);
+    }
+    // Negative: '-' + abs (careful with i64::MIN)
+    let mut out = StringRep {
+        bytes: [0_u8; REP_SIZE],
+    };
+    let mut digs = [0_u8; 24];
+    digs[0] = b'-';
+    let mag = v.unsigned_abs();
+    let n = fmt_u64_dec(mag, &mut digs[1..]).saturating_add(1);
+    let p = out.bytes.as_mut_ptr().cast::<c_void>();
+    assign_bytes(p, digs.as_ptr(), n);
+    out
+}
+
+/// `std::to_string(unsigned int)` — observed Apple clang -cc1.
+#[unsafe(export_name = "_ZNSt3__19to_stringEj")]
+pub(crate) unsafe extern "C" fn to_string_uint(v: u32) -> StringRep {
+    string_from_u64(u64::from(v))
+}
+
+/// `std::to_string(int)`
+#[unsafe(export_name = "_ZNSt3__19to_stringEi")]
+pub(crate) unsafe extern "C" fn to_string_int(v: i32) -> StringRep {
+    string_from_i64(i64::from(v))
+}
+
+/// `std::to_string(unsigned long)` (LP64 = u64)
+#[unsafe(export_name = "_ZNSt3__19to_stringEm")]
+pub(crate) unsafe extern "C" fn to_string_ulong(v: u64) -> StringRep {
+    string_from_u64(v)
+}
+
+/// `std::to_string(long)`
+#[unsafe(export_name = "_ZNSt3__19to_stringEl")]
+pub(crate) unsafe extern "C" fn to_string_long(v: i64) -> StringRep {
+    string_from_i64(v)
+}
+
+/// `std::to_string(unsigned long long)`
+#[unsafe(export_name = "_ZNSt3__19to_stringEy")]
+pub(crate) unsafe extern "C" fn to_string_ull(v: u64) -> StringRep {
+    string_from_u64(v)
+}
+
+/// `std::to_string(long long)`
+#[unsafe(export_name = "_ZNSt3__19to_stringEx")]
+pub(crate) unsafe extern "C" fn to_string_ll(v: i64) -> StringRep {
+    string_from_i64(v)
+}
+
 /// `std::__1::__next_prime(size_t)` — bucket count helper for unordered_* .
 /// nlist `__ZNSt3__112__next_primeEm`
 #[unsafe(export_name = "_ZNSt3__112__next_primeEm")]

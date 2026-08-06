@@ -383,14 +383,20 @@ Nothing is vendored in-tree. `kh install xcode-tools` (aliases: `clt`, `git`):
    [`swscan.apple.com`](https://swscan.apple.com) (same source as macOS
    `softwareupdate` / `xcode-select --install`). **No Apple ID, no cookies.**
 2. **Select** — product that ships `CLTools_Executables*.pkg`; prefer latest
-   stable title (“Command Line Tools for Xcode …”).
-3. **Download** — package from `swcdn.apple.com` into the **persistent cache**
-   under `$KAKEHASHI_DATA_DIR/cache/downloads/`.
+   stable title (currently **Command Line Tools for Xcode 26.6**).
+3. **Download** — same product’s packages from `swcdn.apple.com` into the
+   **persistent cache** under `$KAKEHASHI_DATA_DIR/cache/downloads/`:
+   - `CLTools_Executables*.pkg` — toolchain (`git`, `clang`, …)
+   - `CLTools_macOSNMOS_SDK.pkg` — current major SDK (folder e.g. `MacOSX26.5.sdk`)
+   - *not* LMOS (previous major), empty `CLTools_macOS_SDK.pkg`, Remove pkgs, Swift
 4. **Extract** — built-in **XAR → pbzx → odc cpio** (no p7zip for `.pkg`).
 5. **Bottle** — `{bottle}/Library/Developer/CommandLineTools/…` plus
-   `{bottle}/usr/bin/git` → CLT git.
+   `{bottle}/usr/bin/git` → CLT git and `SDKs/MacOSX.sdk` → NMOS versioned SDK.
 
 Optional pin: `KAKEHASHI_XCODE_TOOLS_VERSION=26.6` (substring match on title).
+
+**Version naming:** catalog title is CLT/Xcode **26.6**; the SDK *directory*
+inside NMOS is currently `MacOSX26.5.sdk` (Apple’s packaging — not a pin bug).
 
 ### Docker: do not re-download every run
 
@@ -399,9 +405,9 @@ first successful install:
 
 | Layer | Path (host, under repo) | Behaviour on next `docker run` |
 | --- | --- | --- |
-| Bottle install | `.kh/data/bottle/Library/Developer/CommandLineTools/` | **no-op** if `usr/bin/git` exists |
-| Archive cache | `.kh/data/cache/downloads/CLTools_Executables*.pkg` | reused if bottle wiped but cache kept |
-| Extract cache | `.kh/data/cache/extract/command-line-tools/` | skip re-extract when tree valid |
+| Bottle install | `.kh/data/bottle/Library/Developer/CommandLineTools/` | **no-op** if `usr/bin/git` + SDK headers present |
+| Archive cache | `.kh/data/cache/downloads/CLTools_Executables*.pkg` (+ NMOS SDK) | reused if bottle wiped but cache kept |
+| Extract cache | `.kh/data/cache/extract/command-line-tools/` (+ `-sdk-*`) | skip re-extract when tree valid |
 | Catalog cache | `.kh/data/cache/downloads/software-update.sucatalog` | reused for ~24h |
 
 Force a full re-fetch: `KAKEHASHI_FORCE_DOWNLOAD=1`.
@@ -412,7 +418,7 @@ Optional: `KAKEHASHI_CACHE_DIR` overrides the cache root (still bind-mount it).
 
 ```bash
 kh bottle ensure
-kh install xcode-tools            # second call is free if bottle intact
+kh install xcode-tools            # second call is free if bottle intact (git + SDK)
 kh run git -- --version
 
 # optional pin / force:

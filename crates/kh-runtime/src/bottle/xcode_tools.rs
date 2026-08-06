@@ -1,16 +1,20 @@
-//! Install Apple **Command Line Tools** into the bottle (source of Apple `git`).
+//! Install Apple **Command Line Tools** into the bottle (source of Apple `git`
+//! and clang + MacOSX.sdk headers).
 //!
 //! Primary path (clean Linux / Docker):
-//! 1. Public Software Update catalog (`swscan.apple.com`) → latest CLT
-//!    `CLTools_Executables*.pkg` (see [`swscan`])
-//! 2. Persistent cache under `KAKEHASHI_DATA_DIR/cache` (Docker bind mount)
-//! 3. Extract → `{bottle}/Library/Developer/CommandLineTools/…`
-//! 4. Symlink `{bottle}/usr/bin/git` → CLT git
+//! 1. Public Software Update catalog (`swscan.apple.com`) → latest CLT product
+//! 2. Download from `swcdn.apple.com` (same product):
+//!    - `CLTools_Executables*.pkg` (toolchain)
+//!    - `CLTools_macOSNMOS_SDK.pkg` (current MacOSX.sdk only — not LMOS)
+//! 3. Persistent cache under `KAKEHASHI_DATA_DIR/cache` (Docker bind mount)
+//! 4. Extract → `{bottle}/Library/Developer/CommandLineTools/…`
+//! 5. Symlink `{bottle}/usr/bin/git` → CLT git; `SDKs/MacOSX.sdk` → NMOS
 //!
 //! Optional: `KAKEHASHI_XCODE_TOOLS_VERSION` pins the catalog title substring.
 //! Force re-fetch: `KAKEHASHI_FORCE_DOWNLOAD=1`.
 //!
-//! Idempotent: if bottle already has `…/usr/bin/git`, install is a no-op (no network).
+//! Idempotent: if bottle has `…/usr/bin/git` **and** SDK headers, install is a
+//! no-op (no network). Incomplete bottles (git without SDK) upgrade in place.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -32,6 +36,9 @@ pub const GUEST_GIT_PATH: &str = "/Library/Developer/CommandLineTools/usr/bin/gi
 /// Guest-relative path of git inside the CLT tree.
 pub const GUEST_GIT_REL: &str = "Library/Developer/CommandLineTools/usr/bin/git";
 
+/// Guest-relative path of the CLT `SDKs/` directory.
+pub(crate) const GUEST_SDKS_REL: &str = "Library/Developer/CommandLineTools/SDKs";
+
 /// Guest-relative symlink at classic `/usr/bin/git`.
 pub(crate) const GUEST_USR_BIN_GIT_REL: &str = "usr/bin/git";
 
@@ -42,22 +49,49 @@ const CACHE_EXTRACT_NAME: &str = "command-line-tools";
 pub(crate) fn install_xcode_tools() -> Result<InstallReport, ToolError> {
     let bottle = ensure_active_bottle()?;
 
-    // Idempotent: Docker re-runs must not re-download.
-    if !download_cache::force_download() {
-        let host_git = bottle.join(GUEST_GIT_REL);
-        if host_git.is_file() {
-            return Ok(InstallReport {
-                package: "xcode-tools",
-                host_path: host_git,
-                guest_path: GUEST_GIT_PATH,
-                bottle,
-            });
-        }
+    let host_git = bottle.join(GUEST_GIT_REL);
+    let has_git = host_git.is_file();
+    let has_sdk = bottle_has_macos_sdk(&bottle);
+
+    // Idempotent: Docker re-runs must not re-download when complete.
+    if !download_cache::force_download() && has_git && has_sdk {
+        return Ok(InstallReport {
+            package: "xcode-tools",
+            host_path: host_git,
+            guest_path: GUEST_GIT_PATH,
+            bottle,
+        });
     }
 
-    let archive = resolve_clt_archive()?;
-    let clt_root = extract_archive_to_cache(&archive)?;
-    install_clt_into_bottle(&bottle, &clt_root)?;
+    // Resolve product once (executables + NMOS SDK from the same catalog entry).
+    let (pkg, exec_archive) = resolve_clt_product()?;
+
+    if !has_git || download_cache::force_download() {
+        let clt_root = extract_archive_to_cache(&exec_archive)?;
+        install_clt_into_bottle(&bottle, &clt_root)?;
+    }
+
+    if !has_sdk || download_cache::force_download() {
+        let sdk_archives = swscan::ensure_clt_sdk_archives(&pkg)
+            .map_err(|e| ToolError::Command(format!("Apple CLT SDK download failed: {e}")))?;
+        if sdk_archives.is_empty() {
+            return Err(ToolError::Command(format!(
+                "CLT product {:?} has no CLTools_macOSNMOS_SDK package in catalog \
+                 (rename or empty product — try KAKEHASHI_FORCE_DOWNLOAD=1)",
+                pkg.name
+            )));
+        }
+        for archive in &sdk_archives {
+            install_sdk_pkg_into_bottle(&bottle, archive)?;
+        }
+        ensure_macos_sdk_symlinks(&bottle)?;
+        if !bottle_has_macos_sdk(&bottle) {
+            return Err(ToolError::Command(format!(
+                "CLT SDK install finished but no usr/include/stdio.h under {}/SDKs",
+                bottle.join(GUEST_CLT_REL).display()
+            )));
+        }
+    }
 
     let host_git = bottle.join(GUEST_GIT_REL);
     if !host_git.is_file() {
@@ -74,6 +108,40 @@ pub(crate) fn install_xcode_tools() -> Result<InstallReport, ToolError> {
         guest_path: GUEST_GIT_PATH,
         bottle,
     })
+}
+
+/// Whether the bottle has a usable MacOSX SDK (system headers).
+#[must_use]
+pub(crate) fn bottle_has_macos_sdk(bottle: &Path) -> bool {
+    find_sdk_stdio(bottle).is_some()
+}
+
+/// Locate `…/SDKs/MacOSX*.sdk/usr/include/stdio.h` under the bottle CLT tree.
+fn find_sdk_stdio(bottle: &Path) -> Option<PathBuf> {
+    let sdks = bottle.join(GUEST_SDKS_REL);
+    if !sdks.is_dir() {
+        return None;
+    }
+    // Prefer the default symlink target first.
+    let preferred = sdks.join("MacOSX.sdk/usr/include/stdio.h");
+    if preferred.is_file() {
+        return Some(preferred);
+    }
+    let Ok(entries) = fs::read_dir(&sdks) else {
+        return None;
+    };
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("MacOSX") || !name.contains(".sdk") {
+            continue;
+        }
+        let stdio = ent.path().join("usr/include/stdio.h");
+        if stdio.is_file() {
+            return Some(stdio);
+        }
+    }
+    None
 }
 
 /// Whether the bottle already has Apple git from a prior CLT install.
@@ -119,9 +187,9 @@ fn ensure_active_bottle() -> Result<PathBuf, ToolError> {
     Ok(created.path)
 }
 
-fn resolve_clt_archive() -> Result<PathBuf, ToolError> {
+fn resolve_clt_product() -> Result<(swscan::CltPackage, PathBuf), ToolError> {
     match swscan::download_selected_clt() {
-        Ok((_pkg, path)) => Ok(path),
+        Ok((pkg, path)) => Ok((pkg, path)),
         Err(e) => {
             let mut msg = format!("Apple CLT download failed: {e}\n");
             let mut help = Vec::new();
@@ -130,6 +198,207 @@ fn resolve_clt_archive() -> Result<PathBuf, ToolError> {
             Err(ToolError::Command(msg))
         }
     }
+}
+
+/// Extract one SDK `.pkg` and merge its `Library/Developer/CommandLineTools/SDKs`
+/// tree into the bottle CLT root.
+fn install_sdk_pkg_into_bottle(bottle: &Path, archive: &Path) -> Result<(), ToolError> {
+    let stem = archive
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clt-sdk");
+    let extract_name = format!("command-line-tools-sdk-{stem}");
+    let extract_root = download_cache::extract_path(&extract_name).map_err(ToolError::Io)?;
+
+    let need_extract =
+        download_cache::force_download() || find_sdk_root_in_extract(&extract_root).is_none();
+    if need_extract {
+        if extract_root.exists() {
+            drop(fs::remove_dir_all(&extract_root));
+        }
+        fs::create_dir_all(&extract_root)?;
+        super::pkg_extract::extract_apple_pkg(archive, &extract_root).map_err(|e| {
+            ToolError::Command(format!(
+                "Apple SDK .pkg extract failed ({}): {e}",
+                archive.display()
+            ))
+        })?;
+    }
+
+    let sdk_src = find_sdk_root_in_extract(&extract_root).ok_or_else(|| {
+        ToolError::Command(format!(
+            "extracted {} but no SDKs/MacOSX*.sdk under {}",
+            archive
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("sdk.pkg"),
+            extract_root.display()
+        ))
+    })?;
+
+    let dest_sdks = bottle.join(GUEST_SDKS_REL);
+    fs::create_dir_all(&dest_sdks)?;
+    // Merge each MacOSX*.sdk directory (and any sibling files) into bottle SDKs.
+    let entries = fs::read_dir(&sdk_src)?;
+    for ent in entries {
+        let ent = ent?;
+        let from = ent.path();
+        let name = ent.file_name();
+        let to = dest_sdks.join(&name);
+        let ft = ent.file_type()?;
+        if ft.is_dir() {
+            if to.exists() {
+                drop(fs::remove_dir_all(&to));
+            }
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                let target = fs::read_link(&from)?;
+                if to.exists() || to.symlink_metadata().is_ok() {
+                    drop(fs::remove_file(&to));
+                }
+                symlink(target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::copy(&from, &to)?;
+            }
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Find `…/SDKs` that contains at least one `MacOSX*.sdk` under an extract tree.
+fn find_sdk_root_in_extract(root: &Path) -> Option<PathBuf> {
+    // Common layout from Payload: Library/Developer/CommandLineTools/SDKs
+    let direct = root.join("Library/Developer/CommandLineTools/SDKs");
+    if sdk_dir_has_macosx(&direct) {
+        return Some(direct);
+    }
+    if sdk_dir_has_macosx(root) {
+        return Some(root.to_path_buf());
+    }
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(dir) = stack.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 50_000 {
+            break;
+        }
+        if dir
+            .file_name()
+            .is_some_and(|n| n == "SDKs" && sdk_dir_has_macosx(&dir))
+        {
+            return Some(dir);
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    None
+}
+
+fn sdk_dir_has_macosx(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|ent| {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("MacOSX") && name.contains(".sdk")
+    })
+}
+
+/// Create `MacOSX.sdk` and `MacOSXNN.sdk` symlinks like a real CLT install.
+fn ensure_macos_sdk_symlinks(bottle: &Path) -> Result<(), ToolError> {
+    let sdks = bottle.join(GUEST_SDKS_REL);
+    if !sdks.is_dir() {
+        return Ok(());
+    }
+
+    // Collect versioned directories: MacOSX26.5.sdk → (26, 5, "MacOSX26.5.sdk")
+    let mut versioned: Vec<(u32, u32, String)> = Vec::new();
+    let entries = fs::read_dir(&sdks)?;
+    for ent in entries {
+        let ent = ent?;
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if !ent.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some((maj, min)) = parse_macosx_sdk_name(&name) {
+            versioned.push((maj, min, name.into_owned()));
+        }
+    }
+    if versioned.is_empty() {
+        return Ok(());
+    }
+    versioned.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+
+    // Per major: MacOSX26.sdk → highest MacOSX26.x.sdk
+    let mut by_major: Vec<(u32, &str)> = Vec::new();
+    for (maj, _min, name) in &versioned {
+        if by_major.iter().any(|(m, _)| m == maj) {
+            continue;
+        }
+        by_major.push((*maj, name.as_str()));
+    }
+    for (maj, target) in &by_major {
+        let link = sdks.join(format!("MacOSX{maj}.sdk"));
+        // Don't clobber a real directory.
+        // Don't clobber a real directory.
+        if link.is_dir() && !link.is_symlink() {
+            continue;
+        }
+        replace_symlink(&link, target)?;
+    }
+
+    // Default MacOSX.sdk → newest versioned directory.
+    if let Some((_, _, newest)) = versioned.first() {
+        let link = sdks.join("MacOSX.sdk");
+        if !link.is_dir() || link.is_symlink() {
+            replace_symlink(&link, newest)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_macosx_sdk_name(name: &str) -> Option<(u32, u32)> {
+    // MacOSX26.5.sdk or MacOSX15.4.sdk — not MacOSX.sdk / MacOSX26.sdk
+    let rest = name.strip_prefix("MacOSX")?.strip_suffix(".sdk")?;
+    if rest.is_empty() || !rest.contains('.') {
+        return None;
+    }
+    let mut parts = rest.split('.');
+    let maj: u32 = parts.next()?.parse().ok()?;
+    let min: u32 = parts.next()?.parse().ok()?;
+    Some((maj, min))
+}
+
+fn replace_symlink(link: &Path, target: &str) -> Result<(), ToolError> {
+    if link.exists() || link.symlink_metadata().is_ok() {
+        drop(fs::remove_file(link));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(target, link)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (link, target);
+    }
+    Ok(())
 }
 
 fn extract_archive_to_cache(archive: &Path) -> Result<PathBuf, ToolError> {
@@ -160,9 +429,8 @@ fn extract_archive_to_cache(archive: &Path) -> Result<PathBuf, ToolError> {
 
     if is_pkg {
         // Primary: own XAR + pbzx + odc (no p7zip/bsdtar).
-        super::pkg_extract::extract_apple_pkg(archive, &extract_root).map_err(|e| {
-            ToolError::Command(format!("Apple .pkg extract failed: {e}"))
-        })?;
+        super::pkg_extract::extract_apple_pkg(archive, &extract_root)
+            .map_err(|e| ToolError::Command(format!("Apple .pkg extract failed: {e}")))?;
     } else if is_tar {
         extract_tar(archive, &extract_root)?;
     } else {
@@ -258,10 +526,7 @@ fn extract_pkg_bsdtar(archive: &Path, dest: &Path) -> Result<(), ToolError> {
 }
 
 fn dest_has_payload_or_files(dest: &Path) -> bool {
-    dest.join("Payload").is_file()
-        || dest
-            .read_dir()
-            .is_ok_and(|mut d| d.next().is_some())
+    dest.join("Payload").is_file() || dest.read_dir().is_ok_and(|mut d| d.next().is_some())
 }
 
 /// Reject the known p7zip-16 XAR bug: every member hardlinked to Payload size.
@@ -329,10 +594,7 @@ fn peel_nested_packages(root: &Path) -> Result<(), ToolError> {
             continue;
         }
         if let Some(payload) = find_named_file(root, "Payload") {
-            let out = payload
-                .parent()
-                .unwrap_or(root)
-                .join("Payload.extracted");
+            let out = payload.parent().unwrap_or(root).join("Payload.extracted");
             if !out.exists() {
                 fs::create_dir_all(&out)?;
                 extract_payload(&payload, &out)?;
@@ -394,9 +656,10 @@ fn extract_payload_pbzx(payload: &Path, dest: &Path) -> Result<(), ToolError> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| ToolError::Command(format!("cpio: {e}")))?;
-    let mut cpio_in = cpio.stdin.take().ok_or_else(|| {
-        ToolError::Command("cpio produced no stdin for pbzx Payload".into())
-    })?;
+    let mut cpio_in = cpio
+        .stdin
+        .take()
+        .ok_or_else(|| ToolError::Command("cpio produced no stdin for pbzx Payload".into()))?;
 
     let mut chunks = 0_u32;
     loop {
@@ -428,15 +691,16 @@ fn extract_payload_pbzx(payload: &Path, dest: &Path) -> Result<(), ToolError> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                ToolError::Command(format!("xz: {e} (need host xz-utils for pbzx Payload)")
-                )
+                ToolError::Command(format!("xz: {e} (need host xz-utils for pbzx Payload)"))
             })?;
-        let mut xz_in = xz.stdin.take().ok_or_else(|| {
-            ToolError::Command("xz produced no stdin".into())
-        })?;
-        let mut xz_out = xz.stdout.take().ok_or_else(|| {
-            ToolError::Command("xz produced no stdout".into())
-        })?;
+        let mut xz_in = xz
+            .stdin
+            .take()
+            .ok_or_else(|| ToolError::Command("xz produced no stdin".into()))?;
+        let mut xz_out = xz
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Command("xz produced no stdout".into()))?;
 
         // Stream this xz frame into xz(1).
         let mut remaining = xz_len;
@@ -445,9 +709,8 @@ fn extract_payload_pbzx(payload: &Path, dest: &Path) -> Result<(), ToolError> {
             let n = remaining.min(buf.len());
             input
                 .read_exact(
-                    buf.get_mut(..n).ok_or_else(|| {
-                        ToolError::Command("pbzx buffer slice failed".into())
-                    })?,
+                    buf.get_mut(..n)
+                        .ok_or_else(|| ToolError::Command("pbzx buffer slice failed".into()))?,
                 )
                 .map_err(ToolError::Io)?;
             xz_in
@@ -699,11 +962,7 @@ mod tests {
     fn unique(prefix: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "kh-clt-{}-{}-{n}",
-            prefix,
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("kh-clt-{}-{}-{n}", prefix, std::process::id()))
     }
 
     #[test]
@@ -714,5 +973,38 @@ mod tests {
         fs::write(clt.join("usr/bin/git"), b"fake").expect("write");
         assert_eq!(find_clt_root(&root), Some(clt));
         drop(fs::remove_dir_all(&root));
+    }
+
+    #[test]
+    fn parse_sdk_names_and_symlinks() {
+        assert_eq!(parse_macosx_sdk_name("MacOSX26.5.sdk"), Some((26, 5)));
+        assert_eq!(parse_macosx_sdk_name("MacOSX15.4.sdk"), Some((15, 4)));
+        assert_eq!(parse_macosx_sdk_name("MacOSX.sdk"), None);
+        assert_eq!(parse_macosx_sdk_name("MacOSX26.sdk"), None);
+
+        let bottle = unique("sdk-links");
+        let sdks = bottle.join(GUEST_SDKS_REL);
+        fs::create_dir_all(sdks.join("MacOSX26.5.sdk/usr/include")).expect("dirs");
+        fs::write(sdks.join("MacOSX26.5.sdk/usr/include/stdio.h"), b"ok").expect("stdio");
+        fs::create_dir_all(sdks.join("MacOSX15.4.sdk/usr/include")).expect("dirs");
+        fs::write(sdks.join("MacOSX15.4.sdk/usr/include/stdio.h"), b"ok").expect("stdio");
+        ensure_macos_sdk_symlinks(&bottle).expect("links");
+        assert!(bottle_has_macos_sdk(&bottle));
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read_link(sdks.join("MacOSX.sdk")).expect("MacOSX.sdk"),
+                PathBuf::from("MacOSX26.5.sdk")
+            );
+            assert_eq!(
+                fs::read_link(sdks.join("MacOSX26.sdk")).expect("MacOSX26.sdk"),
+                PathBuf::from("MacOSX26.5.sdk")
+            );
+            assert_eq!(
+                fs::read_link(sdks.join("MacOSX15.sdk")).expect("MacOSX15.sdk"),
+                PathBuf::from("MacOSX15.4.sdk")
+            );
+        }
+        drop(fs::remove_dir_all(&bottle));
     }
 }

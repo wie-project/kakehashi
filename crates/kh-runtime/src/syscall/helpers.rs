@@ -261,6 +261,13 @@ pub(crate) const KH_HELPER_REGFREE: u32 = KH_HELPER_BASE | 0x10;
 /// Returns 0 on success; negative errno-ish on failure.
 pub(crate) const KH_HELPER_TLS_CONNECT: u32 = KH_HELPER_BASE | 0x11;
 
+/// Guest main executable path for freestanding `_NSGetExecutablePath`.
+///
+/// `x0` = out buffer VA, `x1` = capacity (incl. NUL). Writes guest absolute
+/// path (e.g. `/Library/Developer/CommandLineTools/usr/bin/clang`). Returns
+/// byte length **including** NUL, or `0` if unset / too small.
+pub(crate) const KH_HELPER_EXECUTABLE_PATH: u32 = KH_HELPER_BASE | 0x12;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -294,6 +301,7 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_REGEXEC => handle_regexec(args),
         KH_HELPER_REGFREE => handle_regfree(args),
         KH_HELPER_TLS_CONNECT => handle_tls_connect(args),
+        KH_HELPER_EXECUTABLE_PATH => handle_executable_path(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
 }
@@ -750,6 +758,31 @@ fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
         name,
         u64::try_from(out.len()).unwrap_or(0),
     )
+}
+
+fn handle_executable_path(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_executable_path";
+    let ptr = args.x0;
+    let Ok(cap) = usize::try_from(args.x1) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if ptr == 0 || cap == 0 || !registry_check_range(ptr, cap, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(path) = crate::process::guest_executable_path() else {
+        // Unset: freestanding falls back (historically soft-git CLT path).
+        return SyscallResult::ok(name, 0);
+    };
+    let bytes = path.as_bytes();
+    if bytes.len().saturating_add(1) > cap {
+        return SyscallResult::err(name, EINVAL);
+    }
+    let mut out = vec![0_u8; bytes.len().saturating_add(1)];
+    if let Some(dst) = out.get_mut(..bytes.len()) {
+        dst.copy_from_slice(bytes);
+    }
+    guest_write(ptr, &out);
+    SyscallResult::ok(name, u64::try_from(out.len()).unwrap_or(0))
 }
 
 fn handle_getenv(args: SyscallArgs) -> SyscallResult {
