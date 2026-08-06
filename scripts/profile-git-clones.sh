@@ -77,7 +77,7 @@ fi
 
 "$KH" run git -- config --global user.email "kh@test.io"
 "$KH" run git -- config --global user.name "kh-profile"
-"$KH" run git -- config --global protocol.version 1
+"$KH" run git -- config --global protocol.version 2
 "$KH" run git -- config --global http.postBuffer 524288000
 
 # name|url|dest_under_/out

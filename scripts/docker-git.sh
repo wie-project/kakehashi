@@ -114,8 +114,8 @@ fi
 
 "$KH" run git -- config --global user.email "kh@test.io"
 "$KH" run git -- config --global user.name "Vladislav"
-# Prefer protocol v1 until freestanding libcurl implements v2 stateless-connect.
-"$KH" run git -- config --global protocol.version 1
+# Default Git protocol v2 (ls-refs / fetch over smart HTTP). v1 still works if set.
+"$KH" run git -- config --global protocol.version 2
 # Large want-lists (full monorepo clones) exceed the default ~1 MiB buffer and
 # switch git remote-curl to CURLOPT_READFUNCTION + chunked POST. Freestanding
 # gathers that path; a high postBuffer keeps the simpler POSTFIELDS path too.

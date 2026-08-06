@@ -36,23 +36,25 @@ See also: [roadmap](roadmap.md), [architecture](architecture.md), [curl](curl.md
 | --- | --- |
 | `capabilities` | **pass** |
 | Helper `list` (protocol v0/v1) | **pass** — refs from GitHub |
+| Protocol **v2** (`ls-refs` / fetch) | **pass** — default in `docker-git.sh` |
 | Host HTTP helper + body + `Content-Type` | **pass** |
-| `git ls-remote https://…` (spawned helper) | **pass** (Docker; protocol v1) |
+| `git ls-remote https://…` (spawned helper) | **pass** (Docker; v1 and v2) |
 | `git clone --depth 1 https://…` | **pass** (Docker; working tree + objects) |
 | `git clone https://…` (full, small repo) | **pass** (Docker; Hello-World; TLS socket path) |
 | `git clone https://…` (full, ~9 MiB pack) | **pass** (Docker; this repo after inflate fix) |
 | `git clone --depth 1` linux kernel | **pass** (Docker; ~279 MiB pack, ~2 GiB tree; path B streaming) |
+| `git clone` facebook/folly (full, v2) | **pass** (Docker; ~97 MiB, ~3k files) |
 
 ```text
 # capabilities
 printf 'capabilities\n\n' | kh run …/git-remote-http -- origin https://…
 # → stateless-connect / fetch / get / …
 
-# list (protocol.version=1 in ~/.gitconfig; v2 returns empty refs by design)
+# list (classic v0/v1 helper path; with protocol.version=2 git uses ls-refs)
 printf 'list\n\n' | kh run …/git-remote-http -- origin https://github.com/octocat/Hello-World.git
 # → @refs/heads/master HEAD / 7fd1a60b… refs/heads/master / …
 
-# full spawn path
+# full spawn path (protocol.version=2 default)
 kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 # → 7fd1a60b…\tHEAD / 7fd1a60b…\trefs/heads/master / …
 
@@ -60,7 +62,7 @@ kh run git -- ls-remote https://github.com/octocat/Hello-World.git
 kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
 # → exit 0; hw/README present
 
-# full clone (small repos; response body ≤ 64 MiB host/guest cap)
+# full clone (TLS path B streaming)
 kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
 # → exit 0; hw-full/README present
 ```
@@ -140,16 +142,19 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     `https unexpectedly said: '<sha> refs/…'` lines after an otherwise green
     clone (e.g. **facebook/folly**: 560 heads+tags). Fix: track closed stdio,
     `host close` on take, `EBADF` on later I/O, re-open via `dup2` onto 0/1/2.
-    Verified: full `clone https://github.com/facebook/folly` under Docker with
-    `protocol.version=1` — exit 0, no `unexpectedly said` flood.
+    Verified: full `clone https://github.com/facebook/folly` under Docker
+    (v1 and v2) — exit 0, no `unexpectedly said` flood.
+15. **Protocol v2** — smart HTTP `Git-Protocol: version=2` + `ls-refs` /
+    `fetch` (via Apple `git-remote-http` `stateless-connect`) works over path B
+    TLS FDs. Verified Docker: `ls-remote`, Hello-World full clone, this repo
+    shallow clone, **facebook/folly** full clone (~75 s, 3075 files); default in
+    `scripts/docker-git.sh` is now `protocol.version=2` (v1 remains if set).
 
 **Polish / still open:** full (non-shallow) clone of multi‑GiB monorepos under
-time budget; protocol v2 `stateless-connect`; push; plain `http://` on the
-socket path. Prefer `protocol.version=1` in guest `~/.gitconfig` until v2 RPC
-is complete. `./scripts/docker-git.sh` forces v1 for that reason. Stage freestanding with **release** dylib
-(`cargo build -p kh-libsystem --release --target aarch64-apple-darwin` then
-`./scripts/stage-libsystem.sh`) so `stage-libsystem` does not pick a stale
-release over a newer debug build.
+time budget; push; plain `http://` on the socket path. Stage freestanding with
+**release** dylib (`cargo build -p kh-libsystem --release --target
+aarch64-apple-darwin` then `./scripts/stage-libsystem.sh`) so `stage-libsystem`
+does not pick a stale release over a newer debug build.
 
 Local G3 remains green. Curl options **tier1** is green after the `fcntl`
 varargs fix.

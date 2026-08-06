@@ -122,8 +122,8 @@ Details and gates: [`docs/curl.md`](docs/curl.md).
 
 ```bash
 kh install xcode-tools   # public swscan; no Apple ID
-# Prefer protocol v1 until v2 RPC is complete:
-git config --global protocol.version 1
+# Default is protocol v2 (also set by scripts/docker-git.sh):
+git config --global protocol.version 2
 
 kh run git -- --version
 kh run git -- ls-remote https://github.com/octocat/Hello-World.git
@@ -138,8 +138,8 @@ See [`docs/git.md`](docs/git.md) for gates (G0–G4). Docker: `scripts/docker-gi
 ### Not a product claim (yet)
 
 Full curl feature set (POST bodies, proxies, HTTP/3 end-to-end, every scheme),
-real Apple Security.framework, full git (push, protocol
-v2), GUI, codesign.
+real Apple Security.framework, full git (push, multi‑GiB monorepo time
+budgets), GUI, codesign.
 
 ## Crates
 
