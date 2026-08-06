@@ -46,7 +46,10 @@ static REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Layout ABI with `kh-runtime::tls` / `errno`:
 /// `magic @ 0`, `errno @ 8`, `pthread_self @ 16`,
 /// `host_tpidr @ 24` / `alt_top @ 32` (host-owned A1 mirrors; guest must not
-/// treat them as ABI for freestanding logic).
+/// treat them as ABI for freestanding logic),
+/// `tsd_vals @ 40` (guest-owned; pointer to per-thread `pthread` TSD array).
+///
+/// Host only reads/writes offsets 0..40; freestanding owns `tsd_vals`.
 #[repr(C, align(16))]
 struct GuestTls {
     magic: u64,
@@ -57,6 +60,9 @@ struct GuestTls {
     host_tpidr: u64,
     /// Host-written hypercall alt stack top.
     alt_top: u64,
+    /// Heap array of [`MAX_KEYS`] `AtomicUsize` TSD values for this thread.
+    /// Null until first `pthread_setspecific` / lazy ensure (main thread).
+    tsd_vals: *mut AtomicUsize,
 }
 
 /// Control block pointed to by guest `pthread_t`.
@@ -269,8 +275,7 @@ pub(crate) unsafe extern "C" fn pthread_once(
             continue;
         }
         // Claim: any other value (incl. Darwin `PTHREAD_ONCE_INIT` magic) → running.
-        if w
-            .compare_exchange(cur, ONCE_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        if w.compare_exchange(cur, ONCE_RUNNING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             if let Some(init) = init_routine {
@@ -472,14 +477,13 @@ pub(crate) unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut c_void) -> c_i
         return EINVAL;
     }
     let w = unsafe { &*mutex_word(mutex) };
-    if w
-        .compare_exchange(
-            MUTEX_UNLOCKED,
-            MUTEX_LOCKED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
-        .is_ok()
+    if w.compare_exchange(
+        MUTEX_UNLOCKED,
+        MUTEX_LOCKED,
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    )
+    .is_ok()
     {
         0
     } else {
@@ -497,14 +501,13 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
     let w = unsafe { &*mutex_word(mutex) };
 
     // Fast path: uncontended.
-    if w
-        .compare_exchange(
-            MUTEX_UNLOCKED,
-            MUTEX_LOCKED,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
-        .is_ok()
+    if w.compare_exchange(
+        MUTEX_UNLOCKED,
+        MUTEX_LOCKED,
+        Ordering::Acquire,
+        Ordering::Relaxed,
+    )
+    .is_ok()
     {
         return 0;
     }
@@ -514,14 +517,13 @@ pub(crate) unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int 
         for _ in 0..64_u32 {
             let cur = w.load(Ordering::Relaxed);
             if cur == MUTEX_UNLOCKED {
-                if w
-                    .compare_exchange(
-                        MUTEX_UNLOCKED,
-                        MUTEX_LOCKED,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
+                if w.compare_exchange(
+                    MUTEX_UNLOCKED,
+                    MUTEX_LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
                 {
                     return 0;
                 }
@@ -649,9 +651,7 @@ fn timespec_now_ns() -> Option<i64> {
     if ret < 0 {
         return None;
     }
-    let sec = i64::from_le_bytes([
-        tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7],
-    ]);
+    let sec = i64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
     let usec = i32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]);
     Some(
         sec.saturating_mul(1_000_000_000)
@@ -743,15 +743,116 @@ pub(crate) unsafe extern "C" fn pthread_cond_signal(cond: *mut c_void) -> c_int 
     0
 }
 
-// ── TSD / self (curl G1; process-global values enough for single-thread path) ─
+// ── TSD / self ──────────────────────────────────────────────────────────────
+//
+// Keys are process-wide; **values are per-thread** (Darwin / POSIX). A single
+// process-global value table races under curl's DNS thread pool + OpenSSL and
+// produced intermittent guest SIGSEGV in `_async_thrdd_item_process` (bad
+// `thrdq_item.item`, often shaped `(aslr_tag << 32) | 0xb`).
 
 const MAX_KEYS: usize = 64;
 /// Next key id (1..=MAX_KEYS). Key 0 is invalid / deleted.
 static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
 static KEY_LIVE: [AtomicBool; MAX_KEYS] = [const { AtomicBool::new(false) }; MAX_KEYS];
-/// Per-key values for the process (main thread). Multi-thread guests need TLS
-/// expansion later; curl `--version` is single-threaded through this surface.
-static TSD_VAL: [AtomicUsize; MAX_KEYS] = [const { AtomicUsize::new(0) }; MAX_KEYS];
+/// Fallback when guest TLS is missing (early boot / no TPIDR). Not used once
+/// each thread has `GuestTls.tsd_vals`.
+static TSD_FALLBACK: [AtomicUsize; MAX_KEYS] = [const { AtomicUsize::new(0) }; MAX_KEYS];
+
+#[inline]
+fn tsd_array_bytes() -> usize {
+    core::mem::size_of::<AtomicUsize>().saturating_mul(MAX_KEYS)
+}
+
+/// Allocate and zero a per-thread TSD value array.
+fn alloc_tsd_array() -> *mut AtomicUsize {
+    let n = tsd_array_bytes();
+    let raw = unsafe { malloc(n) };
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        crate::stdio::bzero(raw, n);
+    }
+    raw.cast::<AtomicUsize>()
+}
+
+#[inline]
+fn free_tsd_array(p: *mut AtomicUsize) {
+    if !p.is_null() {
+        unsafe {
+            free(p.cast::<c_void>());
+        }
+    }
+}
+
+/// Current thread's `GuestTls`, or null if TPIDR unset / magic mismatch.
+fn current_guest_tls() -> *mut GuestTls {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tpidr: u64;
+        // SAFETY: pure register read.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, tpidr_el0",
+                out(reg) tpidr,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if tpidr == 0 {
+            return core::ptr::null_mut();
+        }
+        let base = usize::try_from(tpidr).unwrap_or(0);
+        if base == 0 {
+            return core::ptr::null_mut();
+        }
+        let tls = core::ptr::with_exposed_provenance_mut::<GuestTls>(base);
+        // SAFETY: identity-mapped guest TLS when magic matches.
+        let magic = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*tls).magic)) };
+        if magic != TLS_MAGIC {
+            return core::ptr::null_mut();
+        }
+        tls
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+/// Ensure this thread has a TSD value array; returns base or null on OOM / no TLS.
+fn ensure_thread_tsd_vals() -> *mut AtomicUsize {
+    let tls = current_guest_tls();
+    if tls.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: magic-checked GuestTls for this thread only.
+    let existing = unsafe { (*tls).tsd_vals };
+    if !existing.is_null() {
+        return existing;
+    }
+    let fresh = alloc_tsd_array();
+    if fresh.is_null() {
+        return core::ptr::null_mut();
+    }
+    // Only this thread writes tsd_vals; no atomic needed.
+    unsafe {
+        (*tls).tsd_vals = fresh;
+    }
+    fresh
+}
+
+#[inline]
+fn tsd_value_slot(idx: usize) -> Option<&'static AtomicUsize> {
+    if idx >= MAX_KEYS {
+        return None;
+    }
+    let base = ensure_thread_tsd_vals();
+    if !base.is_null() {
+        // SAFETY: array of MAX_KEYS; idx checked; lives until thread join.
+        return Some(unsafe { &*base.add(idx) });
+    }
+    TSD_FALLBACK.get(idx)
+}
 
 /// C `pthread_key_create` → nlist `_pthread_key_create`.
 #[unsafe(no_mangle)]
@@ -774,7 +875,8 @@ pub(crate) unsafe extern "C" fn pthread_key_create(
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            if let Some(v) = TSD_VAL.get(idx) {
+            // Clear fallback slot; per-thread arrays start zeroed on alloc.
+            if let Some(v) = TSD_FALLBACK.get(idx) {
                 v.store(0, Ordering::Relaxed);
             }
             // SAFETY: caller provided writable key out-param.
@@ -798,9 +900,11 @@ pub(crate) unsafe extern "C" fn pthread_key_delete(key: c_int) -> c_int {
     if let Some(slot) = KEY_LIVE.get(idx) {
         slot.store(false, Ordering::Release);
     }
-    if let Some(v) = TSD_VAL.get(idx) {
+    if let Some(v) = TSD_FALLBACK.get(idx) {
         v.store(0, Ordering::Relaxed);
     }
+    // Per-thread slots for this key are left as-is; next create reuses the
+    // key id only after live=false, and getspecific rejects dead keys.
     0
 }
 
@@ -815,7 +919,7 @@ pub(crate) unsafe extern "C" fn pthread_getspecific(key: c_int) -> *mut c_void {
     if !KEY_LIVE.get(idx).is_some_and(|s| s.load(Ordering::Acquire)) {
         return core::ptr::null_mut();
     }
-    let val = TSD_VAL.get(idx).map_or(0, |v| v.load(Ordering::Acquire));
+    let val = tsd_value_slot(idx).map_or(0, |v| v.load(Ordering::Acquire));
     core::ptr::with_exposed_provenance_mut(val)
 }
 
@@ -830,9 +934,10 @@ pub(crate) unsafe extern "C" fn pthread_setspecific(key: c_int, value: *const c_
     if !KEY_LIVE.get(idx).is_some_and(|s| s.load(Ordering::Acquire)) {
         return EINVAL;
     }
-    if let Some(v) = TSD_VAL.get(idx) {
-        v.store(value.addr(), Ordering::Release);
-    }
+    let Some(slot) = tsd_value_slot(idx) else {
+        return ENOMEM;
+    };
+    slot.store(value.addr(), Ordering::Release);
     0
 }
 
@@ -849,9 +954,8 @@ pub(crate) unsafe extern "C" fn pthread_self() -> *mut c_void {
         core::arch::asm!("mrs {}, tpidr_el0", out(reg) tpidr, options(nomem, nostack, preserves_flags));
     }
     if tpidr != 0 {
-        let tls = core::ptr::with_exposed_provenance::<GuestTls>(
-            usize::try_from(tpidr).unwrap_or(0),
-        );
+        let tls =
+            core::ptr::with_exposed_provenance::<GuestTls>(usize::try_from(tpidr).unwrap_or(0));
         // SAFETY: main TLS page / worker TLS installed by runtime has magic.
         let magic = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*tls).magic)) };
         if magic == TLS_MAGIC {
@@ -894,10 +998,7 @@ pub(crate) unsafe extern "C" fn pthread_setcancelstate(
 
 /// C `pthread_setcanceltype` → nlist `_pthread_setcanceltype` (soft).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn pthread_setcanceltype(
-    _type_: c_int,
-    oldtype: *mut c_int,
-) -> c_int {
+pub(crate) unsafe extern "C" fn pthread_setcanceltype(_type_: c_int, oldtype: *mut c_int) -> c_int {
     if !oldtype.is_null() {
         // SAFETY: optional out-param from guest.
         unsafe {
@@ -976,6 +1077,15 @@ pub(crate) unsafe extern "C" fn pthread_create(
         munmap_anon(stack, STACK_SIZE);
         return EAGAIN;
     }
+    let tsd_vals = alloc_tsd_array();
+    if tsd_vals.is_null() {
+        unsafe {
+            free(tsd_raw);
+            free(raw);
+        }
+        munmap_anon(stack, STACK_SIZE);
+        return EAGAIN;
+    }
     let tsd = tsd_raw.cast::<GuestTls>();
     let t = raw.cast::<KhThread>();
     let pthread_va = u64::try_from(raw.addr()).unwrap_or(0);
@@ -986,6 +1096,7 @@ pub(crate) unsafe extern "C" fn pthread_create(
         (*tsd).pthread_self = pthread_va;
         (*tsd).host_tpidr = 0;
         (*tsd).alt_top = 0;
+        (*tsd).tsd_vals = tsd_vals;
 
         (*t).magic = MAGIC;
         (*t).done = AtomicU32::new(0);
@@ -1018,6 +1129,7 @@ pub(crate) unsafe extern "C" fn pthread_create(
     };
     if ret < 0 {
         trace::note(b"[kh-libsystem] bsdthread_create failed\n");
+        free_tsd_array(tsd_vals);
         unsafe {
             free(tsd_raw);
             free(raw);
@@ -1067,6 +1179,8 @@ pub(crate) unsafe extern "C" fn pthread_join(
     munmap_anon(stack, stack_size);
     unsafe {
         if !tsd.is_null() {
+            free_tsd_array((*tsd).tsd_vals);
+            (*tsd).tsd_vals = core::ptr::null_mut();
             free(tsd.cast::<c_void>());
         }
         free(thread);

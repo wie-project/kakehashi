@@ -17,7 +17,9 @@
 //! offset 16: pthread_self: u64  (guest pthread_t VA, optional)
 //! offset 24: host_tpidr: u64    (host-owned mirror; A1)
 //! offset 32: alt_top: u64       (host-owned mirror; A1)
+//! offset 40: tsd_vals: u64      (guest-owned; per-thread pthread TSD array)
 //! ```
+//! Host only publishes offsets 24/32; freestanding owns `tsd_vals`.
 #![allow(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +39,8 @@ pub const GUEST_TLS_PTHREAD_OFF: usize = 16;
 pub const GUEST_TLS_HOST_TPIDR_OFF: usize = 24;
 /// Hypercall alt-stack top mirror (host-owned).
 pub const GUEST_TLS_ALT_TOP_OFF: usize = 32;
+/// Guest-owned per-thread `pthread` TSD array pointer (freestanding).
+pub const GUEST_TLS_TSD_VALS_OFF: usize = 40;
 
 /// Process-wide main guest TLS VA (for diagnostics / tests).
 static MAIN_GUEST_TLS: AtomicU64 = AtomicU64::new(0);
@@ -409,6 +413,9 @@ pub fn init_guest_tls_block(base: *mut u8, pthread_va: u64) {
         )
         .write(0);
         core::ptr::with_exposed_provenance_mut::<u64>(addr.saturating_add(GUEST_TLS_ALT_TOP_OFF))
+            .write(0);
+        // Freestanding lazily allocates the TSD array; start null.
+        core::ptr::with_exposed_provenance_mut::<u64>(addr.saturating_add(GUEST_TLS_TSD_VALS_OFF))
             .write(0);
     }
 }

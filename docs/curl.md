@@ -46,6 +46,7 @@ Docker, and HTTP GET under UTM.
 | Broader curl CLI | POST, auth, proxies, HTTP/2–3 end-to-end, FTP — implement trace-first only when a gate needs them |
 | `t7_two_urls` SEGV (serial multi-URL + `-o …#1`) | Once seen as guest SIGSEGV in c-ares `_ares_query_dnsrec_cb` (bad callback arg); tier7 + 30× stress now green. Re-open if it returns under full `docker-curl-options.sh all` |
 | tier1 hang (regression) | **fixed** — Darwin `fcntl` is varargs; freestanding fixed 3-arg export dropped `O_NONBLOCK` → multi wakeup-pipe `read` blocked forever. See `fcntl_varargs.c` + guest `O_NONBLOCK` FD flags in runtime. |
+| Flaky guest SIGSEGV rc=139 in `_async_thrdd_item_process` | **fixed** — freestanding `pthread_getspecific` / `setspecific` used a **process-global** value table. Curl 8.21 DNS thread pool + OpenSSL need per-thread TSD; the race corrupted `thrdq_item.item` (bad pointer shaped `(aslr_tag << 32) \| 0xb`). Values now live in `GuestTls.tsd_vals` (per worker / lazy on main). |
 
 ### Recent freestanding polish (UTM crash fix)
 
