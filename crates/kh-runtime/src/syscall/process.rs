@@ -251,6 +251,24 @@ fn inject_kh_env(envp: &[String], kind: ExecEnvKind) -> Vec<CString> {
     {
         out.push(c);
     }
+    // Nested re-exec (e.g. modern `ld` `-lto_library`, clang `-cc1`) drops the
+    // host analysis flags unless we re-inject them. Without this, only the
+    // outermost process dumps `KAKEHASHI_BOUNDARY_STATS`.
+    for key in [
+        "KAKEHASHI_BOUNDARY_STATS",
+        "KAKEHASHI_FUTEX_STATS",
+        "KAKEHASHI_HEAP_STATS",
+    ] {
+        let prefix = format!("{key}=");
+        if envp.iter().any(|e| e.starts_with(&prefix)) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(key)
+            && let Ok(c) = CString::new(format!("{key}={v}"))
+        {
+            out.push(c);
+        }
+    }
     out
 }
 

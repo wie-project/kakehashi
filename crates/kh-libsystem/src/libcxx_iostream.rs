@@ -478,12 +478,168 @@ static mut ZTV_OFSTREAM: [usize; IF_ZTV_WORDS] = [0; IF_ZTV_WORDS];
 #[used]
 static mut ZTT_OFSTREAM: [usize; IF_ZTT_WORDS] = [0; IF_ZTT_WORDS];
 
-// ── ctype facet id + locale soft state ──────────────────────────────────────
+// ── ctype / collate facet ids + soft facet object ───────────────────────────
 
 /// `std::ctype<char>::id` → nlist `__ZNSt3__15ctypeIcE2idE`.
 #[unsafe(export_name = "_ZNSt3__15ctypeIcE2idE")]
 #[used]
 static mut CTYPE_CHAR_ID: [usize; 4] = [0; 4];
+
+/// `std::collate<char>::id` — pulled by live `libLTO` under `-flto`.
+#[unsafe(export_name = "_ZNSt3__17collateIcE2idE")]
+#[used]
+static mut COLLATE_CHAR_ID: [usize; 4] = [0; 4];
+
+/// Soft facet blob: non-null `use_facet` return so live LLVM does not SEGV on
+/// null. Layout: Itanium vptr + facet/refcount soft + **ctype `__tab_`**.
+///
+/// Observed `-flto` SEGV: `LDR W9, [X9, X8, LSL #2]` with `X9=0`, `X8=0x2e`
+/// (ASCII `'.'`) → classic `table[c]` with **null table pointer** inside
+/// soft facet. Fill pad slots with a real 256-entry mask table.
+#[repr(C)]
+struct SoftFacetObj {
+    vptr: usize,
+    /// Soft refcount / base padding; several words also hold `__tab_`-like
+    /// pointers so layout skew still hits a valid table.
+    pad: [usize; 15],
+}
+
+/// libc++-shaped `ctype_base::mask` bits (public ABI values, ASCII "C").
+const M_SPACE: u32 = 1 << 0;
+const M_PRINT: u32 = 1 << 1;
+const M_CNTRL: u32 = 1 << 2;
+const M_UPPER: u32 = 1 << 3;
+const M_LOWER: u32 = 1 << 4;
+const M_ALPHA: u32 = 1 << 5;
+const M_DIGIT: u32 = 1 << 6;
+const M_PUNCT: u32 = 1 << 7;
+const M_XDIGIT: u32 = 1 << 8;
+const M_BLANK: u32 = 1 << 9;
+
+const fn ascii_ctype_mask(c: u8) -> u32 {
+    let mut m = 0_u32;
+    if c == b' ' || c == b'\t' {
+        m |= M_BLANK | M_SPACE;
+    }
+    if c == b'\n' || c == b'\r' || c == b'\x0c' || c == b'\x0b' {
+        m |= M_SPACE;
+    }
+    if c < 0x20 || c == 0x7f {
+        m |= M_CNTRL;
+    }
+    if c >= 0x20 && c < 0x7f {
+        m |= M_PRINT;
+    }
+    if c >= b'A' && c <= b'Z' {
+        m |= M_UPPER | M_ALPHA;
+    }
+    if c >= b'a' && c <= b'z' {
+        m |= M_LOWER | M_ALPHA;
+    }
+    if c >= b'0' && c <= b'9' {
+        m |= M_DIGIT | M_XDIGIT;
+    }
+    if (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F') {
+        m |= M_XDIGIT;
+    }
+    if m & (M_ALPHA | M_DIGIT | M_SPACE | M_CNTRL) == 0 && c > 0x20 && c < 0x7f {
+        m |= M_PUNCT;
+    }
+    m
+}
+
+const fn build_classic_table() -> [u32; 256] {
+    let mut t = [0_u32; 256];
+    let mut i = 0_usize;
+    while i < 256 {
+        t[i] = ascii_ctype_mask(i as u8);
+        i += 1;
+    }
+    t
+}
+
+/// Soft `ctype<char>::classic_table()` payload (256 masks).
+static CLASSIC_CTYPE_TABLE: [u32; 256] = build_classic_table();
+
+/// Itanium vtable: [offset_to_top, typeinfo, d1, d0, virt…] — vptr → slot 2.
+static mut SOFT_FACET_VTABLE: [usize; 24] = [0; 24];
+static mut SOFT_FACET_OBJ: SoftFacetObj = SoftFacetObj {
+    vptr: 0,
+    pad: [0; 15],
+};
+static FACET_READY: AtomicBool = AtomicBool::new(false);
+
+/// Soft virt used for unknown facet methods (safe defaults / identity).
+unsafe extern "C" fn soft_facet_virt(
+    _this: *mut c_void,
+    a: usize,
+    _b: usize,
+    _c: usize,
+    _d: usize,
+    _e: usize,
+    _f: usize,
+    _g: usize,
+) -> usize {
+    // Identity-ish: many ctype transforms return the input char in `a`/`x1`.
+    a
+}
+
+/// Soft `do_is(mask, char)`-shaped: x1=mask, x2=char → nonzero if match.
+unsafe extern "C" fn soft_ctype_do_is_char(
+    _this: *mut c_void,
+    mask: usize,
+    ch: usize,
+    _d: usize,
+    _e: usize,
+    _f: usize,
+    _g: usize,
+    _h: usize,
+) -> usize {
+    let c = (ch & 0xff) as u8;
+    let m = CLASSIC_CTYPE_TABLE[c as usize] as usize;
+    usize::from((m & mask) != 0)
+}
+
+fn ensure_soft_facet() {
+    if FACET_READY.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        let vt = &raw mut SOFT_FACET_VTABLE;
+        let d1 = fn_usize(soft_dtor);
+        let d0 = fn_usize(soft_deleting_dtor);
+        let v = fn_usize_facet(soft_facet_virt);
+        let vis = fn_usize_facet(soft_ctype_do_is_char);
+        (*vt)[0] = 0; // offset_to_top
+        (*vt)[1] = 0; // typeinfo soft null
+        (*vt)[2] = d1;
+        (*vt)[3] = d0;
+        // First data virt often `do_is(mask,char)` on ctype — prefer real mask check.
+        (*vt)[4] = vis;
+        for i in 5..24 {
+            (*vt)[i] = v;
+        }
+        // vptr points at first virtual (index 2).
+        let vptr = core::ptr::addr_of!((*vt)[2]) as usize;
+        SOFT_FACET_OBJ.vptr = vptr;
+        let tab = CLASSIC_CTYPE_TABLE.as_ptr() as usize;
+        // Soft refcount-ish + plant table pointer in every pad word so
+        // `__tab_` at +8/+16/+… still resolves (layout not frozen to one ABI).
+        SOFT_FACET_OBJ.pad[0] = 1;
+        for i in 1..15 {
+            SOFT_FACET_OBJ.pad[i] = tab;
+        }
+        // Common: first field after vptr is table on some builds.
+        SOFT_FACET_OBJ.pad[0] = tab;
+    }
+    FACET_READY.store(true, Ordering::Release);
+}
+
+fn fn_usize_facet(
+    f: unsafe extern "C" fn(*mut c_void, usize, usize, usize, usize, usize, usize, usize) -> usize,
+) -> usize {
+    f as usize
+}
 
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -775,6 +931,8 @@ unsafe fn init_fstream_vtables() {
 // ── ios_base / locale ───────────────────────────────────────────────────────
 
 /// Soft locale — host `sizeof(std::locale)==8` (shared body pointer).
+const LOCALE_SOFT_BODY: usize = 0x0000_4C4F_435F_4B48; // "KH_LOC" tag in low bits
+
 /// `std::locale::locale()` default ctor C1.
 #[unsafe(export_name = "_ZNSt3__16localeC1Ev")]
 pub(crate) unsafe extern "C" fn locale_ctor(this: *mut c_void) {
@@ -784,8 +942,35 @@ pub(crate) unsafe extern "C" fn locale_ctor(this: *mut c_void) {
     }
     unsafe {
         // Non-null fake shared body so null checks pass.
-        this.cast::<usize>().write(0x0000_4C4F_435F_4B48); // soft cookie
+        this.cast::<usize>().write(LOCALE_SOFT_BODY);
     }
+}
+
+/// `std::locale::locale(locale const&)` copy ctor C1.
+///
+/// Observed: modern `ld` under `-flto` enters live `libLTO` which copies
+/// locales; missing symbol exited with freestanding code 127.
+#[unsafe(export_name = "_ZNSt3__16localeC1ERKS0_")]
+pub(crate) unsafe extern "C" fn locale_copy_ctor(this: *mut c_void, other: *const c_void) {
+    ensure_iostream_vtables();
+    if this.is_null() {
+        return;
+    }
+    let body = if other.is_null() {
+        LOCALE_SOFT_BODY
+    } else {
+        unsafe { other.cast::<usize>().read() }
+    };
+    let body = if body == 0 { LOCALE_SOFT_BODY } else { body };
+    unsafe {
+        this.cast::<usize>().write(body);
+    }
+}
+
+/// Complete-object copy ctor (same soft body model).
+#[unsafe(export_name = "_ZNSt3__16localeC2ERKS0_")]
+pub(crate) unsafe extern "C" fn locale_copy_ctor_c2(this: *mut c_void, other: *const c_void) {
+    unsafe { locale_copy_ctor(this, other) }
 }
 
 /// `std::locale::~locale()` D1.
@@ -799,13 +984,65 @@ pub(crate) unsafe extern "C" fn locale_dtor(this: *mut c_void) {
     }
 }
 
-/// `locale::use_facet(id const&)` → null soft (no facets).
+/// `locale::use_facet(id const&)` → soft facet object (never null).
+///
+/// Observed: `-flto` link enters live `libLTO`, which copies locales and calls
+/// `use_facet`; returning null SEGVd at `addr=0`. One soft facet + soft vtable
+/// is enough to pass trivial non-bitcode paths; real facets still on demand.
 #[unsafe(export_name = "_ZNKSt3__16locale9use_facetERNS0_2idE")]
 pub(crate) unsafe extern "C" fn locale_use_facet(
     _this: *const c_void,
     _id: *const c_void,
 ) -> *mut c_void {
-    core::ptr::null_mut()
+    ensure_iostream_vtables();
+    ensure_soft_facet();
+    core::ptr::addr_of_mut!(SOFT_FACET_OBJ).cast::<c_void>()
+}
+
+/// `locale::has_facet(id const&) const` → true (pairs with soft `use_facet`).
+#[unsafe(export_name = "_ZNKSt3__16locale9has_facetERKNS0_2idE")]
+pub(crate) unsafe extern "C" fn locale_has_facet(
+    _this: *const c_void,
+    _id: *const c_void,
+) -> bool {
+    true
+}
+
+/// `locale::name() const` → empty soft string ("C" / `*` not modeled).
+///
+/// libLTO pulls this; return empty `basic_string` by value (AArch64 sret).
+#[unsafe(export_name = "_ZNKSt3__16locale4nameEv")]
+pub(crate) unsafe extern "C" fn locale_name(_this: *const c_void) -> crate::libcxx_string::StringRep {
+    crate::libcxx_string::StringRep::empty()
+}
+
+/// `std::__1::__get_classname(char const*, bool)` — demangle helper for typeinfo.
+///
+/// Observed under `-flto` / live libLTO after soft facets. Soft: return the
+/// mangled name pointer as-is (no demangle); never null when input is non-null.
+#[unsafe(export_name = "_ZNSt3__115__get_classnameEPKcb")]
+pub(crate) unsafe extern "C" fn get_classname(
+    mangled: *const c_char,
+    _trim: bool,
+) -> *const c_char {
+    if mangled.is_null() {
+        // Static empty C string.
+        static EMPTY: [u8; 1] = [0];
+        return EMPTY.as_ptr().cast();
+    }
+    mangled
+}
+
+/// `std::__1::__get_collation_name(char const*)` — collate facet name helper.
+///
+/// Soft: return `"C"` (POSIX default collate) or the input when non-null.
+#[unsafe(export_name = "_ZNSt3__120__get_collation_nameEPKc")]
+pub(crate) unsafe extern "C" fn get_collation_name(name: *const c_char) -> *const c_char {
+    if name.is_null() {
+        static C_LOCALE: &[u8] = b"C\0";
+        return C_LOCALE.as_ptr().cast();
+    }
+    name
 }
 
 /// `ios_base::init(void* sb)`.

@@ -132,24 +132,34 @@ unsafe impl Sync for RuneRange {}
 
 /// Darwin `_RuneLocale` layout used by ctype macros (LP64 arm64).
 ///
-/// Size must match guest expectations when code indexes `__runetype[c]`.
+/// Field offsets must match CLT `runetype.h` / `_DefaultRuneLocale`:
+/// `__runetype` is at **0x3c** (after `invalid_rune` **without** pad). Observed:
+/// modern `ld` `-flto` scans version digits via
+/// `*(uint32_t*)(locale + 0x3c + c*4)` and bit 10 (`_CTYPE_D`). Our old
+/// `_pad0` after `invalid_rune` shifted the table to 0x40 → bit tests read
+/// the wrong words → version string became `N.0.\x18\x03`.
+///
+/// Host `sizeof(_RuneLocale) == 3208` on arm64.
 #[repr(C)]
 struct RuneLocale {
     magic: [u8; 8],
     encoding: [u8; 32],
     sgetrune: *mut core::ffi::c_void,
     sputrune: *mut core::ffi::c_void,
+    /// Offset 56; next field `__runetype` at 60 (0x3c) — **no** padding.
     invalid_rune: i32,
-    _pad0: i32,
     runetype: [u32; CACHED_RUNES],
     maplower: [i32; CACHED_RUNES],
     mapupper: [i32; CACHED_RUNES],
+    /// Pad to 8-byte align for `_RuneRange` (host: mapupper ends 3132, ext @ 3136).
+    _pad_before_ext: i32,
     runetype_ext: RuneRange,
     maplower_ext: RuneRange,
     mapupper_ext: RuneRange,
     variable: *mut core::ffi::c_void,
     variable_len: i32,
-    _pad1: i32,
+    /// Trailing pad to host `sizeof(_RuneLocale) == 3208`.
+    _pad_end: [u8; 12],
 }
 
 // SAFETY: only const data + null fn ptrs; guests read the tables.
@@ -175,10 +185,10 @@ static DEFAULT_RUNE_LOCALE: RuneLocale = RuneLocale {
     sgetrune: core::ptr::null_mut(),
     sputrune: core::ptr::null_mut(),
     invalid_rune: -1,
-    _pad0: 0,
     runetype: build_runetype(),
     maplower: build_maplower(),
     mapupper: build_mapupper(),
+    _pad_before_ext: 0,
     runetype_ext: RuneRange {
         nranges: 0,
         _pad: 0,
@@ -196,8 +206,15 @@ static DEFAULT_RUNE_LOCALE: RuneLocale = RuneLocale {
     },
     variable: core::ptr::null_mut(),
     variable_len: 0,
-    _pad1: 0,
+    _pad_end: [0; 12],
 };
+
+// Compile-time layout gate (CLT arm64 host: sizeof 3208, __runetype @ 0x3c).
+const _: () = assert!(core::mem::size_of::<RuneLocale>() == 3208);
+const _: () = assert!(core::mem::offset_of!(RuneLocale, invalid_rune) == 56);
+const _: () = assert!(core::mem::offset_of!(RuneLocale, runetype) == 0x3c);
+const _: () = assert!(core::mem::offset_of!(RuneLocale, maplower) == 1084);
+const _: () = assert!(core::mem::offset_of!(RuneLocale, runetype_ext) == 3136);
 
 /// Darwin `___maskrune` → nlist `___maskrune` (ctype backend).
 #[unsafe(export_name = "__maskrune")]

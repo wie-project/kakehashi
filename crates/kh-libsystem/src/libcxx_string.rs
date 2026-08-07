@@ -154,6 +154,41 @@ fn assign_bytes(this: *mut c_void, s: *const u8, len: usize) {
     if this.is_null() {
         return;
     }
+    // If `s` aliases this string's current buffer, copy first — `dispose`
+    // would free the source (self-assign / append-from-self / grow edge cases).
+    let alias = !s.is_null()
+        && len > 0
+        && !this.is_null()
+        && {
+            let data = current_data(this);
+            let dlen = current_len(this);
+            let s_addr = s.addr();
+            let d_addr = data.addr();
+            !data.is_null() && s_addr >= d_addr && s_addr < d_addr.saturating_add(dlen.max(1))
+        };
+    if alias {
+        let tmp = unsafe { malloc(len.saturating_add(1)) }.cast::<u8>();
+        if tmp.is_null() {
+            trace::force_note(b"[kh-libsystem] assign alias OOM\n");
+            unsafe {
+                crate::process::exit_now(1);
+            }
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(s, tmp, len);
+            tmp.add(len).write(0);
+        }
+        dispose(this);
+        if len <= SSO_CAP {
+            set_short(this, tmp, len);
+        } else {
+            set_long(this, tmp, len);
+        }
+        unsafe {
+            free(tmp.cast());
+        }
+        return;
+    }
     dispose(this);
     if len <= SSO_CAP {
         set_short(this, s, len);
@@ -405,24 +440,159 @@ pub(crate) unsafe extern "C" fn string_reserve(this: *mut c_void, res: usize) {
     }
 }
 
-/// `__grow_by`
+/// `__grow_by(old_cap, delta_cap, old_sz, n_copy, n_del, n_add)`
+///
+/// Matches Apple libc++ ABIv1 dylib export (see SDK `string`):
+/// - allocate new long buffer with growth;
+/// - copy prefix `n_copy`, leave hole of `n_add`, copy tail after `n_del`;
+/// - set long pointer + capacity;
+/// - **does not set size** (caller / `__grow_by_without_replace` does).
+///
+/// Previous soft only `reserve()`'d — wrong layout for insert/replace and
+/// short→long growth used by inlined `push_back` when building LTO strings.
 #[unsafe(export_name = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__grow_byEmmmmmm")]
 pub(crate) unsafe extern "C" fn string_grow_by(
     this: *mut c_void,
-    _old_cap: usize,
+    old_cap: usize,
     delta_cap: usize,
     old_sz: usize,
     n_copy: usize,
     n_del: usize,
     n_add: usize,
 ) {
-    let new_sz = old_sz.saturating_sub(n_del).saturating_add(n_add);
-    let want = old_sz
-        .saturating_add(delta_cap)
-        .max(new_sz)
-        .max(n_copy.saturating_add(n_add));
+    if this.is_null() {
+        return;
+    }
+    let n_copy = n_copy.min(old_sz);
+    let after_del = old_sz.saturating_sub(n_copy).saturating_sub(n_del);
+    // Capacity growth: max(old+delta, 2*old), then +1 for NUL slot (libc++).
+    let mut rec = old_cap.saturating_add(delta_cap).max(old_cap.saturating_mul(2));
+    rec = rec
+        .max(n_copy.saturating_add(n_add).saturating_add(after_del))
+        .max(SSO_CAP);
+    // Stored long cap is allocation count including NUL (capacity()+1).
+    let mut alloc_count = rec.saturating_add(1).max(2);
+    if alloc_count % 2 == 1 {
+        alloc_count = alloc_count.saturating_add(1);
+    }
+
+    let was_long = is_long(this);
+    let old_ptr = current_data(this);
+    let p = unsafe { malloc(alloc_count) }.cast::<u8>();
+    if p.is_null() {
+        trace::force_note(b"[kh-libsystem] __grow_by OOM\n");
+        unsafe {
+            crate::process::exit_now(1);
+        }
+    }
     unsafe {
-        string_reserve(this, want);
+        if n_copy > 0 && !old_ptr.is_null() {
+            ptr::copy_nonoverlapping(old_ptr, p, n_copy);
+        }
+        // Hole [n_copy, n_copy+n_add) left for caller; zero so accidental
+        // reads are NULs not freelist junk.
+        if n_add > 0 {
+            ptr::write_bytes(p.add(n_copy), 0, n_add);
+        }
+        if after_del > 0 && !old_ptr.is_null() {
+            let src_off = n_copy.saturating_add(n_del);
+            let dst_off = n_copy.saturating_add(n_add);
+            ptr::copy_nonoverlapping(old_ptr.add(src_off), p.add(dst_off), after_del);
+        }
+        // NUL after current logical content (caller may extend into hole).
+        let provisional = n_copy.saturating_add(after_del);
+        if provisional < alloc_count {
+            p.add(provisional).write(0);
+        }
+    }
+    if was_long {
+        let old_data = long_data(this);
+        // Only free if it was a real long allocation (old_cap+1 != min short).
+        // libc++: if (__old_cap + 1 != __min_cap) deallocate.
+        // SSO_CAP+1 == 23 is the short buffer size in elements with NUL.
+        if !old_data.is_null() && old_cap.saturating_add(1) != SSO_CAP.saturating_add(1) {
+            unsafe {
+                free(old_data.cast());
+            }
+        }
+    }
+    // Install long rep: data*, size UNCHANGED (ABI), cap|FLAG.
+    // Size field may be garbage if we were short; caller must set it.
+    unsafe {
+        this.cast::<*mut u8>().write(p);
+        // Keep existing size word if already long; if short, write old_sz as a
+        // safe provisional (callers that use without_replace overwrite anyway).
+        if !was_long {
+            this.cast::<usize>().add(1).write(old_sz);
+        }
+        this.cast::<usize>().add(2).write(alloc_count | LONG_FLAG);
+    }
+}
+
+/// `__grow_by_and_replace(old_cap, delta_cap, old_sz, n_copy, n_del, n_add, new_stuff)`
+///
+/// Like `__grow_by` but also copies `n_add` chars from `new_stuff` into the hole
+/// and sets size = n_copy + n_add + tail. Exported by Apple libc++ ABIv1.
+#[unsafe(export_name = "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE21__grow_by_and_replaceEmmmmmmPKc")]
+pub(crate) unsafe extern "C" fn string_grow_by_and_replace(
+    this: *mut c_void,
+    old_cap: usize,
+    delta_cap: usize,
+    old_sz: usize,
+    n_copy: usize,
+    n_del: usize,
+    n_add: usize,
+    new_stuff: *const c_char,
+) {
+    if this.is_null() {
+        return;
+    }
+    let n_copy = n_copy.min(old_sz);
+    let after_del = old_sz.saturating_sub(n_copy).saturating_sub(n_del);
+    let new_sz = n_copy.saturating_add(n_add).saturating_add(after_del);
+    let mut rec = old_cap.saturating_add(delta_cap).max(old_cap.saturating_mul(2));
+    rec = rec.max(new_sz).max(SSO_CAP);
+    let mut alloc_count = rec.saturating_add(1).max(2);
+    if alloc_count % 2 == 1 {
+        alloc_count = alloc_count.saturating_add(1);
+    }
+    let was_long = is_long(this);
+    let old_ptr = current_data(this);
+    let p = unsafe { malloc(alloc_count) }.cast::<u8>();
+    if p.is_null() {
+        trace::force_note(b"[kh-libsystem] __grow_by_and_replace OOM\n");
+        unsafe {
+            crate::process::exit_now(1);
+        }
+    }
+    unsafe {
+        if n_copy > 0 && !old_ptr.is_null() {
+            ptr::copy_nonoverlapping(old_ptr, p, n_copy);
+        }
+        if n_add > 0 && !new_stuff.is_null() {
+            ptr::copy_nonoverlapping(new_stuff.cast::<u8>(), p.add(n_copy), n_add);
+        } else if n_add > 0 {
+            ptr::write_bytes(p.add(n_copy), 0, n_add);
+        }
+        if after_del > 0 && !old_ptr.is_null() {
+            let src_off = n_copy.saturating_add(n_del);
+            let dst_off = n_copy.saturating_add(n_add);
+            ptr::copy_nonoverlapping(old_ptr.add(src_off), p.add(dst_off), after_del);
+        }
+        p.add(new_sz).write(0);
+    }
+    if was_long {
+        let old_data = long_data(this);
+        if !old_data.is_null() && old_cap.saturating_add(1) != SSO_CAP.saturating_add(1) {
+            unsafe {
+                free(old_data.cast());
+            }
+        }
+    }
+    unsafe {
+        this.cast::<*mut u8>().write(p);
+        this.cast::<usize>().add(1).write(new_sz);
+        this.cast::<usize>().add(2).write(alloc_count | LONG_FLAG);
     }
 }
 

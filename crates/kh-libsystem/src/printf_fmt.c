@@ -455,3 +455,202 @@ int _simple_vsprintf(void *h, const char *fmt, va_list ap) {
   words[2] = len;
   return n;
 }
+
+/* ── sscanf / vsscanf (Apple arm64 va_list — Rust fixed-arg ABI was wrong) ──
+ *
+ * Observed: modern `ld` `-flto` parses platform versions via sscanf
+ * ("%u.%u.%u"). The Rust soft sscanf took a0..a3 as fixed args; the C
+ * caller uses true variadic ABI → wrong outs / n=0 → version string
+ * '15.0.\x18\x03' / "malformed version number".
+ */
+static int is_space_c(unsigned char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static int parse_uint(const char *s, unsigned *out, unsigned base) {
+  int i = 0;
+  unsigned acc = 0;
+  int n = 0;
+  if (!s || !out)
+    return 0;
+  if (s[0] == '+' || s[0] == '-')
+    return 0; /* unsigned path: no sign for version fields */
+  for (;;) {
+    unsigned char c = (unsigned char)s[i];
+    unsigned d;
+    if (c >= '0' && c <= '9')
+      d = (unsigned)(c - '0');
+    else if (base == 16 && c >= 'a' && c <= 'f')
+      d = (unsigned)(c - 'a' + 10);
+    else if (base == 16 && c >= 'A' && c <= 'F')
+      d = (unsigned)(c - 'A' + 10);
+    else
+      break;
+    if (d >= base)
+      break;
+    acc = acc * base + d;
+    i++;
+    n++;
+    if (n > 10)
+      break;
+  }
+  if (n == 0)
+    return 0;
+  *out = acc;
+  return i;
+}
+
+static int parse_int_signed(const char *s, int *out) {
+  int i = 0;
+  int sign = 1;
+  unsigned u = 0;
+  int n;
+  if (!s || !out)
+    return 0;
+  if (s[0] == '+' || s[0] == '-') {
+    if (s[0] == '-')
+      sign = -1;
+    i = 1;
+  }
+  n = parse_uint(s + i, &u, 10);
+  if (n == 0)
+    return 0;
+  *out = sign < 0 ? -(int)u : (int)u;
+  return i + n;
+}
+
+static int vsscanf_impl(const char *s, const char *fmt, va_list ap) {
+  size_t si = 0;
+  size_t fi = 0;
+  int assigned = 0;
+  if (!s || !fmt)
+    return -1;
+  for (;;) {
+    unsigned char f = (unsigned char)fmt[fi];
+    if (f == 0)
+      break;
+    if (f == '%') {
+      unsigned char spec;
+      int suppress = 0;
+      fi++;
+      if (fmt[fi] == '*') {
+        suppress = 1;
+        fi++;
+      }
+      /* skip width */
+      while (fmt[fi] >= '0' && fmt[fi] <= '9')
+        fi++;
+      /* length modifiers */
+      if (fmt[fi] == 'h') {
+        fi++;
+        if (fmt[fi] == 'h')
+          fi++;
+      } else if (fmt[fi] == 'l') {
+        fi++;
+        if (fmt[fi] == 'l')
+          fi++;
+      } else if (fmt[fi] == 'z' || fmt[fi] == 't' || fmt[fi] == 'j') {
+        fi++;
+      }
+      spec = (unsigned char)fmt[fi];
+      if (spec == 0)
+        break;
+      fi++;
+      while (is_space_c((unsigned char)s[si]))
+        si++;
+      if (spec == '%') {
+        if ((unsigned char)s[si] != '%')
+          break;
+        si++;
+        continue;
+      }
+      if (spec == 'd' || spec == 'i') {
+        int v = 0;
+        int n = parse_int_signed(s + si, &v);
+        if (n == 0)
+          break;
+        si += (size_t)n;
+        if (!suppress) {
+          int *p = va_arg(ap, int *);
+          if (p)
+            *p = v;
+          assigned++;
+        }
+        continue;
+      }
+      if (spec == 'u' || spec == 'x' || spec == 'X' || spec == 'o') {
+        unsigned base = spec == 'u' ? 10 : (spec == 'o' ? 8 : 16);
+        unsigned v = 0;
+        int n = parse_uint(s + si, &v, base);
+        if (n == 0)
+          break;
+        si += (size_t)n;
+        if (!suppress) {
+          unsigned *p = va_arg(ap, unsigned *);
+          if (p)
+            *p = v;
+          assigned++;
+        }
+        continue;
+      }
+      if (spec == 's') {
+        char *dst = suppress ? 0 : va_arg(ap, char *);
+        size_t n = 0;
+        if ((unsigned char)s[si] == 0)
+          break;
+        while (s[si] && !is_space_c((unsigned char)s[si])) {
+          if (dst && n < 255)
+            dst[n] = s[si];
+          n++;
+          si++;
+        }
+        if (n == 0)
+          break;
+        if (dst)
+          dst[n < 255 ? n : 255] = 0;
+        if (!suppress)
+          assigned++;
+        continue;
+      }
+      if (spec == 'c') {
+        if ((unsigned char)s[si] == 0)
+          break;
+        if (!suppress) {
+          char *p = va_arg(ap, char *);
+          if (p)
+            *p = s[si];
+          assigned++;
+        }
+        si++;
+        continue;
+      }
+      /* unsupported conversion */
+      break;
+    }
+    if (is_space_c(f)) {
+      while (is_space_c((unsigned char)fmt[fi]))
+        fi++;
+      while (is_space_c((unsigned char)s[si]))
+        si++;
+      continue;
+    }
+    if ((unsigned char)s[si] != f)
+      break;
+    si++;
+    fi++;
+  }
+  return assigned;
+}
+
+int vsscanf(const char *s, const char *fmt, va_list ap) {
+  return vsscanf_impl(s, fmt, ap);
+}
+
+int sscanf(const char *s, const char *fmt, ...) {
+  va_list ap;
+  int n;
+  va_start(ap, fmt);
+  n = vsscanf_impl(s, fmt, ap);
+  va_end(ap);
+  return n;
+}

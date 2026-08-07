@@ -61,6 +61,8 @@ fn main() {
         "_fprintf",
         "_vfprintf",
         "_putchar",
+        "_sscanf",
+        "_vsscanf",
         "___snprintf_chk",
         "___vsnprintf_chk",
         "___assert_rtn",

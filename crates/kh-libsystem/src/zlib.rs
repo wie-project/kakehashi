@@ -556,6 +556,104 @@ pub(crate) unsafe extern "C" fn compressBound(source_len: u64) -> u64 {
         .saturating_add(12)
 }
 
+/// C `uncompress` → nlist `_uncompress` (zlib one-shot inflate).
+///
+/// libLTO imports this for some bitcode/object paths. Missing symbol would
+/// bind to `kh_missing_symbol` (exit 127); provide a real soft.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn uncompress(
+    dest: *mut u8,
+    dest_len: *mut u64,
+    source: *const u8,
+    source_len: u64,
+) -> c_int {
+    if dest.is_null() || dest_len.is_null() || source.is_null() {
+        return Z_STREAM_ERROR;
+    }
+    let cap = unsafe { *dest_len } as usize;
+    let src_n = source_len as usize;
+    if src_n == 0 {
+        unsafe {
+            *dest_len = 0;
+        }
+        return Z_OK;
+    }
+    let src = unsafe { core::slice::from_raw_parts(source, src_n) };
+    use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
+    let decoded = match decompress_to_vec_zlib(src) {
+        Ok(v) => v,
+        Err(_) => match decompress_to_vec(src) {
+            Ok(v) => v,
+            Err(_) => return Z_DATA_ERROR,
+        },
+    };
+    if decoded.len() > cap {
+        unsafe {
+            *dest_len = decoded.len() as u64;
+        }
+        return Z_BUF_ERROR;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(decoded.as_ptr(), dest, decoded.len());
+        *dest_len = decoded.len() as u64;
+    }
+    Z_OK
+}
+
+/// C `compress2` → nlist `_compress2` (zlib one-shot deflate with level).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn compress2(
+    dest: *mut u8,
+    dest_len: *mut u64,
+    source: *const u8,
+    source_len: u64,
+    level: c_int,
+) -> c_int {
+    if dest.is_null() || dest_len.is_null() || source.is_null() {
+        return Z_STREAM_ERROR;
+    }
+    let cap = unsafe { *dest_len } as usize;
+    let src_n = source_len as usize;
+    if src_n == 0 {
+        unsafe {
+            *dest_len = 0;
+        }
+        return Z_OK;
+    }
+    let src = unsafe { core::slice::from_raw_parts(source, src_n) };
+    let lvl = if level == Z_DEFAULT_COMPRESSION {
+        6
+    } else {
+        level.clamp(0, 9) as u8
+    };
+    use miniz_oxide::deflate::compress_to_vec_zlib;
+    let encoded = compress_to_vec_zlib(src, lvl);
+    if encoded.len() > cap {
+        unsafe {
+            *dest_len = encoded.len() as u64;
+        }
+        return Z_BUF_ERROR;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(encoded.as_ptr(), dest, encoded.len());
+        *dest_len = encoded.len() as u64;
+    }
+    Z_OK
+}
+
+/// C `compress` → nlist `_compress` (default-level compress2).
+///
+/// Named `zlib_compress` so it does not shadow `miniz_oxide::deflate::core::compress`.
+#[unsafe(export_name = "compress")]
+pub(crate) unsafe extern "C" fn zlib_compress(
+    dest: *mut u8,
+    dest_len: *mut u64,
+    source: *const u8,
+    source_len: u64,
+) -> c_int {
+    unsafe { compress2(dest, dest_len, source, source_len, Z_DEFAULT_COMPRESSION) }
+}
+
 /// C `zError` → nlist `_zError`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn zError(err: c_int) -> *const c_char {
