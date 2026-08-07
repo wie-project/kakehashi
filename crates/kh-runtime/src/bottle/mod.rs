@@ -49,8 +49,8 @@ pub use manage::{
 };
 pub use path::{
     PathError, bottle_openat_rel, bottle_root, guest_cwd_string, host_path_to_guest, read_c_bytes,
-    read_c_string, repair_ld_liblib_join, set_bottle_root, translate_path,
-    translate_path_with_root,
+    read_c_string, repair_ld_guest_path, repair_ld_liblib_join, repair_ld_syslibroot_join,
+    set_bottle_root, translate_path, translate_path_with_root,
 };
 pub use registry::{
     active_file_path, clear_active, config_dir, data_dir, default_bottle_path, read_active,

@@ -66,6 +66,57 @@ pub fn repair_ld_liblib_join(guest: &str) -> Option<String> {
     Some(out)
 }
 
+/// Repair `-syslibroot $SDK` joins that drop `/` after the SDK root.
+///
+/// Observed under freestanding (G5): modern `ld` probes
+/// `…/MacOSX.sdkusr/lib` instead of `…/MacOSX.sdk/usr/lib` (and similarly
+/// `…sdkLibrary/…`, `…sdkSystem/…`). Host inserts the slash; until freestanding
+/// path/string join matches, open/access/stat retry with `/` after `.sdk`.
+#[must_use]
+pub fn repair_ld_syslibroot_join(guest: &str) -> Option<String> {
+    let bytes = guest.as_bytes();
+    let mut i = 0_usize;
+    while i.saturating_add(4) <= bytes.len() {
+        if bytes.get(i..i.saturating_add(4)) == Some(b".sdk") {
+            let after = i.saturating_add(4);
+            if let Some(&c) = bytes.get(after)
+                && c != b'/'
+            {
+                let mut out = String::with_capacity(guest.len().saturating_add(1));
+                out.push_str(&guest[..after]);
+                out.push('/');
+                out.push_str(&guest[after..]);
+                return Some(out);
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    None
+}
+
+/// Apply freestanding `ld` path-join repairs (may chain).
+///
+/// Order matters: a probe can be both `…sdkusr/liblibSystem.tbd` (missing `/`
+/// after `.sdk` **and** `lib`+`libName`). Apply each rewrite that matches so
+/// the final path is `…/MacOSX.sdk/usr/lib/libSystem.tbd`.
+#[must_use]
+pub fn repair_ld_guest_path(guest: &str) -> Option<String> {
+    let mut cur = guest.to_string();
+    let mut changed = false;
+    // Fixed-point: each step inserts at most one `/`; two bug classes max today.
+    for _ in 0..4 {
+        let next = repair_ld_liblib_join(&cur).or_else(|| repair_ld_syslibroot_join(&cur));
+        match next {
+            Some(p) if p != cur => {
+                cur = p;
+                changed = true;
+            }
+            _ => break,
+        }
+    }
+    changed.then_some(cur)
+}
+
 /// Pure translation helper (testable without process globals).
 pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<PathBuf, PathError> {
     if guest.is_empty() {
@@ -351,6 +402,43 @@ mod tests {
     }
 
     #[test]
+    fn repair_ld_syslibroot_join_inserts_slash_after_sdk() {
+        assert_eq!(
+            repair_ld_syslibroot_join("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdkusr/lib")
+                .as_deref(),
+            Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib")
+        );
+        assert_eq!(
+            repair_ld_syslibroot_join(
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdkSystem/Library/Frameworks"
+            )
+            .as_deref(),
+            Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks")
+        );
+        assert_eq!(
+            repair_ld_syslibroot_join(
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib"
+            ),
+            None
+        );
+        assert_eq!(
+            repair_ld_guest_path(
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/liblibSystem.tbd"
+            )
+            .as_deref(),
+            Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libSystem.tbd")
+        );
+        // Both bugs stacked: dropped `/` after `.sdk` and `lib`+`libName`.
+        assert_eq!(
+            repair_ld_guest_path(
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdkusr/liblibSystem.tbd"
+            )
+            .as_deref(),
+            Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libSystem.tbd")
+        );
+    }
+
+    #[test]
     fn absolute_under_bottle() {
         let root = Path::new("/opt/bottle");
         let host = translate_path_with_root(Some(root), "/usr/lib/libSystem.B.dylib")
@@ -422,17 +510,15 @@ mod tests {
 
     #[test]
     fn bridge_volumes_linux_to_host() {
-        let host = translate_path_with_root(Some(Path::new("/opt/bottle")), "/Volumes/linux/home/a")
-            .expect("bridge");
+        let host =
+            translate_path_with_root(Some(Path::new("/opt/bottle")), "/Volumes/linux/home/a")
+                .expect("bridge");
         assert_eq!(host, PathBuf::from("/home/a"));
     }
 
     #[test]
     fn bottle_openat_rel_uses_dirfd_when_configured() {
-        let tmp = std::env::temp_dir().join(format!(
-            "kh-b1-openat-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kh-b1-openat-{}", std::process::id()));
         drop(std::fs::remove_dir_all(&tmp));
         std::fs::create_dir_all(tmp.join("usr/lib")).expect("mkdir");
         set_bottle_root(Some(tmp.clone()));

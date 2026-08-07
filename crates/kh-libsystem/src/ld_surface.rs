@@ -506,37 +506,51 @@ static mut STRTOK_SAVE: *mut c_char = core::ptr::null_mut();
 const STRTOK_WALK_MAX: usize = 1 << 20;
 
 /// Live guest C-string pointer: non-null and outside Darwin PAGEZERO.
+///
+/// Same barrier shape as `curl::easy_from` (explicit `is_null` + PAGEZERO) so
+/// CodeQL `rust/access-invalid-pointer` sees a NotNullCheckBarrier at each use.
 #[inline]
 fn strtok_addr_ok(p: *const c_char) -> bool {
-    !p.is_null() && crate::stdio::ptr_usable(p.cast())
+    !p.is_null() && p.addr() >= crate::stdio::PAGEZERO_END
 }
 
-/// Load one byte from a validated guest C-string address.
+/// Load one byte from a guest C-string address without forming a Rust reference.
+///
+/// Uses `copy_nonoverlapping` into a stack local (not `as_ref` / `*p`) so we never
+/// create `&T` over an untrusted C buffer, and the null/PAGEZERO checks sit in
+/// the same function as the access (CodeQL barrier).
 ///
 /// # Safety
-/// `p` must satisfy `strtok_addr_ok` and point into a live allocation for at
-/// least one `c_char` (caller's NUL-terminated buffer contract).
+/// After the address checks pass, `p` must point into a live allocation for at
+/// least one `c_char` (libc `strtok` NUL-terminated buffer contract).
 #[inline]
 unsafe fn strtok_load(p: *const c_char) -> Option<c_char> {
-    if !strtok_addr_ok(p) {
+    // NotNullCheckBarrier: keep both checks inline (do not fold through a helper
+    // alone at the deref site — CodeQL does not always track that).
+    if p.is_null() || p.addr() < crate::stdio::PAGEZERO_END {
         return None;
     }
-    // SAFETY: address checked; live byte by caller contract.
-    Some(unsafe { core::ptr::read(p) })
+    let mut b: c_char = 0;
+    // SAFETY: null + PAGEZERO rejected; one-byte copy from caller's live C string.
+    unsafe {
+        core::ptr::copy_nonoverlapping(p, core::ptr::addr_of_mut!(b), 1);
+    }
+    Some(b)
 }
 
-/// Store one byte at a validated guest C-string address.
+/// Store one byte at a guest C-string address without forming a Rust reference.
 ///
 /// # Safety
 /// Same as [`strtok_load`], plus the location must be mutable.
 #[inline]
 unsafe fn strtok_store(p: *mut c_char, v: c_char) -> bool {
-    if !strtok_addr_ok(p) {
+    if p.is_null() || p.addr() < crate::stdio::PAGEZERO_END {
         return false;
     }
-    // SAFETY: address checked; live mutable byte by caller contract.
+    let b = v;
+    // SAFETY: null + PAGEZERO rejected; one-byte copy into caller's live buffer.
     unsafe {
-        core::ptr::write(p, v);
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(b), p, 1);
     }
     true
 }
@@ -796,7 +810,12 @@ pub(crate) unsafe extern "C" fn truncate(path: *const c_char, length: i64) -> c_
     0
 }
 
-/// `mkdtemp` — soft: return template unchanged after filling XXXXXX with digits.
+/// `mkdtemp` — fill trailing `XXXXXX`, create the directory (0700), return path.
+///
+/// Observed: modern `ld` `-lto_library` uses `/tmp/ld-support-XXXXXX` then
+/// joins `libLTO.dylib`. The old soft path only rewrote X's and **never
+/// mkdir'd**, so later path joins saw a non-directory and wedged on
+/// access/stat of glued names like `/tmpld-support-…libLTO.dylib`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mkdtemp(template: *mut c_char) -> *mut c_char {
     if template.is_null() {
@@ -807,26 +826,99 @@ pub(crate) unsafe extern "C" fn mkdtemp(template: *mut c_char) -> *mut c_char {
         errno::set_errno(EINVAL);
         return core::ptr::null_mut();
     }
-    unsafe {
-        let base = template.add(len - 6);
-        let mut i = 0_usize;
-        while i < 6 {
-            if base.add(i).read().cast_unsigned() != b'X' {
-                errno::set_errno(EINVAL);
-                return core::ptr::null_mut();
-            }
-            let digit = b'0'.wrapping_add(u8::try_from(i % 10).unwrap_or(0));
-            base.add(i).write(digit.cast_signed());
-            i = i.saturating_add(1);
+    let xs = unsafe { template.add(len.saturating_sub(6)) };
+    for i in 0..6 {
+        if unsafe { xs.add(i).read() }.cast_unsigned() != b'X' {
+            errno::set_errno(EINVAL);
+            return core::ptr::null_mut();
         }
-        // mkdir soft: just claim success without creating (linker may not need).
     }
-    template
+    // Same alphabet / LCG shape as freestanding `mkstemp`.
+    const ALPH: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut state = template.addr().wrapping_mul(0x9E37_79B9).wrapping_add(len);
+    for _attempt in 0..256 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let mut s = state;
+        for i in 0..6 {
+            let idx = s % 62;
+            let ch = ALPH.get(idx).copied().unwrap_or(b'0');
+            unsafe {
+                xs.add(i).write(ch.cast_signed());
+            }
+            s >>= 6;
+        }
+        // Darwin mkdir mode is often 0700 for mkdtemp.
+        let rc = unsafe { crate::posix::mkdir(template, 0o700) };
+        if rc == 0 {
+            return template;
+        }
+        // Retry only on EEXIST.
+        if errno::get_errno() != 17 {
+            return core::ptr::null_mut();
+        }
+    }
+    errno::set_errno(17); // EEXIST
+    core::ptr::null_mut()
 }
 
-/// Darwin `mkpath_np` — soft success.
+/// Darwin `mkpath_np` — create every path component (`mkdir -p` style).
+///
+/// Observed: modern `ld` `-lto_library` builds `/tmp/ld-support-<pid>/libLTO.dylib`
+/// via `mkpath_np` then waits for the tree. Soft always-0 never created the
+/// dir → infinite access/stat loop on a missing temp path.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn mkpath_np(_path: *const c_char, _mode: u16) -> c_int {
+pub(crate) unsafe extern "C" fn mkpath_np(path: *const c_char, mode: u16) -> c_int {
+    if path.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let len = unsafe { strlen(path) };
+    if len == 0 || len >= 1024 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // Copy to mutable buffer so we can insert NULs at each `/`.
+    let mut buf = [0_u8; 1024];
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.cast::<u8>(), buf.as_mut_ptr(), len);
+    }
+    buf[len] = 0;
+    let mode_i = c_int::from(mode);
+    // Walk components: for `/a/b/c` create `/a`, `/a/b`, `/a/b/c`.
+    let mut i = 0_usize;
+    // Skip leading slashes but keep absolute root.
+    while i < len && buf[i] == b'/' {
+        i = i.saturating_add(1);
+    }
+    while i < len {
+        // Find next slash.
+        let mut j = i;
+        while j < len && buf[j] != b'/' {
+            j = j.saturating_add(1);
+        }
+        // Temporarily terminate at j (or end).
+        let saved = buf[j];
+        buf[j] = 0;
+        let cpath = buf.as_ptr().cast::<c_char>();
+        let rc = unsafe { crate::posix::mkdir(cpath, mode_i) };
+        let err = if rc != 0 {
+            errno::get_errno()
+        } else {
+            0
+        };
+        buf[j] = saved;
+        if rc != 0 && err != 17 {
+            // EEXIST is fine; anything else fails the whole path.
+            return -1;
+        }
+        // Skip slash run.
+        i = j;
+        while i < len && buf[i] == b'/' {
+            i = i.saturating_add(1);
+        }
+    }
     0
 }
 

@@ -29,12 +29,12 @@ pub(crate) fn handle_access(args: SyscallArgs) -> SyscallResult {
     match access_path(&path) {
         Ok(()) => SyscallResult::ok(name, 0),
         Err(e) => {
-            // G5: modern ld may probe `…/liblibName.ext` (missing `/`); retry.
+            // G5: modern ld may probe paths with a dropped `/` (liblib, .sdkusr).
             if e == ENOENT
-                && let Some(fixed) = bottle::repair_ld_liblib_join(&path)
+                && let Some(fixed) = bottle::repair_ld_guest_path(&path)
                 && access_path(&fixed).is_ok()
             {
-                tracing::debug!(guest = %path, fixed = %fixed, "access ok (liblib repair)");
+                tracing::debug!(guest = %path, fixed = %fixed, "access ok (ld path repair)");
                 return SyscallResult::ok(name, 0);
             }
             SyscallResult::err(name, e)
@@ -86,10 +86,15 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
     match path_stat_into(&path, no_follow, args.x1, name) {
         Ok(r) => r,
         Err(ENOENT) => {
-            if let Some(fixed) = bottle::repair_ld_liblib_join(&path) {
+            if let Some(fixed) = bottle::repair_ld_guest_path(&path) {
                 match path_stat_into(&fixed, no_follow, args.x1, name) {
                     Ok(r) => {
-                        tracing::debug!(op = name, guest = %path, fixed = %fixed, "stat ok (liblib repair)");
+                        tracing::debug!(
+                            op = name,
+                            guest = %path,
+                            fixed = %fixed,
+                            "stat ok (ld path repair)"
+                        );
                         r
                     }
                     Err(e) => SyscallResult::err(name, e),
@@ -398,7 +403,15 @@ pub(crate) fn handle_readlink(args: SyscallArgs) -> SyscallResult {
     }
 }
 
-/// `symlink` — target `x0` (opaque string), link path `x1` (translated).
+/// `symlink` — target `x0`, link path `x1` (both path-translated to host).
+///
+/// On Darwin the target string is often a guest-absolute path that dyld/the
+/// kernel resolve in the same guest namespace. Under kh the host kernel follows
+/// the symlink target as a **host** path, so a guest path like
+/// `/Volumes/linux/out/foo` (or bottle `/Library/...`) must be stored as the
+/// translated host path. Observed: modern `ld` `-lto_library` stages
+/// `/tmp/ld-support-*/libLTO.dylib` → guest source; untranslated target made
+/// `stat` of the link always ENOENT → infinite staging loop.
 pub(crate) fn handle_symlink(args: SyscallArgs) -> SyscallResult {
     let name = "symlink";
     if !registry_check_range(args.x0, 1, false) || !registry_check_range(args.x1, 1, false) {
@@ -410,12 +423,14 @@ pub(crate) fn handle_symlink(args: SyscallArgs) -> SyscallResult {
     let Some(link) = bottle::read_c_string(args.x1, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
-    // Target is stored as-is (guest path string); only the link node is translated.
-    let Ok(c_target) = std::ffi::CString::new(target) else {
-        return SyscallResult::err(name, EFAULT);
+    let Ok(host_target) = translate_path(&target) else {
+        return SyscallResult::err(name, ENOENT);
     };
     let Ok(host_link) = translate_path(&link) else {
         return SyscallResult::err(name, ENOENT);
+    };
+    let Ok(c_target) = std::ffi::CString::new(host_target.as_os_str().as_encoded_bytes()) else {
+        return SyscallResult::err(name, EFAULT);
     };
     let Ok(c_link) = std::ffi::CString::new(host_link.as_os_str().as_encoded_bytes()) else {
         return SyscallResult::err(name, EFAULT);

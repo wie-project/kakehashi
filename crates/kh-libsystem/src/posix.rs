@@ -79,6 +79,7 @@ fn trunc_i64_to_c_int(v: i64) -> c_int {
 
 // ── I/O ─────────────────────────────────────────────────────────────────────
 
+
 /// C `open` → nlist `_open`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int {
@@ -1800,14 +1801,30 @@ fn soft_env_seed_defaults() {
     soft_env_seed_git_from_host();
     // Prefer host-inherited SDKROOT/DEVELOPER_DIR when present (nested -cc1).
     soft_env_seed_sdk_from_host();
+    // Modern `ld` `-lto_library` re-execs with `DYLD_LIBRARY_PATH=/tmp/ld-support-…`
+    // so dyld would pick the staged `libLTO.dylib`. Without seeding, each nested
+    // `kh run` starts with a soft env that lacks DYLD_* → infinite re-exec (P1).
+    soft_env_seed_dyld_from_host();
     soft_env_rebuild_environ();
 }
 
 /// Pull SDKROOT / DEVELOPER_DIR from the host process (nested `kh run`).
 fn soft_env_seed_sdk_from_host() {
-    const KEYS: &[&[u8]] = &[b"SDKROOT\0", b"DEVELOPER_DIR\0"];
+    soft_env_seed_keys_from_host(&[b"SDKROOT\0", b"DEVELOPER_DIR\0"]);
+}
+
+/// Pull `DYLD_LIBRARY_PATH` / fallback from host (nested `ld` LTO re-exec).
+fn soft_env_seed_dyld_from_host() {
+    soft_env_seed_keys_from_host(&[
+        b"DYLD_LIBRARY_PATH\0",
+        b"DYLD_FALLBACK_LIBRARY_PATH\0",
+        b"DYLD_FRAMEWORK_PATH\0",
+    ]);
+}
+
+fn soft_env_seed_keys_from_host(keys: &[&[u8]]) {
     let mut val_buf = [0_u8; SOFT_ENV_WIDTH];
-    for key in KEYS {
+    for key in keys {
         let n = unsafe {
             sys::helper3(
                 crate::KH_HELPER_GETENV,

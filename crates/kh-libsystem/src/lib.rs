@@ -137,6 +137,10 @@ pub const KH_HELPER_REGFREE: u32 = 0x4B48_0010;
 pub const KH_HELPER_TLS_CONNECT: u32 = 0x4B48_0011;
 /// Host-helper id: guest main executable path for `_NSGetExecutablePath`.
 pub const KH_HELPER_EXECUTABLE_PATH: u32 = 0x4B48_0012;
+/// Host-helper id: `dlopen` → handle into the runtime mapped-image table.
+pub const KH_HELPER_DLOPEN: u32 = 0x4B48_0013;
+/// Host-helper id: `dlsym` → guest VA from a `dlopen` handle / `RTLD_DEFAULT`.
+pub const KH_HELPER_DLSYM: u32 = 0x4B48_0014;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

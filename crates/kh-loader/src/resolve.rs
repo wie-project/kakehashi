@@ -114,6 +114,28 @@ fn resolve_rpath(rest: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, Resolv
 
     let mut last_allowlisted: Option<PathBuf> = None;
 
+    // Darwin dyld: `DYLD_LIBRARY_PATH` is searched before LC_RPATH for @rpath
+    // leaves. Nested `ld -lto_library` re-exec sets this to `/tmp/ld-support-*`
+    // so the staged `libLTO.dylib` wins over `@executable_path/../lib`.
+    if let Ok(dyld) = std::env::var("DYLD_LIBRARY_PATH") {
+        for dir in dyld.split(':').filter(|d| !d.is_empty()) {
+            match candidate_from_dyld_dir(dir, rest, ctx) {
+                Ok(candidate) => {
+                    if candidate.exists() {
+                        return Ok(candidate);
+                    }
+                    last_allowlisted = Some(candidate);
+                }
+                Err(
+                    ResolveError::OutsideAllowlist(_)
+                    | ResolveError::NoBottle
+                    | ResolveError::Escape(_),
+                ) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     for rpath in ctx.rpaths {
         if rpath.contains("@rpath") {
             return Err(ResolveError::NestedRpath);
@@ -134,6 +156,23 @@ fn resolve_rpath(rest: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, Resolv
     }
 
     last_allowlisted.ok_or_else(|| ResolveError::OutsideAllowlist(PathBuf::from(rest)))
+}
+
+/// Resolve `dir/rest` where `dir` is one entry from host `DYLD_LIBRARY_PATH`
+/// (guest absolute path after nested re-exec, or host path under the bottle).
+fn candidate_from_dyld_dir(
+    dir: &str,
+    rest: &str,
+    ctx: &ResolveContext<'_>,
+) -> Result<PathBuf, ResolveError> {
+    let base = if is_absolute_install_name(dir) {
+        resolve_absolute(dir, ctx)?
+    } else {
+        join_allow_dotdot(ctx.loader_dir, dir)?
+    };
+    let candidate = join_no_dotdot(&base, rest)?;
+    ensure_allowlisted(&candidate, ctx)?;
+    Ok(candidate)
 }
 
 fn expand_rpath_value(rpath: &str, ctx: &ResolveContext<'_>) -> Result<PathBuf, ResolveError> {

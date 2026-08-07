@@ -8,6 +8,7 @@
 
 pub mod bottle;
 pub mod cpu;
+pub mod dyld_table;
 pub mod entry;
 pub mod host;
 pub mod host_slot;
@@ -32,6 +33,10 @@ pub use bottle::{
     has_libcurl_symlink, has_libcxx_symlink, install_package, package_host_path,
     resolve_guest_program, set_bottle_root, status as bottle_status, translate_path,
     translate_path_with_root,
+};
+pub use dyld_table::{
+    RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF, clear as dyld_table_clear, dlopen_lookup, dlsym_lookup,
+    register_image as dyld_register_image,
 };
 pub use process::{ProcessState, reset_run};
 

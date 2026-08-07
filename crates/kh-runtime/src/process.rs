@@ -518,6 +518,8 @@ pub fn with_ref<R>(f: impl FnOnce(&ProcessState) -> R) -> R {
 /// Resets FD/signals/counters for a new guest run (keeps bottle root).
 pub fn reset_run(max_syscalls: usize) {
     with_mut(|p| p.reset_run(max_syscalls));
+    // Fresh guest process: drop prior dlopen image table.
+    crate::dyld_table::clear();
     // After re-exec of a Mach-O helper, host 0/1/2 may be O_NONBLOCK pipes
     // created for curl multi in the parent — restore Darwin blocking stdio.
     normalize_stdio_pipes_blocking();

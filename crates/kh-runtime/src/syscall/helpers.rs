@@ -268,6 +268,14 @@ pub(crate) const KH_HELPER_TLS_CONNECT: u32 = KH_HELPER_BASE | 0x11;
 /// byte length **including** NUL, or `0` if unset / too small.
 pub(crate) const KH_HELPER_EXECUTABLE_PATH: u32 = KH_HELPER_BASE | 0x12;
 
+/// Freestanding `dlopen`: `x0` = path C string VA (0 = main).
+/// Returns opaque handle, or 0 if no mapped image matches.
+pub(crate) const KH_HELPER_DLOPEN: u32 = KH_HELPER_BASE | 0x13;
+
+/// Freestanding `dlsym`: `x0` = handle, `x1` = symbol name VA.
+/// Returns guest VA, or 0 if missing.
+pub(crate) const KH_HELPER_DLSYM: u32 = KH_HELPER_BASE | 0x14;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -302,7 +310,43 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_REGFREE => handle_regfree(args),
         KH_HELPER_TLS_CONNECT => handle_tls_connect(args),
         KH_HELPER_EXECUTABLE_PATH => handle_executable_path(args),
+        KH_HELPER_DLOPEN => handle_dlopen(args),
+        KH_HELPER_DLSYM => handle_dlsym(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
+    }
+}
+
+fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_dlopen";
+    let path_va = args.x0;
+    // dlopen(NULL) → treat as RTLD_DEFAULT search handle (main is not special).
+    if path_va == 0 {
+        return SyscallResult::ok(name, crate::dyld_table::RTLD_DEFAULT);
+    }
+    let Some(guest_path) = bottle::read_c_string(path_va, CSTR_MAX) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let host = bottle::translate_path(&guest_path).ok();
+    if let Some(h) = crate::dyld_table::dlopen_lookup(host.as_deref(), &guest_path) {
+        SyscallResult::ok(name, h)
+    } else {
+        // Not mapped yet — soft fail (no on-demand load of 150 MiB plugins).
+        tracing::debug!(guest = %guest_path, "dlopen: no mapped image");
+        SyscallResult::ok(name, 0)
+    }
+}
+
+fn handle_dlsym(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_dlsym";
+    let handle = args.x0;
+    let sym_va = args.x1;
+    let Some(sym) = bottle::read_c_string(sym_va, CSTR_MAX) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    if let Some(va) = crate::dyld_table::dlsym_lookup(handle, &sym) {
+        SyscallResult::ok(name, va)
+    } else {
+        SyscallResult::ok(name, 0)
     }
 }
 
@@ -572,10 +616,7 @@ fn handle_http(args: SyscallArgs) -> SyscallResult {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let tmp = std::env::temp_dir().join(format!(
-        "kh-http-{}-{nanos}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("kh-http-{}-{nanos}", std::process::id()));
     let body_path = tmp.with_extension("body");
     let hdr_path = tmp.with_extension("hdr");
     let post_path = tmp.with_extension("post");
@@ -621,7 +662,8 @@ fn handle_http(args: SyscallArgs) -> SyscallResult {
             write_err(&format!("post body write: {e}"));
             return SyscallResult::err(name, EINVAL);
         }
-        cmd.arg("--data-binary").arg(format!("@{}", post_path.display()));
+        cmd.arg("--data-binary")
+            .arg(format!("@{}", post_path.display()));
     }
     cmd.arg(&url);
 
@@ -754,10 +796,7 @@ fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
         dst.copy_from_slice(bytes);
     }
     guest_write(ptr, &out);
-    SyscallResult::ok(
-        name,
-        u64::try_from(out.len()).unwrap_or(0),
-    )
+    SyscallResult::ok(name, u64::try_from(out.len()).unwrap_or(0))
 }
 
 fn handle_executable_path(args: SyscallArgs) -> SyscallResult {
@@ -864,10 +903,7 @@ fn count_groups(pat: &str) -> usize {
 }
 
 /// Minimal BRE → rust-regex (subset used by git pathspecs).
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
-)]
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 fn bre_to_rust(bre: &str) -> String {
     let mut out = String::with_capacity(bre.len().saturating_mul(2));
     let bytes = bre.as_bytes();
@@ -920,11 +956,7 @@ fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::ok(name, DARWIN_REG_INVARG);
     };
     let is_ere = cflags & DARWIN_REG_EXTENDED != 0;
-    let mut rust_pat = if is_ere {
-        pat
-    } else {
-        bre_to_rust(&pat)
-    };
+    let mut rust_pat = if is_ere { pat } else { bre_to_rust(&pat) };
     let nsub = count_groups(&rust_pat);
     if cflags & DARWIN_REG_NEWLINE != 0 {
         rust_pat.insert_str(0, "(?m)");
@@ -1009,7 +1041,11 @@ fn handle_regexec(args: SyscallArgs) -> SyscallResult {
             return SyscallResult::ok(name, DARWIN_REG_INVARG);
         }
         let pm = guest_slice(pmatch_va, 16);
-        let so = i64::from_le_bytes(pm.get(..8).and_then(|c| c.try_into().ok()).unwrap_or([0; 8]));
+        let so = i64::from_le_bytes(
+            pm.get(..8)
+                .and_then(|c| c.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
         let eo = i64::from_le_bytes(
             pm.get(8..16)
                 .and_then(|c| c.try_into().ok())
@@ -1023,10 +1059,7 @@ fn handle_regexec(args: SyscallArgs) -> SyscallResult {
         if eo_u > hay_owned.len() {
             return SyscallResult::ok(name, DARWIN_REG_INVARG);
         }
-        (
-            hay_owned.get(so_u..eo_u).unwrap_or("").to_owned(),
-            so,
-        )
+        (hay_owned.get(so_u..eo_u).unwrap_or("").to_owned(), so)
     } else {
         (hay_owned, 0_i64)
     };

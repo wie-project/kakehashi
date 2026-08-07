@@ -148,7 +148,15 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         env_owned.extend(sdk_env);
     }
     for (k, v) in std::env::vars() {
-        if !k.starts_with("GIT_") || k.contains('\0') || v.contains('\0') {
+        // Nested re-exec: pass through GIT_* and DYLD_* so guest `main` envp and
+        // freestanding soft-seed (via host getenv) see the same values. Modern
+        // `ld` stages `libLTO` under `/tmp/ld-support-*` and re-execs with
+        // `DYLD_LIBRARY_PATH` set; dropping that var caused an infinite re-exec.
+        let keep = k.starts_with("GIT_")
+            || k == "DYLD_LIBRARY_PATH"
+            || k == "DYLD_FALLBACK_LIBRARY_PATH"
+            || k == "DYLD_FRAMEWORK_PATH";
+        if !keep || k.contains('\0') || v.contains('\0') {
             continue;
         }
         // Soft-cap: skip absurdly large values.
@@ -232,6 +240,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let heap_dump_va = freestanding_export_va(&session, "_kh_heap_stats_dump")
         .or_else(|| freestanding_export_va(&session, "kh_heap_stats_dump"));
 
+    // Publish mapped images for freestanding `dlopen`/`dlsym` (e.g. clang's
+    // `-lto_library` re-open of already-loaded `@rpath/libLTO.dylib`).
+    register_dyld_images(&session);
+
     // Keep stack / session alive across the call (may noreturn via guest exit).
     // `forget` retains all GuestMemory owners if exit traps.
     std::mem::forget(stack);
@@ -255,6 +267,26 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let low = u32::try_from(status & 0xffff_ffff).unwrap_or(0);
     let code = i32::from_ne_bytes(low.to_ne_bytes());
     finish_with_exit_code(code);
+}
+
+/// Fill `kh_runtime::dyld_table` from every mapped image (path + slid exports).
+fn register_dyld_images(session: &LoadSession) {
+    use crate::session::ImageLoadStatus;
+    for img in session.images() {
+        if !matches!(img.status, ImageLoadStatus::Mapped) {
+            continue;
+        }
+        let slide = img.slide();
+        let exports = img
+            .exports
+            .iter()
+            .map(|e| (e.name.clone(), e.value.wrapping_add(slide)));
+        kh_runtime::dyld_register_image(
+            img.path.clone(),
+            img.install_name.clone(),
+            exports,
+        );
+    }
 }
 
 /// Guest VA of a freestanding `libSystem` export (nlist + slide), if present.

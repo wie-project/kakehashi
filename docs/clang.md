@@ -20,7 +20,7 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | G2 | Missing surface list from `--version` / tiny C compile probes | **pass** (trace log; see progress) |
 | G3 | Compile trivial `hello.c` → object or executable under bottle | **pass** (Docker: `return_zero.c` → Mach-O arm64 `.o`; also `stdio_hello.c` with SDK) |
 | G4 | Link + run guest binary produced by guest clang (optional stretch) | **pass** (Docker: multi-file `g4-mini` via `ld-classic` + SDK TBDs; product runs `g4-mini PASS`, exit 0) |
-| G5 | Standard multi-file link with **modern `ld`** (no `ld-classic`) + run | **pass** (Docker: objs + SDK `libSystem.B.tbd` under modern `ld` → `g4-mini PASS`; full clang-driver default path still to prove) |
+| G5 | Standard multi-file link with **modern `ld`** (no `ld-classic`) + run | **pass** (Docker: objs + SDK; full clang-driver multi-file with live `-lto_library` → `g4-mini PASS` in ~7s; nested re-exec + `DYLD_LIBRARY_PATH` fixed — no soft-ENOENT) |
 
 ### Progress log (Docker Colima, 2026-08)
 
@@ -119,9 +119,10 @@ missing `svc` numbers.
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| modern `-L $SDK/usr/lib -lSystem` (no absolute TBD) | kh-runtime path repair | **pass** (Docker): freestanding join dropped `/` → probes `…/liblibSystem.tbd`; `repair_ld_liblib_join` retries `lib/lib` on open/access/stat ENOENT; product `g4-mini PASS` |
-| modern `-syslibroot $SDK -lSystem` alone (clang-driver shape) | freestanding / modern ld options | Still weak: `-v` shows **empty** library search paths (host adds `$SDK/usr/lib`); dig shows syslibroot used for order-file paths but default lib dirs never probed — next |
-| Full clang driver default link (no `ld-classic`) | above + driver | Prove `clang` multi-file without `--ld-path=ld-classic` once `-syslibroot` defaults work |
+| modern `-L $SDK/usr/lib -lSystem` (no absolute TBD) | kh-runtime path repair | **pass** (Docker): freestanding join drops `/` → `…/liblibSystem.tbd`; `repair_ld_guest_path` chains `liblib` → `lib/lib` on open/access/stat; product `g4-mini PASS` |
+| modern `-syslibroot $SDK -lSystem` alone (clang-driver shape) | kh-runtime path repair + F_GETPATH | **pass** (Docker): join dropped `/` after SDK root → probes `…/MacOSX.sdkusr/lib` (not `…/sdk/usr/lib`); `repair_ld_syslibroot_join` + chain with `liblib`; `fcntl(F_GETPATH)` fills guest path (was soft-ok → tapi ENOENT); product `g4-mini PASS` |
+| Full clang driver default link (no `ld-classic`) | bottle + modern `ld` | **pass** (Docker): modern `ld` + `-syslibroot` + `-lSystem` + live `-lto_library`; product `g4-mini PASS` |
+| modern `ld` + `-lto_library` (clang default) | freestanding + loader | **pass** non-bitcode (Docker, ~1s after one re-exec). Root cause: Apple `ld` stages `/tmp/ld-support-*/libLTO.dylib`, sets `DYLD_LIBRARY_PATH`, and **re-execs** itself. Nested `kh run` dropped `DYLD_*` from guest stack/soft env and ignored it for `@rpath` → infinite re-exec (~45 hops / 25s). Fixed: (1) real `mkdtemp`/`mkpath_np`/`create_symlink` + host-translated symlink targets; (2) seed/pass `DYLD_LIBRARY_PATH` on nested re-exec; (3) prefer `DYLD_LIBRARY_PATH` before LC_RPATH for `@rpath`. No soft-ENOENT hide. **Bitcode LTO codegen** still on demand |
 | Soft Foundation / deeper ObjC if driver pulls more | freestanding | On demand |
 | Harder `-cc1` / more libc++ | freestanding | On demand |
 | Full RTTI / exception unwind | freestanding | Soft `dynamic_cast` is hierarchy walk only; real catch still aborts |
@@ -130,9 +131,9 @@ Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
 **not** ship Apple libc++; we grow freestanding C++ runtime stubs only as the
 guest path requires. Multi-file **modern `ld`** is green with absolute `-L` to
-SDK `usr/lib` + `-lSystem` (and with explicit TBD). Product clang still often
-uses **`--ld-path=…/ld-classic`** until `-syslibroot` default library paths are
-proven under freestanding.
+SDK `usr/lib` + `-lSystem` (and with explicit TBD). The default clang driver
+path (modern `ld`, `-syslibroot`, live CLT `libLTO` on disk, no absolute TBD,
+no soft-ENOENT) is green for non-bitcode links.
 
 ## Method (trace-first)
 
@@ -190,6 +191,17 @@ working `xcrun`.
   /Volumes/linux/src/tests/clang-probe/g4-mini/src/main.c \
   -o /Volumes/linux/out/g4-mini
 # then:  kh run /Volumes/linux/out/g4-mini   →  g4-mini PASS
+
+# G5 clang-driver multi-file (modern ld, no --ld-path, no absolute TBD)
+./scripts/docker-clang.sh \
+  -O0 -std=c11 -arch arm64 \
+  -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/calc.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/report.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/words.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/main.c \
+  -o /Volumes/linux/out/g4-mini-driver
+# then:  kh run /Volumes/linux/out/g4-mini-driver   →  g4-mini PASS
 ```
 
 Process notes for PRs: internet allowed for catalog/install; clippy `-D warnings`

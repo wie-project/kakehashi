@@ -9,7 +9,8 @@ use crate::mem::registry_check_range;
 use crate::process;
 
 use super::common::{
-    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, reg_as_i32, reg_as_i64,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, EPERM, SyscallArgs, SyscallResult, guest_write,
+    reg_as_i32, reg_as_i64,
 };
 
 /// Darwin `AT_FDCWD` for `openat`.
@@ -21,6 +22,10 @@ const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+/// Darwin `F_GETPATH` — write path of `fd` into `arg` buffer (`MAXPATHLEN`).
+const F_GETPATH: i32 = 50;
+/// Darwin `MAXPATHLEN` / `PATH_MAX` for `F_GETPATH` buffer.
+const DARWIN_MAXPATHLEN: usize = 1024;
 
 /// Darwin open(2) flag bits (subset).
 const DARWIN_O_RDONLY: u64 = 0x0000;
@@ -118,10 +123,7 @@ fn map_open_errno(host_err: i32) -> i64 {
         EEXIST
     } else if host_err == libc::EACCES || host_err == libc::EPERM {
         EPERM
-    } else if host_err == libc::EINVAL
-        || host_err == libc::EISDIR
-        || host_err == libc::ENOTDIR
-    {
+    } else if host_err == libc::EINVAL || host_err == libc::EISDIR || host_err == libc::ENOTDIR {
         EINVAL
     } else {
         // Preserve positive host errno when it overlaps Darwin; else ENOENT.
@@ -147,12 +149,12 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     if !r.error {
         return r;
     }
-    // G5: modern ld may open `…/liblibName.ext` (missing `/`); retry repaired.
+    // G5: modern ld may open paths with a dropped `/` (liblib, .sdkusr, …).
     let enoent = r.error && r.retval == Some(ENOENT.unsigned_abs());
-    if enoent && let Some(fixed) = bottle::repair_ld_liblib_join(path) {
+    if enoent && let Some(fixed) = bottle::repair_ld_guest_path(path) {
         let r2 = open_translated_once(&fixed, flags, name);
         if !r2.error {
-            tracing::debug!(guest = %path, fixed = %fixed, "open ok (liblib repair)");
+            tracing::debug!(guest = %path, fixed = %fixed, "open ok (ld path repair)");
             return r2;
         }
     }
@@ -195,7 +197,10 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
             log_open_fail(
                 path,
                 first_err,
-                &format!("openat host_errno={first_err} darwin={}", map_open_errno(first_err)),
+                &format!(
+                    "openat host_errno={first_err} darwin={}",
+                    map_open_errno(first_err)
+                ),
             );
             return SyscallResult::err(name, map_open_errno(first_err));
         }
@@ -232,7 +237,10 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
         log_open_fail(
             path,
             first_err,
-            &format!("open host_errno={first_err} darwin={}", map_open_errno(first_err)),
+            &format!(
+                "open host_errno={first_err} darwin={}",
+                map_open_errno(first_err)
+            ),
         );
         return SyscallResult::err(name, map_open_errno(first_err));
     }
@@ -431,6 +439,28 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
             };
             finish_open(name, rc)
         }
+        F_GETPATH => {
+            // G5: modern `ld` / tapi call `fcntl(fd, F_GETPATH, buf)` after open.
+            // Soft-ok without filling the buffer left garbage paths (observed
+            // follow-up `open("\u{2}")`) and tapi `ENOENT in '…liblib…'`.
+            let buf = args.x2;
+            if !registry_check_range(buf, DARWIN_MAXPATHLEN, true) {
+                return SyscallResult::err(name, EFAULT);
+            }
+            let Some(guest_path) = guest_path_for_host_fd(h) else {
+                return SyscallResult::err(name, ENOENT);
+            };
+            let bytes = guest_path.as_bytes();
+            // Need room for path + NUL.
+            if bytes.len().saturating_add(1) > DARWIN_MAXPATHLEN {
+                return SyscallResult::err(name, ENOENT);
+            }
+            guest_write(buf, bytes);
+            let nul_off = buf.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+            guest_write(nul_off, &[0]);
+            tracing::debug!(%guest_path, "fcntl F_GETPATH");
+            SyscallResult::ok(name, 0)
+        }
         _ => {
             // Soft-success for unknown fcntl cmds (F_FULLFSYNC, F_NOCACHE, …).
             // Hard EINVAL made guests spin; macOS ignores many optional cmds.
@@ -438,6 +468,12 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
             SyscallResult::ok(name, 0)
         }
     }
+}
+
+/// Guest-visible path for a host FD (`/proc/self/fd/N` → bottle/guest form).
+fn guest_path_for_host_fd(h: RawFd) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/self/fd/{h}")).ok()?;
+    bottle::host_path_to_guest(&link)
 }
 
 fn log_fcntl_cmd(cmd: i32) {
