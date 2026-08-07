@@ -97,7 +97,8 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
     let Some(rc) = host::openat(host_dir, &c_path, flags, mode) else {
         return SyscallResult::err(name, ENOENT);
     };
-    finish_open(name, rc)
+    let thin = open_flags_readonly(args.x2);
+    finish_open_maybe_thin(name, rc, thin, Some(&path))
 }
 
 fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
@@ -168,13 +169,14 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
     // O_EXCL alone is not useful; mkdir-retry only when create is requested and
     // failure looks like missing parent (not EEXIST from --no-clobber).
     let excl = host_flags & libc::O_EXCL != 0;
+    let thin = open_flags_readonly(flags);
     // B1: bottle dirfd + relative path — no PathBuf join, shorter kernel walk.
     if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
         let Ok(c_rel) = std::ffi::CString::new(rel) else {
             return SyscallResult::err(name, EFAULT);
         };
         if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
-            return finish_open(name, rc);
+            return finish_open_maybe_thin(name, rc, thin, Some(path));
         }
         let first_err = std::io::Error::last_os_error()
             .raw_os_error()
@@ -189,7 +191,7 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
         {
             drop(mkdirat_p(dirfd, parent));
             if let Some(rc) = host::openat(dirfd, &c_rel, host_flags, mode) {
-                return finish_open(name, rc);
+                return finish_open_maybe_thin(name, rc, thin, Some(path));
             }
         }
         // Prefer the first errno (EEXIST from O_EXCL must not become ENOENT).
@@ -216,7 +218,7 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
     };
     // libc open: works for directories (opendir path) and files alike.
     if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
-        return finish_open(name, rc);
+        return finish_open_maybe_thin(name, rc, thin, Some(path));
     }
     let first_err = std::io::Error::last_os_error()
         .raw_os_error()
@@ -230,7 +232,7 @@ fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallRe
     {
         drop(std::fs::create_dir_all(parent));
         if let Some(rc) = host::open_path(&c_path, host_flags, mode) {
-            return finish_open(name, rc);
+            return finish_open_maybe_thin(name, rc, thin, Some(path));
         }
     }
     if first_err == libc::EEXIST || excl {
@@ -275,12 +277,49 @@ fn mkdirat_p(dirfd: RawFd, rel: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn finish_open(name: &'static str, host_fd: RawFd) -> SyscallResult {
+    finish_open_maybe_thin(name, host_fd, false, None)
+}
+
+/// Like [`finish_open`], but when `thin_fat` is set (read-only file open),
+/// fat/universal Mach-O is replaced with an arm64-only view for the guest.
+///
+/// `guest_path` is recorded for `fcntl(F_GETPATH)` (required after fat-thin
+/// swaps the host FD to a memfd that has no real path).
+fn finish_open_maybe_thin(
+    name: &'static str,
+    host_fd: RawFd,
+    thin_fat: bool,
+    guest_path: Option<&str>,
+) -> SyscallResult {
+    let host_fd = if thin_fat {
+        match crate::fat_thin::thin_fat_fd(host_fd) {
+            Some(thin) => {
+                host::close_fd(host_fd);
+                tracing::debug!("open: fat Mach-O thinned to arm64 slice");
+                thin
+            }
+            None => host_fd,
+        }
+    } else {
+        host_fd
+    };
     if let Some(gfd) = alloc_guest_fd(host_fd) {
+        if let Some(p) = guest_path {
+            process::fd_set_guest_path(gfd, p);
+        }
         SyscallResult::ok(name, u64::try_from(gfd).unwrap_or(0))
     } else {
         host::close_fd(host_fd);
         SyscallResult::err(name, EPERM)
     }
+}
+
+/// True when Darwin open flags are read-only (no write/create/trunc).
+fn open_flags_readonly(darwin_flags: u64) -> bool {
+    let acc = darwin_flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    acc == DARWIN_O_RDONLY
+        && darwin_flags & DARWIN_O_CREAT == 0
+        && darwin_flags & DARWIN_O_TRUNC == 0
 }
 
 /// `close`.
@@ -443,11 +482,15 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
             // G5: modern `ld` / tapi call `fcntl(fd, F_GETPATH, buf)` after open.
             // Soft-ok without filling the buffer left garbage paths (observed
             // follow-up `open("\u{2}")`) and tapi `ENOENT in '…liblib…'`.
+            // Prefer the path recorded at open — fat-thin swaps the host FD to a
+            // memfd whose `/proc/self/fd` name is not a bottle path.
             let buf = args.x2;
             if !registry_check_range(buf, DARWIN_MAXPATHLEN, true) {
                 return SyscallResult::err(name, EFAULT);
             }
-            let Some(guest_path) = guest_path_for_host_fd(h) else {
+            let gfd = reg_as_i32(args.x0);
+            let Some(guest_path) = process::fd_guest_path(gfd).or_else(|| guest_path_for_host_fd(h))
+            else {
                 return SyscallResult::err(name, ENOENT);
             };
             let bytes = guest_path.as_bytes();

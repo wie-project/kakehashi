@@ -48,6 +48,9 @@ static FD_GUEST_NB: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS
 static FD_TLS: [AtomicU8; FD_SLOTS] = [const { AtomicU8::new(0) }; FD_SLOTS];
 /// Hint for next free FD scan.
 static FD_NEXT: AtomicI32 = AtomicI32::new(3);
+/// Guest path string for each allocated FD (for `fcntl(F_GETPATH)` after
+/// fat-thin replaces the host FD with a memfd / unlinked temp).
+static FD_GUEST_PATH: RwLock<Option<HashMap<i32, String>>> = RwLock::new(None);
 /// Guest has `close`'d stdio slots 0/1/2 (bit0=stdin, bit1=stdout, bit2=stderr).
 ///
 /// Stdio is identity-mapped to host 0/1/2, so a soft no-op `close` left the host
@@ -159,7 +162,42 @@ pub fn fd_take(gfd: i32) -> Option<RawFd> {
     if let Some(nb) = FD_GUEST_NB.get(idx) {
         nb.store(0, Ordering::Release);
     }
+    fd_clear_guest_path(gfd);
     if v < 0 { None } else { Some(v) }
+}
+
+/// Record the guest path used to open `gfd` (absolute Darwin path).
+pub fn fd_set_guest_path(gfd: i32, path: impl Into<String>) {
+    if gfd < 3 {
+        return;
+    }
+    if let Ok(mut g) = FD_GUEST_PATH.write() {
+        let map = g.get_or_insert_with(HashMap::new);
+        map.insert(gfd, path.into());
+    }
+}
+
+/// Guest path for `gfd`, if recorded at open.
+#[must_use]
+pub fn fd_guest_path(gfd: i32) -> Option<String> {
+    if gfd < 3 {
+        return None;
+    }
+    FD_GUEST_PATH
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&gfd).cloned()))
+}
+
+fn fd_clear_guest_path(gfd: i32) {
+    if gfd < 3 {
+        return;
+    }
+    if let Ok(mut g) = FD_GUEST_PATH.write()
+        && let Some(map) = g.as_mut()
+    {
+        map.remove(&gfd);
+    }
 }
 
 /// Bit for guest stdio FD in [`STDIO_CLOSED`] (`0→1`, `1→2`, `2→4`).
@@ -362,6 +400,9 @@ fn reset_fd_map() {
     }
     for slot in &FD_TLS {
         slot.store(0, Ordering::Relaxed);
+    }
+    if let Ok(mut g) = FD_GUEST_PATH.write() {
+        *g = None;
     }
     STDIO_CLOSED.store(0, Ordering::Relaxed);
     FD_NEXT.store(3, Ordering::Relaxed);

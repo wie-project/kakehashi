@@ -4,12 +4,13 @@
 //!
 //! `unsafe` is denied by workspace lints and only allowed in tightly scoped
 //! modules (`cpu`, `host`, `host_slot`, `mem/*`, `trap`, `entry`, `thread`,
-//! `tls`, and `bottle::read_c_string`).
+//! `tls`, `fat_thin`, and `bottle::read_c_string`).
 
 pub mod bottle;
 pub mod cpu;
 pub mod dyld_table;
 pub mod entry;
+pub mod fat_thin;
 pub mod host;
 pub mod host_slot;
 pub mod mem;

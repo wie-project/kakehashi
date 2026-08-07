@@ -18,10 +18,14 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 
+use miniz_oxide::deflate::compress_to_vec_zlib;
 use miniz_oxide::deflate::core::{
     CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
 };
 use miniz_oxide::inflate::stream::{self as mz_stream, InflateState as MzInflateState};
+use miniz_oxide::inflate::{
+    decompress_to_vec, decompress_to_vec_zlib, decompress_to_vec_zlib_with_limit,
+};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
 use crate::errno;
@@ -296,10 +300,7 @@ pub(crate) unsafe extern "C" fn deflateBound(
 
 /// C `deflateSetHeader` → soft no-op (gzip header; git uses zlib wrapper).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn deflateSetHeader(
-    _strm: *mut c_void,
-    _head: *mut c_void,
-) -> c_int {
+pub(crate) unsafe extern "C" fn deflateSetHeader(_strm: *mut c_void, _head: *mut c_void) -> c_int {
     Z_OK
 }
 
@@ -579,7 +580,6 @@ pub(crate) unsafe extern "C" fn uncompress(
         return Z_OK;
     }
     let src = unsafe { core::slice::from_raw_parts(source, src_n) };
-    use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
     let decoded = match decompress_to_vec_zlib(src) {
         Ok(v) => v,
         Err(_) => match decompress_to_vec(src) {
@@ -626,7 +626,6 @@ pub(crate) unsafe extern "C" fn compress2(
     } else {
         level.clamp(0, 9) as u8
     };
-    use miniz_oxide::deflate::compress_to_vec_zlib;
     let encoded = compress_to_vec_zlib(src, lvl);
     if encoded.len() > cap {
         unsafe {
@@ -676,8 +675,6 @@ pub(crate) unsafe extern "C" fn zError(err: c_int) -> *const c_char {
 /// actually emits a **zlib** wrapper (not true gzip). Caller must `free` the
 /// returned pointer. Cap: 64 MiB decoded.
 pub(crate) fn inflate_to_malloc(src: &[u8]) -> Option<(*mut u8, usize)> {
-    use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib_with_limit};
-
     const MAX_OUT: usize = 64 * 1024 * 1024;
     if src.is_empty() {
         return None;
