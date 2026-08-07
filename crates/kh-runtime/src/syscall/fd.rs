@@ -143,6 +143,23 @@ fn open_fail(name: &'static str, path: &str, why: &str) -> SyscallResult {
 }
 
 fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult {
+    let r = open_translated_once(path, flags, name);
+    if !r.error {
+        return r;
+    }
+    // G5: modern ld may open `…/liblibName.ext` (missing `/`); retry repaired.
+    let enoent = r.error && r.retval == Some(ENOENT.unsigned_abs());
+    if enoent && let Some(fixed) = bottle::repair_ld_liblib_join(path) {
+        let r2 = open_translated_once(&fixed, flags, name);
+        if !r2.error {
+            tracing::debug!(guest = %path, fixed = %fixed, "open ok (liblib repair)");
+            return r2;
+        }
+    }
+    r
+}
+
+fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallResult {
     let host_flags = darwin_to_host_open_flags(flags);
     let mode = 0o666_u32;
     let creat = host_flags & libc::O_CREAT != 0;

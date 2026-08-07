@@ -119,7 +119,9 @@ missing `svc` numbers.
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| Full clang driver default link (no absolute TBD; `-lSystem` only) | freestanding / driver flags | Still weak: modern `-lSystem` alone may report `library 'System' not found` without the same search path classic uses; prove `clang` without `--ld-path=ld-classic` |
+| modern `-L $SDK/usr/lib -lSystem` (no absolute TBD) | kh-runtime path repair | **pass** (Docker): freestanding join dropped `/` → probes `…/liblibSystem.tbd`; `repair_ld_liblib_join` retries `lib/lib` on open/access/stat ENOENT; product `g4-mini PASS` |
+| modern `-syslibroot $SDK -lSystem` alone (clang-driver shape) | freestanding / modern ld options | Still weak: `-v` shows **empty** library search paths (host adds `$SDK/usr/lib`); dig shows syslibroot used for order-file paths but default lib dirs never probed — next |
+| Full clang driver default link (no `ld-classic`) | above + driver | Prove `clang` multi-file without `--ld-path=ld-classic` once `-syslibroot` defaults work |
 | Soft Foundation / deeper ObjC if driver pulls more | freestanding | On demand |
 | Harder `-cc1` / more libc++ | freestanding | On demand |
 | Full RTTI / exception unwind | freestanding | Soft `dynamic_cast` is hierarchy walk only; real catch still aborts |
@@ -127,9 +129,10 @@ missing `svc` numbers.
 Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
 **not** ship Apple libc++; we grow freestanding C++ runtime stubs only as the
-guest path requires. Multi-file **modern `ld`** is green with explicit SDK TBD
-input; product clang still often uses **`--ld-path=…/ld-classic`** until the
-driver’s default `-lSystem` search is proven.
+guest path requires. Multi-file **modern `ld`** is green with absolute `-L` to
+SDK `usr/lib` + `-lSystem` (and with explicit TBD). Product clang still often
+uses **`--ld-path=…/ld-classic`** until `-syslibroot` default library paths are
+proven under freestanding.
 
 ## Method (trace-first)
 

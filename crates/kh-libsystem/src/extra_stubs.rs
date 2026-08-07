@@ -446,17 +446,39 @@ unsafe fn fnmatch_inner(mut pat: *const c_char, mut s: *const c_char) -> bool {
     }
 }
 
-/// C `realpath` → nlist `_realpath` (copy path; no full canonicalize).
+/// C `realpath` → nlist `_realpath`.
+///
+/// Soft: copy the path, but still require the path to exist (Darwin
+/// `realpath` returns `NULL` + `ENOENT` when the target is missing). Modern
+/// `ld` uses this when processing `-syslibroot` before adding default
+/// `$root/usr/lib` library search paths.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn realpath(
     path: *const c_char,
     resolved: *mut c_char,
 ) -> *mut c_char {
+    const F_OK: c_int = 0;
     if path.is_null() {
         errno::set_errno(EINVAL);
         return core::ptr::null_mut();
     }
+    // Reject PAGEZERO / unrebased guest pointers.
+    if path.addr() < crate::stdio::PAGEZERO_END {
+        errno::set_errno(EINVAL);
+        return core::ptr::null_mut();
+    }
+    // Darwin: path must exist. Use freestanding `access(F_OK)`.
+    let exists = unsafe { crate::posix::access(path, F_OK) } == 0;
+    if !exists {
+        errno::set_errno(2); // ENOENT
+        return core::ptr::null_mut();
+    }
     let n = unsafe { strlen(path) };
+    // PATH_MAX-ish cap for stack resolved buffers callers pass in.
+    if n >= 1024 {
+        errno::set_errno(63); // ENAMETOOLONG-ish
+        return core::ptr::null_mut();
+    }
     let out = if resolved.is_null() {
         let p = unsafe { malloc(n.saturating_add(1)) };
         if p.is_null() {

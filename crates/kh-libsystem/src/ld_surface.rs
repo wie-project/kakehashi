@@ -491,25 +491,91 @@ pub(crate) unsafe extern "C" fn strndup(s: *const c_char, n: usize) -> *mut c_ch
 }
 
 /// C `strtok` — classic static delimiter walk (not thread-safe).
+///
+/// # Safety (caller)
+/// Same contract as libc: `s` (or the prior continuation) is a live mutable
+/// NUL-terminated C string for the whole tokenize sequence; `delim` is a live
+/// NUL-terminated delimiter set. This implementation never forms Rust `&T` /
+/// `&mut T` over that buffer — only raw `read`/`write` after address checks.
+///
+/// Defensive guest guards (beyond libc): reject null and Darwin PAGEZERO
+/// addresses, and hard-cap the walk so a missing terminator cannot run forever.
 static mut STRTOK_SAVE: *mut c_char = core::ptr::null_mut();
+
+/// Max bytes walked in one `strtok` call (same order as freestanding `strlen`).
+const STRTOK_WALK_MAX: usize = 1 << 20;
+
+/// Live guest C-string pointer: non-null and outside Darwin PAGEZERO.
+#[inline]
+fn strtok_addr_ok(p: *const c_char) -> bool {
+    !p.is_null() && crate::stdio::ptr_usable(p.cast())
+}
+
+/// Load one byte from a validated guest C-string address.
+///
+/// # Safety
+/// `p` must satisfy `strtok_addr_ok` and point into a live allocation for at
+/// least one `c_char` (caller's NUL-terminated buffer contract).
+#[inline]
+unsafe fn strtok_load(p: *const c_char) -> Option<c_char> {
+    if !strtok_addr_ok(p) {
+        return None;
+    }
+    // SAFETY: address checked; live byte by caller contract.
+    Some(unsafe { core::ptr::read(p) })
+}
+
+/// Store one byte at a validated guest C-string address.
+///
+/// # Safety
+/// Same as [`strtok_load`], plus the location must be mutable.
+#[inline]
+unsafe fn strtok_store(p: *mut c_char, v: c_char) -> bool {
+    if !strtok_addr_ok(p) {
+        return false;
+    }
+    // SAFETY: address checked; live mutable byte by caller contract.
+    unsafe {
+        core::ptr::write(p, v);
+    }
+    true
+}
 
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_char {
-    if delim.is_null() {
+    if !strtok_addr_ok(delim) {
         return core::ptr::null_mut();
     }
+
     let mut p = if s.is_null() {
+        // SAFETY: prior continuation; re-validated before any load/store.
         unsafe { STRTOK_SAVE }
     } else {
         s
     };
-    if p.is_null() {
+    if !strtok_addr_ok(p) {
+        unsafe {
+            STRTOK_SAVE = core::ptr::null_mut();
+        }
         return core::ptr::null_mut();
     }
-    // Skip leading delimiters.
+
+    // SAFETY: `p`/`delim` address-ok; each step re-validates before load/store.
+    // Advances only after a successful non-NUL load so `STRTOK_SAVE` never
+    // steps from an unobserved address (no OOB continuation invent).
     unsafe {
+        let mut walked = 0_usize;
+
+        // Skip leading delimiters.
         loop {
-            let c = p.read();
+            if walked > STRTOK_WALK_MAX {
+                STRTOK_SAVE = core::ptr::null_mut();
+                return core::ptr::null_mut();
+            }
+            let Some(c) = strtok_load(p) else {
+                STRTOK_SAVE = core::ptr::null_mut();
+                return core::ptr::null_mut();
+            };
             if c == 0 {
                 STRTOK_SAVE = core::ptr::null_mut();
                 return core::ptr::null_mut();
@@ -517,30 +583,65 @@ pub(crate) unsafe extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> 
             if !is_delim(c, delim) {
                 break;
             }
+            // Observed a live non-NUL byte at `p` → one-byte step stays on the
+            // object while the string remains NUL-terminated (libc contract).
             p = p.add(1);
+            walked = walked.saturating_add(1);
         }
+
         let start = p;
         loop {
-            let c = p.read();
+            if walked > STRTOK_WALK_MAX {
+                // Missing terminator: return what we have; do not invent a save.
+                STRTOK_SAVE = core::ptr::null_mut();
+                return start;
+            }
+            let Some(c) = strtok_load(p) else {
+                STRTOK_SAVE = core::ptr::null_mut();
+                return start;
+            };
             if c == 0 {
                 STRTOK_SAVE = core::ptr::null_mut();
                 return start;
             }
             if is_delim(c, delim) {
-                p.write(0);
-                STRTOK_SAVE = p.add(1);
+                // Classic strtok: splice token with in-place NUL at delimiter.
+                if !strtok_store(p, 0) {
+                    STRTOK_SAVE = core::ptr::null_mut();
+                    return start;
+                }
+                // Continuation is the byte after the delimiter we just wrote.
+                // That address is only retained if it itself passes addr checks
+                // (rejects PAGEZERO/null); next call loads it or clears.
+                let next = p.add(1);
+                STRTOK_SAVE = if strtok_addr_ok(next) {
+                    next
+                } else {
+                    core::ptr::null_mut()
+                };
                 return start;
             }
             p = p.add(1);
+            walked = walked.saturating_add(1);
         }
     }
 }
 
 unsafe fn is_delim(c: c_char, delim: *const c_char) -> bool {
+    if !strtok_addr_ok(delim) {
+        return false;
+    }
     let mut d = delim;
+    let mut n = 0_usize;
+    // SAFETY: `delim` address-ok; each byte re-checked; hard cap on set length.
     unsafe {
         loop {
-            let x = d.read();
+            if n > 256 {
+                return false;
+            }
+            let Some(x) = strtok_load(d) else {
+                return false;
+            };
             if x == 0 {
                 return false;
             }
@@ -548,6 +649,7 @@ unsafe fn is_delim(c: c_char, delim: *const c_char) -> bool {
                 return true;
             }
             d = d.add(1);
+            n = n.saturating_add(1);
         }
     }
 }

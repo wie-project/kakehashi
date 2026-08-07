@@ -49,6 +49,23 @@ pub fn translate_path(guest: &str) -> Result<PathBuf, PathError> {
     process::with_bottle_root(|root| translate_path_with_root(root, guest))
 }
 
+/// Repair modern Apple `ld` library-search joins that drop the `/` separator.
+///
+/// Observed under freestanding (G5): `-L $SDK/usr/lib -lSystem` probes
+/// `$SDK/usr/liblibSystem.tbd` instead of `$SDK/usr/lib/libSystem.tbd`
+/// (`…/lib` + `libName.ext` glued without `/`). Host macOS `ld` inserts the
+/// slash; until freestanding string/path join matches, open/access/stat retry
+/// with the first `liblib` → `lib/lib`. Returns `None` when no repair applies.
+#[must_use]
+pub fn repair_ld_liblib_join(guest: &str) -> Option<String> {
+    let i = guest.find("liblib")?;
+    let mut out = String::with_capacity(guest.len().saturating_add(1));
+    out.push_str(&guest[..i]);
+    out.push_str("lib/lib");
+    out.push_str(&guest[i.saturating_add(6)..]);
+    Some(out)
+}
+
 /// Pure translation helper (testable without process globals).
 pub fn translate_path_with_root(root: Option<&Path>, guest: &str) -> Result<PathBuf, PathError> {
     if guest.is_empty() {
@@ -316,6 +333,22 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_ld_liblib_join_inserts_slash() {
+        assert_eq!(
+            repair_ld_liblib_join(
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/liblibSystem.tbd"
+            )
+            .as_deref(),
+            Some("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libSystem.tbd")
+        );
+        assert_eq!(
+            repair_ld_liblib_join("/usr/liblibcache.tbd").as_deref(),
+            Some("/usr/lib/libcache.tbd")
+        );
+        assert_eq!(repair_ld_liblib_join("/usr/lib/libSystem.tbd"), None);
+    }
 
     #[test]
     fn absolute_under_bottle() {

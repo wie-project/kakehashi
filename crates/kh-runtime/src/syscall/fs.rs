@@ -26,28 +26,40 @@ pub(crate) fn handle_access(args: SyscallArgs) -> SyscallResult {
     let Some(path) = bottle::read_c_string(args.x0, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
-    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(&path) {
+    match access_path(&path) {
+        Ok(()) => SyscallResult::ok(name, 0),
+        Err(e) => {
+            // G5: modern ld may probe `…/liblibName.ext` (missing `/`); retry.
+            if e == ENOENT
+                && let Some(fixed) = bottle::repair_ld_liblib_join(&path)
+                && access_path(&fixed).is_ok()
+            {
+                tracing::debug!(guest = %path, fixed = %fixed, "access ok (liblib repair)");
+                return SyscallResult::ok(name, 0);
+            }
+            SyscallResult::err(name, e)
+        }
+    }
+}
+
+fn access_path(path: &str) -> Result<(), i64> {
+    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
         let Ok(c_rel) = std::ffi::CString::new(rel) else {
-            return SyscallResult::err(name, EFAULT);
+            return Err(EFAULT);
         };
         return if host::faccessat_ok(dirfd, &c_rel) {
-            tracing::debug!(guest = %path, rel, "access ok (bottle openat)");
-            SyscallResult::ok(name, 0)
+            Ok(())
         } else {
-            tracing::debug!(guest = %path, rel, "access enoent (bottle openat)");
-            SyscallResult::err(name, ENOENT)
+            Err(ENOENT)
         };
     }
-    let Ok(host_path) = translate_path(&path) else {
-        tracing::debug!(guest = %path, "access enoent (translate)");
-        return SyscallResult::err(name, ENOENT);
+    let Ok(host_path) = translate_path(path) else {
+        return Err(ENOENT);
     };
     if host_path.exists() {
-        tracing::debug!(guest = %path, host = %host_path.display(), "access ok");
-        SyscallResult::ok(name, 0)
+        Ok(())
     } else {
-        tracing::debug!(guest = %path, host = %host_path.display(), "access enoent");
-        SyscallResult::err(name, ENOENT)
+        Err(ENOENT)
     }
 }
 
@@ -71,20 +83,43 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
     let Some(path) = bottle::read_c_string(args.x0, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
+    match path_stat_into(&path, no_follow, args.x1, name) {
+        Ok(r) => r,
+        Err(ENOENT) => {
+            if let Some(fixed) = bottle::repair_ld_liblib_join(&path) {
+                match path_stat_into(&fixed, no_follow, args.x1, name) {
+                    Ok(r) => {
+                        tracing::debug!(op = name, guest = %path, fixed = %fixed, "stat ok (liblib repair)");
+                        r
+                    }
+                    Err(e) => SyscallResult::err(name, e),
+                }
+            } else {
+                SyscallResult::err(name, ENOENT)
+            }
+        }
+        Err(e) => SyscallResult::err(name, e),
+    }
+}
+
+fn path_stat_into(
+    path: &str,
+    no_follow: bool,
+    buf_va: u64,
+    name: &'static str,
+) -> Result<SyscallResult, i64> {
     // B1: fstatat(bottle_dirfd, rel) avoids PathBuf + full absolute walk.
-    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(&path) {
+    if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
         let Ok(c_rel) = std::ffi::CString::new(rel) else {
-            return SyscallResult::err(name, EFAULT);
+            return Err(EFAULT);
         };
         let Some(st) = host::fstatat(dirfd, &c_rel, no_follow) else {
-            tracing::debug!(op = name, guest = %path, rel, "stat enoent (bottle openat)");
-            return SyscallResult::err(name, ENOENT);
+            return Err(ENOENT);
         };
-        return write_darwin_stat64_from_libc(args.x1, &st, name);
+        return Ok(write_darwin_stat64_from_libc(buf_va, &st, name));
     }
-    let Ok(host_path) = translate_path(&path) else {
-        tracing::debug!(op = name, guest = %path, "stat enoent (translate)");
-        return SyscallResult::err(name, ENOENT);
+    let Ok(host_path) = translate_path(path) else {
+        return Err(ENOENT);
     };
     let meta = if no_follow {
         std::fs::symlink_metadata(&host_path)
@@ -92,13 +127,9 @@ fn path_stat(args: SyscallArgs, no_follow: bool, name: &'static str) -> SyscallR
         std::fs::metadata(&host_path)
     };
     let Ok(meta) = meta else {
-        tracing::debug!(op = name, guest = %path, host = %host_path.display(), "stat enoent");
-        return SyscallResult::err(name, ENOENT);
+        return Err(ENOENT);
     };
-    if path.contains("README") {
-        tracing::debug!(op = name, guest = %path, host = %host_path.display(), "stat ok");
-    }
-    write_darwin_stat64(args.x1, &meta, name)
+    Ok(write_darwin_stat64(buf_va, &meta, name))
 }
 
 /// `fstat` / `fstat64` — fd `x0`, buffer `x1`.
