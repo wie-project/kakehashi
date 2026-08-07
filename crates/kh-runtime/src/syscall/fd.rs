@@ -70,9 +70,10 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
     if !registry_check_range(args.x1, 1, false) {
         return SyscallResult::err(name, EFAULT);
     }
-    let Some(path) = bottle::read_c_string(args.x1, 4096) else {
+    let Some(bytes) = bottle::read_c_bytes(args.x1, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
+    let path = String::from_utf8_lossy(&bytes).into_owned();
 
     if dirfd == AT_FDCWD || path.starts_with('/') {
         return open_translated(&path, args.x2, name);
@@ -84,7 +85,8 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
 
     let flags = darwin_to_host_open_flags(args.x2);
     let mode = u32::try_from(args.x3 & 0xFFFF).unwrap_or(0o666);
-    let Ok(c_path) = std::ffi::CString::new(path) else {
+    // CString rejects interior NUL; our bytes already stop at first NUL.
+    let Ok(c_path) = std::ffi::CString::new(bytes) else {
         return SyscallResult::err(name, EFAULT);
     };
     let Some(rc) = host::openat(host_dir, &c_path, flags, mode) else {
@@ -95,19 +97,13 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
 
 fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
     if !registry_check_range(path_ptr, 1, false) {
-        tracing::warn!(
-            path_ptr = format_args!("0x{path_ptr:x}"),
-            "{name} EFAULT: path ptr not in guest registry (G5 tapi dig)"
-        );
         return SyscallResult::err(name, EFAULT);
     }
-    let Some(path) = bottle::read_c_string(path_ptr, 4096) else {
-        tracing::warn!(
-            path_ptr = format_args!("0x{path_ptr:x}"),
-            "{name} EFAULT: read_c_string failed (unterminated or unmapped)"
-        );
+    let Some(bytes) = bottle::read_c_bytes(path_ptr, 4096) else {
         return SyscallResult::err(name, EFAULT);
     };
+    // Darwin paths are bytes; lossy only for logging / bottle PathBuf.
+    let path = String::from_utf8_lossy(&bytes).into_owned();
     open_translated(&path, flags, name)
 }
 
@@ -153,7 +149,6 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     // O_EXCL alone is not useful; mkdir-retry only when create is requested and
     // failure looks like missing parent (not EEXIST from --no-clobber).
     let excl = host_flags & libc::O_EXCL != 0;
-
     // B1: bottle dirfd + relative path — no PathBuf join, shorter kernel walk.
     if let Some((dirfd, rel)) = bottle::bottle_openat_rel(path) {
         let Ok(c_rel) = std::ffi::CString::new(rel) else {

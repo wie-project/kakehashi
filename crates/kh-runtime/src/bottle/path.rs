@@ -257,10 +257,13 @@ const PATH_STACK: usize = 512;
 
 /// Reads a NUL-terminated C string from an identity-mapped guest pointer.
 ///
-/// Used by `open` / `access` handlers. Caps length to avoid runaway scans.
+/// Read a NUL-terminated guest C string as raw bytes (no UTF-8 requirement).
+///
+/// Darwin paths are byte sequences; rejecting non-UTF-8 as `EFAULT` broke modern
+/// `ld`/`libtapi` (G5): `open` saw a short binary blob and failed before ENOENT.
 #[must_use]
 #[allow(unsafe_code)]
-pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
+pub fn read_c_bytes(ptr: u64, max_len: usize) -> Option<Vec<u8>> {
     if ptr == 0 || max_len == 0 {
         return None;
     }
@@ -273,10 +276,7 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
         // SAFETY: identity map — guest VA == host VA for mapped pages.
         let byte = unsafe { *base_ptr.wrapping_add(i) };
         if byte == 0 {
-            return stack
-                .get(..i)
-                .and_then(|s| std::str::from_utf8(s).ok())
-                .map(str::to_owned);
+            return stack.get(..i).map(<[u8]>::to_vec);
         }
         if let Some(slot) = stack.get_mut(i) {
             *slot = byte;
@@ -294,11 +294,22 @@ pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
     for i in stack_cap..max_len {
         let byte = unsafe { *base_ptr.wrapping_add(i) };
         if byte == 0 {
-            return String::from_utf8(buf).ok();
+            return Some(buf);
         }
         buf.push(byte);
     }
     None
+}
+
+/// Used by `open` / `access` handlers. Caps length to avoid runaway scans.
+///
+/// Accepts any byte path (lossy UTF-8). Prefer [`read_c_bytes`] when the caller
+/// must not invent replacement characters.
+#[must_use]
+#[allow(unsafe_code)]
+pub fn read_c_string(ptr: u64, max_len: usize) -> Option<String> {
+    let bytes = read_c_bytes(ptr, max_len)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]

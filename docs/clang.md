@@ -20,6 +20,7 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | G2 | Missing surface list from `--version` / tiny C compile probes | **pass** (trace log; see progress) |
 | G3 | Compile trivial `hello.c` → object or executable under bottle | **pass** (Docker: `return_zero.c` → Mach-O arm64 `.o`; also `stdio_hello.c` with SDK) |
 | G4 | Link + run guest binary produced by guest clang (optional stretch) | **pass** (Docker: multi-file `g4-mini` via `ld-classic` + SDK TBDs; product runs `g4-mini PASS`, exit 0) |
+| G5 | Standard multi-file link with **modern `ld`** (no `ld-classic`) + run | **pass** (Docker: objs + SDK `libSystem.B.tbd` under modern `ld` → `g4-mini PASS`; full clang-driver default path still to prove) |
 
 ### Progress log (Docker Colima, 2026-08)
 
@@ -66,7 +67,12 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | Soft `std::filesystem` path ops (`libcxx_fs`) | **landed** — path component methods return **view `{ptr,len}` in x0/x1** (ld call sites: no sret; `cbz x1`) |
 | Soft `operator new(align)` / `_simple_*` / `vm_allocate` | **landed** — modern ld missing surface |
 | Soft streambuf `xsputn` writes stderr + returns `n` | **landed** — was spin (return 0) / empty `ld: ` errors |
-| **G5 standard link** (default `ld`, no `ld-classic`) | **in progress** — past SEGV/`__ZnwmSt11align_val_t`/`_simple_salloc`/`vm_allocate`; modern `ld` still exits 1 with sparse diagnostics; product path remains `ld-classic` |
+| Soft `_simple_vsprintf` real format+append | **landed** — was no-op → empty `mach_o::Error::message()` → sparse `ld: ` |
+| `read_c_bytes` for Darwin paths (no UTF-8 reject) | **landed** — non-UTF-8 path bytes were `EFAULT` |
+| Soft `filebuf` read + ifstream filebuf @+0x10 | **landed** — TBD load path for modern `ld` / tapi |
+| `vm_allocate` 16 KiB-aligned user (host 4 KiB OK) | **landed** — `UnsafeHeaderWriter` minHeaderAlignment |
+| Page-aligned freestanding `malloc` (≥256 B mmap) | **landed** — same assert class as `vm_allocate` |
+| **G5 standard link** (modern `ld`, explicit TBD / SDK) | **pass** (Docker: modern `ld` + `libSystem.B.tbd` → product `g4-mini PASS`; classic still green) |
 | G4 regression after G5 soft surface | **pass** (Docker: classic link + `g4-mini PASS`) |
 
 ### Standard path (modern `ld` + ObjC) — inventory
@@ -113,16 +119,17 @@ missing `svc` numbers.
 
 | Observed | Layer | Plan |
 | --- | --- | --- |
-| Modern `ld` SEGV after soft objc (pc in `ld` text) | freestanding ObjC/Foundation | Dig selector/`isa` use; grow soft Foundation methods or keep **G4 `ld-classic`** as product path |
-| libc++ iostream / `std::filesystem` for modern `ld` | freestanding | On demand from missing-symbol log |
+| Full clang driver default link (no absolute TBD; `-lSystem` only) | freestanding / driver flags | Still weak: modern `-lSystem` alone may report `library 'System' not found` without the same search path classic uses; prove `clang` without `--ld-path=ld-classic` |
+| Soft Foundation / deeper ObjC if driver pulls more | freestanding | On demand |
 | Harder `-cc1` / more libc++ | freestanding | On demand |
 | Full RTTI / exception unwind | freestanding | Soft `dynamic_cast` is hierarchy walk only; real catch still aborts |
 
 Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 `libc++.1.dylib` → freestanding `libSystem.B.dylib` (same as git/7zz). We do
 **not** ship Apple libc++; we grow freestanding C++ runtime stubs only as the
-guest path requires. Product multi-file link remains **`--ld-path=…/ld-classic`**
-until G5 modern `ld` is green.
+guest path requires. Multi-file **modern `ld`** is green with explicit SDK TBD
+input; product clang still often uses **`--ld-path=…/ld-classic`** until the
+driver’s default `-lSystem` search is proven.
 
 ## Method (trace-first)
 

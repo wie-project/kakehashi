@@ -263,39 +263,6 @@ int __vsnprintf_chk(char *dst, size_t cap, int flag, size_t slen,
 
 int vfprintf(void *stream, const char *fmt, va_list ap) {
   char buf[4096];
-  /* G5 dig: recover empty `ld: %s` bodies — dump fmt + first %s peek. */
-  if (fmt && fmt[0] == 'l' && fmt[1] == 'd' && fmt[2] == ':') {
-    va_list ap2;
-    va_copy(ap2, ap);
-    /* Most ld diagnostics: "ld: %s" or "ld: %s\n" — first arg is char*. */
-    const char *s = 0;
-    const char *p = fmt;
-    while (*p && *p != '%')
-      p++;
-    if (p[0] == '%' && p[1] == 's') {
-      s = va_arg(ap2, const char *);
-    }
-    va_end(ap2);
-    write(2, "[kh-fprintf] fmt=", 17);
-    if (fmt) {
-      size_t fl = 0;
-      while (fmt[fl] && fl < 80)
-        fl++;
-      write(2, fmt, fl);
-    }
-    write(2, " s=", 3);
-    if (!s) {
-      write(2, "<null>", 6);
-    } else if (!s[0]) {
-      write(2, "<empty>", 7);
-    } else {
-      size_t sl = 0;
-      while (s[sl] && sl < 200)
-        sl++;
-      write(2, s, sl);
-    }
-    write(2, "\n", 1);
-  }
   int n = vsnprintf_impl(buf, sizeof(buf), fmt, ap);
   if (n < 0)
     return -1;

@@ -82,15 +82,7 @@ fn trunc_i64_to_c_int(v: i64) -> c_int {
 /// C `open` → nlist `_open`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int {
-    if path.is_null() {
-        // G5 dig: tapi/modern ld EFAULT often means open(NULL) via bad string.c_str().
-        crate::trace::force_note(b"[kh-libsystem] open(NULL) -> EFAULT\n");
-        errno::set_errno(14);
-        return -1;
-    }
-    // Also reject PAGEZERO / unrebased path pointers (same class of bug).
-    if path.addr() < crate::stdio::PAGEZERO_END {
-        crate::trace::force_note(b"[kh-libsystem] open(PAGEZERO ptr) -> EFAULT\n");
+    if path.is_null() || path.addr() < crate::stdio::PAGEZERO_END {
         errno::set_errno(14);
         return -1;
     }
@@ -102,10 +94,6 @@ pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_
             u64::from(mode.cast_unsigned()),
         )
     };
-    if ret == -14 {
-        // Runtime: path not readable as C string (unterminated / unmapped). G5 tapi dig.
-        crate::trace::force_note(b"[kh-libsystem] open syscall EFAULT (bad path bytes)\n");
-    }
     ret_c_int(ret)
 }
 
@@ -2505,9 +2493,19 @@ pub(crate) unsafe extern "C" fn mach_task_self() -> usize {
 #[used]
 static mut VM_PAGE_MASK: usize = 0x3fff; // 16 KiB page mask (matches ld_surface)
 
+/// Darwin arm64 guest page (matches `vm_page_size` / `vm_page_mask`).
+const VM_PAGE: usize = 16_384;
+const VM_META_WORDS: usize = 2;
+const VM_META_BYTES: usize = core::mem::size_of::<usize>() * VM_META_WORDS;
+
 /// `vm_allocate(task, *addr, size, flags)` → anonymous RW map.
 ///
 /// `flags` bit0 = anywhere (1) vs fixed (0). Soft: always anywhere via mmap.
+///
+/// **Alignment (G5):** host Linux mmap is often 4 KiB-aligned; modern Apple `ld`
+/// `UnsafeHeaderWriter` requires `buffer.data()` aligned to guest page (16 KiB).
+/// Over-map and return a 16 KiB-aligned interior pointer. Raw base + map size
+/// sit in two words immediately before the returned address for deallocate.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn vm_allocate(
     _task: usize,
@@ -2518,21 +2516,40 @@ pub(crate) unsafe extern "C" fn vm_allocate(
     if addr.is_null() || size == 0 {
         return KERN_INVALID_ARGUMENT;
     }
-    let p = unsafe {
+    let map_size = size.saturating_add(VM_PAGE).saturating_add(VM_META_BYTES);
+    let raw = unsafe {
         mmap(
             core::ptr::null_mut(),
-            size,
+            map_size,
             PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANON,
             -1,
             0,
         )
     };
-    if p.addr() == usize::MAX {
+    if raw.addr() == usize::MAX || raw.is_null() {
         return KERN_NO_SPACE;
     }
+    let raw_addr = raw.addr();
+    // Align user to guest page; leave VM_META_BYTES before it for bookkeeping.
+    let user_addr = (raw_addr
+        .saturating_add(VM_META_BYTES)
+        .saturating_add(VM_PAGE - 1))
+        & !(VM_PAGE - 1);
+    if user_addr.saturating_add(size) > raw_addr.saturating_add(map_size)
+        || user_addr < raw_addr.saturating_add(VM_META_BYTES)
+    {
+        let _ = unsafe { munmap(raw, map_size) };
+        return KERN_NO_SPACE;
+    }
+    // Layout: [raw_base][map_size][…pad…][user…]
     unsafe {
-        addr.write(p);
+        let meta = core::ptr::with_exposed_provenance_mut::<usize>(
+            user_addr.saturating_sub(VM_META_BYTES),
+        );
+        meta.write(raw_addr);
+        meta.add(1).write(map_size);
+        addr.write(core::ptr::with_exposed_provenance_mut(user_addr));
     }
     KERN_SUCCESS
 }
@@ -2547,6 +2564,25 @@ pub(crate) unsafe extern "C" fn vm_deallocate(
     if addr.is_null() || size == 0 {
         return KERN_INVALID_ARGUMENT;
     }
+    let user = addr.addr();
+    if user >= VM_META_BYTES {
+        let meta = core::ptr::with_exposed_provenance::<usize>(user.saturating_sub(VM_META_BYTES));
+        let raw_base = unsafe { meta.read() };
+        let map_size = unsafe { meta.add(1).read() };
+        if raw_base != 0
+            && raw_base < user
+            && map_size >= size
+            && user.saturating_sub(raw_base) < map_size
+        {
+            let rc = unsafe { munmap(core::ptr::with_exposed_provenance_mut(raw_base), map_size) };
+            return if rc != 0 {
+                KERN_INVALID_ARGUMENT
+            } else {
+                KERN_SUCCESS
+            };
+        }
+    }
+    // Fallback: treat addr/size as the whole mapping (legacy callers).
     let rc = unsafe { munmap(addr, size) };
     if rc != 0 {
         KERN_INVALID_ARGUMENT

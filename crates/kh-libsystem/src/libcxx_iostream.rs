@@ -499,8 +499,6 @@ pub(crate) fn ensure_iostream_vtables() {
         init_fstream_vtables();
     }
     INIT_DONE.store(true, Ordering::Release);
-    // Temporary G5 diagnostic: confirm freestanding iostream soft is live.
-    crate::trace::force_note(b"[kh-libsystem] iostream soft vtables ready (xsputn+hm)\n");
 }
 
 // NOTE: mod_init disabled — guest dylib constructors with Rust `link_section`

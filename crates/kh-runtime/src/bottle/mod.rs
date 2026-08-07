@@ -48,7 +48,8 @@ pub use manage::{
     destroy, ensure, status,
 };
 pub use path::{
-    PathError, bottle_openat_rel, bottle_root, guest_cwd_string, host_path_to_guest, read_c_string,
+    PathError, bottle_openat_rel, bottle_root, guest_cwd_string, host_path_to_guest, read_c_bytes,
+    read_c_string,
     set_bottle_root, translate_path, translate_path_with_root,
 };
 pub use registry::{
