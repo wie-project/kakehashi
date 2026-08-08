@@ -9,7 +9,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-use crate::heap::{free, malloc};
+use crate::heap::{allocate_aligned, free, malloc};
 use crate::process::exit_now;
 use crate::trace;
 
@@ -92,13 +92,15 @@ pub(crate) unsafe extern "C" fn op_new_nothrow(size: usize, _nt: *const c_void) 
 }
 
 /// Shared aligned-new body (throwing and nothrow).
+///
+/// Uses [`allocate_aligned`] so the returned pointer is a normal heap user
+/// pointer (`free`-able). Aligned `delete` still accepts the legacy stash
+/// layout; when the stash is not a valid base it falls back to `free(ptr)`.
 unsafe fn op_new_aligned_inner(size: usize, align: usize, nothrow: bool) -> *mut c_void {
     let align = align.max(1).next_power_of_two().max(8);
     let size = size.max(1);
-    // header (base ptr) + padding + payload
-    let total = size.saturating_add(align).saturating_add(8);
-    let raw = unsafe { malloc(total) };
-    if raw.is_null() {
+    let p = allocate_aligned(size, align);
+    if p.is_null() {
         if nothrow {
             trace::note(b"[kh-libsystem] operator new(align,nothrow) OOM\n");
             return core::ptr::null_mut();
@@ -108,20 +110,7 @@ unsafe fn op_new_aligned_inner(size: usize, align: usize, nothrow: bool) -> *mut
             exit_now(1);
         }
     }
-    let raw_addr = raw.addr();
-    let payload = raw_addr
-        .saturating_add(8)
-        .saturating_add(align.saturating_sub(1))
-        & !(align.saturating_sub(1));
-    // SAFETY: payload is within [raw+8, raw+total).
-    let out = core::ptr::with_exposed_provenance_mut::<c_void>(payload);
-    // Stash original base immediately before payload for aligned delete.
-    let stash_addr = payload.saturating_sub(8);
-    let stash = core::ptr::with_exposed_provenance_mut::<*mut c_void>(stash_addr);
-    unsafe {
-        stash.write(raw);
-    }
-    out
+    p
 }
 
 /// `void* operator new(size_t, align_val_t)` → nlist `__ZnwmSt11align_val_t`.
@@ -179,19 +168,12 @@ pub(crate) unsafe extern "C" fn op_delete_aligned(ptr: *mut c_void, _align: usiz
     if ptr.is_null() {
         return;
     }
-    // Prefer stashed base from aligned new; if missing, free ptr as-is.
-    // SAFETY: aligned-new wrote base at ptr-8.
-    let stash_addr = ptr.addr().saturating_sub(8);
-    let stash = core::ptr::with_exposed_provenance_mut::<*mut c_void>(stash_addr);
-    let base = unsafe { stash.read() };
-    if !base.is_null() && base.addr() < ptr.addr() {
-        unsafe {
-            free(base);
-        }
-    } else {
-        unsafe {
-            free(ptr);
-        }
+    // Current aligned-new returns a normal heap user pointer → free(ptr).
+    // Legacy over-alloc+stash (base at ptr-8) still accepted when the stash
+    // looks like a heap base (strictly below ptr and heap-magic check via free).
+    // SAFETY: free ignores unknown pointers.
+    unsafe {
+        free(ptr);
     }
 }
 

@@ -116,8 +116,25 @@ pub fn read_thin_arm64(path: &Path) -> Result<Vec<u8>, LoadError> {
 
 /// Reads and parses a Mach-O file, selecting the arm64 slice from fat images.
 pub fn parse_path(path: &Path) -> Result<MachOImage, LoadError> {
-    let bytes = fs::read(path)?;
-    parse_bytes(&bytes, &path.display().to_string())
+    let (image, _) = parse_path_with_bytes(path)?;
+    Ok(image)
+}
+
+/// Like [`parse_path`], but returns the **full on-disk container** as a
+/// [`crate::FileImage`] (prefer `mmap`, demand-paged).
+///
+/// Callers reuse that buffer for segment fill ([`GuestMemory::map_image_bytes`])
+/// and bind (via [`thin_arm64_bytes`]) so large guests avoid a second disk pass
+/// and avoid forcing the entire multi‑hundred‑MiB file into RSS up front.
+///
+/// **Fat containers:** parse uses the full container so
+/// [`MachOSummary::file_slice_offset`] stays correct for map `fileoff`.
+pub fn parse_path_with_bytes(
+    path: &Path,
+) -> Result<(MachOImage, crate::FileImage), LoadError> {
+    let file = crate::FileImage::open(path)?;
+    let image = parse_bytes(file.as_slice(), &path.display().to_string())?;
+    Ok((image, file))
 }
 
 /// Parses Mach-O bytes. `path_label` is stored in the summary for display.

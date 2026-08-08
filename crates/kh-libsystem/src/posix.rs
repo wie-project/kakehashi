@@ -3038,6 +3038,9 @@ pub(crate) unsafe extern "C" fn mktime(tm: *mut c_void) -> i64 {
 // ── heap ────────────────────────────────────────────────────────────────────
 
 /// C `posix_memalign` → nlist `_posix_memalign`.
+///
+/// Returns a pointer freeable with `free` (heap header sits immediately before
+/// the user address). High alignments use the page-aligned mmap path.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut c_void,
@@ -3050,17 +3053,12 @@ pub(crate) unsafe extern "C" fn posix_memalign(
     if alignment < core::mem::size_of::<*mut c_void>() {
         return EINVAL;
     }
-    // Over-allocate and align within the bump block (never free-aligned precisely).
-    let need = size.saturating_add(alignment);
-    let raw = unsafe { malloc(need) };
-    if raw.is_null() {
+    let p = crate::heap::allocate_aligned(size, alignment);
+    if p.is_null() {
         return ENOMEM;
     }
-    let addr = raw.addr();
-    let align_mask = alignment.saturating_sub(1);
-    let aligned = addr.saturating_add(align_mask) & !align_mask;
     unsafe {
-        memptr.write(core::ptr::with_exposed_provenance_mut::<c_void>(aligned));
+        memptr.write(p);
     }
     0
 }

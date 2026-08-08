@@ -161,7 +161,7 @@ fn create_anon_fd(name: &str) -> Option<RawFd> {
         if fd < 0 {
             return create_temp_fd();
         }
-        return Some(fd as RawFd);
+        Some(fd as RawFd)
     }
     #[cfg(not(target_os = "linux"))]
     {

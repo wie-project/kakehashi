@@ -6,9 +6,11 @@
 //! bind streams.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use goblin::mach::Mach;
-use goblin::mach::symbols::{N_EXT, N_SECT, N_TYPE, N_UNDF, N_WEAK_REF};
+use goblin::mach::load_command::CommandVariant;
+use goblin::mach::symbols::{N_EXT, N_SECT, N_TYPE, N_UNDF, N_WEAK_REF, Symbols};
 
 use kh_runtime::{mprotect_darwin, mprotect_rw};
 
@@ -40,46 +42,109 @@ pub struct UndefinedSymbol {
 /// External defined symbols from the nlist (empty if no symtab).
 ///
 /// Does **not** use dyld export tries or bind opcodes.
+///
+/// When `LC_DYSYMTAB` is present, only walks the **externally defined** range
+/// (`iextdefsym`..`+nextdefsym`). Product tools like CLT `clang` have hundreds
+/// of thousands of local nlists and **zero** external defs — a full table walk
+/// was pure waste (~tens of ms per image). Missing dysymtab → full walk
+/// (fixtures / tiny images).
 pub fn defined_exports(bytes: &[u8]) -> Result<Vec<DefinedSymbol>, LoadError> {
+    let thin = thin_arm64_bytes(bytes)?;
+    let macho = parse_macho_binary(thin)?;
+    let Some(symbols) = macho.symbols.as_ref() else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::new();
-    for_each_nlist(bytes, |name, nlist| {
-        if nlist.is_stab() || (nlist.n_type & N_EXT) == 0 {
-            return;
+    match dysym_extdef_range(&macho) {
+        Some(r) if r.is_empty() => return Ok(out),
+        Some(r) => {
+            out.reserve(r.len().min(4096));
+            for_each_nlist_index(symbols, r, |name, nlist| {
+                push_defined_export(&mut out, name, &nlist);
+            })?;
         }
-        if nlist.n_type & N_TYPE != N_SECT {
-            return;
+        None => {
+            // No / vacuous dysymtab (many fixtures): full nlist walk.
+            for entry in symbols {
+                match entry {
+                    Ok((name, nlist)) => push_defined_export(&mut out, name, &nlist),
+                    Err(err) => return Err(LoadError::NotMachO(format!("nlist: {err}"))),
+                }
+            }
         }
-        out.push(DefinedSymbol {
-            name: name.to_owned(),
-            value: nlist.n_value,
-            sect: u8::try_from(nlist.n_sect).unwrap_or(u8::MAX),
-        });
-    })?;
+    }
     Ok(out)
+}
+
+fn push_defined_export(
+    out: &mut Vec<DefinedSymbol>,
+    name: &str,
+    nlist: &goblin::mach::symbols::Nlist,
+) {
+    if nlist.is_stab() || (nlist.n_type & N_EXT) == 0 {
+        return;
+    }
+    if nlist.n_type & N_TYPE != N_SECT {
+        return;
+    }
+    out.push(DefinedSymbol {
+        name: name.to_owned(),
+        value: nlist.n_value,
+        sect: u8::try_from(nlist.n_sect).unwrap_or(u8::MAX),
+    });
 }
 
 /// External undefined symbols from the nlist in table order (empty if no symtab).
 ///
 /// Does **not** call goblin `MachO::imports()` / bind opcodes.
+///
+/// With `LC_DYSYMTAB`, only walks `iundefsym`..`+nundefsym` (skip locals/extdefs).
 pub fn undefined_imports(bytes: &[u8]) -> Result<Vec<UndefinedSymbol>, LoadError> {
+    let thin = thin_arm64_bytes(bytes)?;
+    let macho = parse_macho_binary(thin)?;
+    let Some(symbols) = macho.symbols.as_ref() else {
+        return Ok(Vec::new());
+    };
     let mut out = Vec::new();
-    for_each_nlist(bytes, |name, nlist| {
-        if nlist.is_stab() || (nlist.n_type & N_EXT) == 0 {
-            return;
+    match dysym_undef_range(&macho) {
+        Some(r) if r.is_empty() => return Ok(out),
+        Some(r) => {
+            out.reserve(r.len().min(1024));
+            for_each_nlist_index(symbols, r, |name, nlist| {
+                push_undefined_import(&mut out, name, &nlist);
+            })?;
         }
-        // N_UNDF external (and prebound-undef treated the same for Micro).
-        if nlist.n_type & N_TYPE != N_UNDF {
-            return;
+        None => {
+            for entry in symbols {
+                match entry {
+                    Ok((name, nlist)) => push_undefined_import(&mut out, name, &nlist),
+                    Err(err) => return Err(LoadError::NotMachO(format!("nlist: {err}"))),
+                }
+            }
         }
-        if nlist.n_sect != 0 {
-            return;
-        }
-        out.push(UndefinedSymbol {
-            name: name.to_owned(),
-            weak_ref: nlist.n_desc & N_WEAK_REF != 0,
-        });
-    })?;
+    }
     Ok(out)
+}
+
+fn push_undefined_import(
+    out: &mut Vec<UndefinedSymbol>,
+    name: &str,
+    nlist: &goblin::mach::symbols::Nlist,
+) {
+    if nlist.is_stab() || (nlist.n_type & N_EXT) == 0 {
+        return;
+    }
+    // N_UNDF external (and prebound-undef treated the same for Micro).
+    if nlist.n_type & N_TYPE != N_UNDF {
+        return;
+    }
+    if nlist.n_sect != 0 {
+        return;
+    }
+    out.push(UndefinedSymbol {
+        name: name.to_owned(),
+        weak_ref: nlist.n_desc & N_WEAK_REF != 0,
+    });
 }
 
 /// Bind main external undefined nlist symbols into contiguous `__got` slots.
@@ -182,18 +247,45 @@ pub(crate) fn fill_exports(session: &mut LoadSession) -> Result<(), LoadError> {
     for img in &mut session.images {
         if !matches!(img.status, ImageLoadStatus::Mapped) {
             img.exports.clear();
+            img.export_by_name.clear();
             continue;
         }
         if img.path.as_os_str().is_empty() {
             img.exports.clear();
+            img.export_by_name.clear();
             continue;
         }
-        let bytes = read_thin_arm64(&img.path)?;
-        img.exports = defined_exports(&bytes)?;
+        // Prefer container retained from parse (no second full-file read).
+        img.exports = if let Some(container) = img.file_bytes.as_ref() {
+            let thin = thin_arm64_bytes(container.as_slice())?;
+            defined_exports(thin)?
+        } else {
+            let bytes = read_thin_arm64(&img.path)?;
+            defined_exports(&bytes)?
+        };
+        // O(1) bind/chained lookup; same preferred VAs as `exports`.
+        img.export_by_name.clear();
+        img.export_by_name.reserve(img.exports.len().saturating_add(1));
+        for exp in &img.exports {
+            img.export_by_name
+                .entry(exp.name.clone())
+                .or_insert(exp.value);
+        }
+        // Darwin clients (e.g. curl) import the unadorned dyld helper name;
+        // freestanding libSystem exports `_dyld_stub_binder`.
+        if let Some(v) = img.export_by_name.get("_dyld_stub_binder").copied() {
+            img.export_by_name
+                .entry("dyld_stub_binder".into())
+                .or_insert(v);
+        }
     }
     Ok(())
 }
 
+/// Flat export map: first definition in load order wins (slid absolute VA).
+///
+/// Prefer [`crate::bind::BindResolveCache`] during bind — this rebuilds the map
+/// and is kept for the nlist-GOT fallback path only.
 pub(crate) fn build_export_map(images: &[ProcessImage]) -> HashMap<String, u64> {
     let mut map = HashMap::new();
     for img in images {
@@ -201,15 +293,17 @@ pub(crate) fn build_export_map(images: &[ProcessImage]) -> HashMap<String, u64> 
             continue;
         }
         let slide = img.slide();
-        for exp in &img.exports {
-            map.entry(exp.name.clone())
-                .or_insert_with(|| exp.value.wrapping_add(slide));
+        if img.export_by_name.is_empty() {
+            for exp in &img.exports {
+                map.entry(exp.name.clone())
+                    .or_insert_with(|| exp.value.wrapping_add(slide));
+            }
+        } else {
+            for (name, &pref) in &img.export_by_name {
+                map.entry(name.clone())
+                    .or_insert_with(|| pref.wrapping_add(slide));
+            }
         }
-    }
-    // Darwin clients (e.g. curl) import the unadorned dyld helper name; freestanding
-    // libSystem exports the C-style `_dyld_stub_binder` nlist.
-    if let Some(&va) = map.get("_dyld_stub_binder") {
-        map.entry("dyld_stub_binder".into()).or_insert(va);
     }
     map
 }
@@ -283,27 +377,69 @@ fn write_got_slots(
     Ok(())
 }
 
-fn for_each_nlist<F>(bytes: &[u8], mut f: F) -> Result<(), LoadError>
+fn parse_macho_binary(thin: &[u8]) -> Result<goblin::mach::MachO<'_>, LoadError> {
+    match Mach::parse(thin) {
+        Ok(Mach::Binary(m)) => Ok(m),
+        Ok(Mach::Fat(_)) => Err(LoadError::NotMachO(
+            "nested fat image inside arm64 slice".into(),
+        )),
+        Err(err) => Err(LoadError::NotMachO(err.to_string())),
+    }
+}
+
+/// `LC_DYSYMTAB` externally-defined range, when the command is trustworthy.
+///
+/// Returns `None` when there is no dysymtab **or** the command is all zeros
+/// (some synthetic fixtures ship `LC_DYSYMTAB` with empty counts while still
+/// having nlist symbols). Real tools (CLT `clang`: hundreds of thousands of
+/// locals, `nextdefsym == 0`) keep the empty range so we skip the local walk.
+fn dysym_extdef_range(macho: &goblin::mach::MachO<'_>) -> Option<Range<usize>> {
+    for lc in &macho.load_commands {
+        if let CommandVariant::Dysymtab(d) = &lc.command {
+            if dysymtab_is_vacuous(d) {
+                return None;
+            }
+            let start = usize::try_from(d.iextdefsym).ok()?;
+            let count = usize::try_from(d.nextdefsym).ok()?;
+            return Some(start..start.saturating_add(count));
+        }
+    }
+    None
+}
+
+/// `LC_DYSYMTAB` undefined range, when the command is trustworthy.
+fn dysym_undef_range(macho: &goblin::mach::MachO<'_>) -> Option<Range<usize>> {
+    for lc in &macho.load_commands {
+        if let CommandVariant::Dysymtab(d) = &lc.command {
+            if dysymtab_is_vacuous(d) {
+                return None;
+            }
+            let start = usize::try_from(d.iundefsym).ok()?;
+            let count = usize::try_from(d.nundefsym).ok()?;
+            return Some(start..start.saturating_add(count));
+        }
+    }
+    None
+}
+
+/// True when `LC_DYSYMTAB` has no local/extdef/undef counts at all (unusable).
+fn dysymtab_is_vacuous(d: &goblin::mach::load_command::DysymtabCommand) -> bool {
+    d.nlocalsym == 0 && d.nextdefsym == 0 && d.nundefsym == 0
+}
+
+fn for_each_nlist_index<F>(
+    symbols: &Symbols<'_>,
+    range: Range<usize>,
+    mut f: F,
+) -> Result<(), LoadError>
 where
     F: FnMut(&str, goblin::mach::symbols::Nlist),
 {
-    // Accept fat containers: reduce to arm64 thin before nlist walk.
-    let thin = thin_arm64_bytes(bytes)?;
-    let macho = match Mach::parse(thin) {
-        Ok(Mach::Binary(m)) => m,
-        Ok(Mach::Fat(_)) => {
-            return Err(LoadError::NotMachO(
-                "nested fat image inside arm64 slice".into(),
-            ));
-        }
-        Err(err) => return Err(LoadError::NotMachO(err.to_string())),
-    };
-
-    for entry in macho.symbols() {
-        match entry {
+    for i in range {
+        match symbols.get(i) {
             Ok((name, nlist)) => f(name, nlist),
             Err(err) => {
-                return Err(LoadError::NotMachO(format!("nlist: {err}")));
+                return Err(LoadError::NotMachO(format!("nlist[{i}]: {err}")));
             }
         }
     }

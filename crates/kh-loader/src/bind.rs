@@ -5,7 +5,8 @@
 //! When an image has no bind opcodes, falls back to nlist → `__got` for the
 //! main executable (Phase 6 fixtures / tools without dyld info).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use goblin::mach::Mach;
 use goblin::mach::bind_opcodes::{
@@ -24,9 +25,9 @@ use scroll::{Sleb128, Uleb128};
 
 use crate::error::LoadError;
 use crate::image::{DylibKind, MachOImage};
-use crate::link::{self, build_export_map, fill_exports};
-use crate::parse::{read_thin_arm64, thin_arm64_bytes};
-use crate::session::{ImageLoadStatus, LoadSession, ProcessImage};
+use crate::link::{self, fill_exports};
+use crate::parse::thin_arm64_bytes;
+use crate::session::{ImageLoadStatus, LoadSession, ProcessImage, SkipReason};
 
 /// One pointer write derived from a bind opcode stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,130 @@ pub struct BindSite {
     pub is_lazy: bool,
 }
 
+/// Process-wide bind/chained resolve tables (built once per `bind_process`).
+///
+/// Avoids rebuilding a flat export `HashMap` (and re-walking install names /
+/// dep ordinals) on every site — critical for large guests with thousands of
+/// chained/classic binds.
+#[derive(Debug)]
+pub struct BindResolveCache {
+    /// Slid absolute VA; first definition in load order wins.
+    flat: HashMap<String, u64>,
+    /// Mapped image index by `install_name`.
+    install_to_idx: HashMap<String, usize>,
+    /// Mapped image index by path basename (`libSystem.B.dylib`).
+    basename_to_idx: HashMap<String, usize>,
+    /// Skipped-duplicate install_name → `real_path` (bottle alias).
+    alias_real: HashMap<String, PathBuf>,
+    /// Mapped `real_path` → image index.
+    real_to_idx: HashMap<PathBuf, usize>,
+    /// Per-image dependent dylib install names (non-`LC_ID_DYLIB`), load order.
+    deps: Vec<Vec<String>>,
+    missing_named: Option<u64>,
+    missing_anon: Option<u64>,
+}
+
+impl BindResolveCache {
+    /// Build export / install-name indexes for the current process set.
+    #[must_use]
+    pub fn build(images: &[ProcessImage]) -> Self {
+        let mut flat = HashMap::new();
+        let mut install_to_idx = HashMap::new();
+        let mut basename_to_idx = HashMap::new();
+        let mut alias_real = HashMap::new();
+        let mut real_to_idx = HashMap::new();
+        let mut deps = Vec::with_capacity(images.len());
+
+        for (idx, img) in images.iter().enumerate() {
+            let dep_list = img
+                .image
+                .as_ref()
+                .map(dependent_dylib_names)
+                .unwrap_or_default();
+            deps.push(dep_list);
+
+            match &img.status {
+                ImageLoadStatus::Mapped => {
+                    let slide = img.slide();
+                    if img.export_by_name.is_empty() {
+                        for exp in &img.exports {
+                            flat.entry(exp.name.clone())
+                                .or_insert_with(|| exp.value.wrapping_add(slide));
+                        }
+                    } else {
+                        for (name, &pref) in &img.export_by_name {
+                            flat.entry(name.clone())
+                                .or_insert_with(|| pref.wrapping_add(slide));
+                        }
+                    }
+                    install_to_idx
+                        .entry(img.install_name.clone())
+                        .or_insert(idx);
+                    if let Some(base) = img.path.file_name().and_then(|n| n.to_str()) {
+                        basename_to_idx.entry(base.to_owned()).or_insert(idx);
+                    }
+                    if !img.real_path.as_os_str().is_empty() {
+                        real_to_idx.entry(img.real_path.clone()).or_insert(idx);
+                    }
+                }
+                ImageLoadStatus::Skipped(SkipReason::Duplicate) => {
+                    alias_real
+                        .entry(img.install_name.clone())
+                        .or_insert_with(|| img.real_path.clone());
+                }
+                ImageLoadStatus::Skipped(_) => {}
+            }
+        }
+
+        let missing_named = flat.get("_kh_missing_symbol_named").copied();
+        let missing_anon = flat.get("_kh_missing_symbol").copied();
+
+        Self {
+            flat,
+            install_to_idx,
+            basename_to_idx,
+            alias_real,
+            real_to_idx,
+            deps,
+            missing_named,
+            missing_anon,
+        }
+    }
+
+    fn find_mapped_idx(&self, install_name: &str) -> Option<usize> {
+        if let Some(&idx) = self.install_to_idx.get(install_name) {
+            return Some(idx);
+        }
+        // Original path also matched `install_name.ends_with(path_basename)`.
+        if let Some(base) = Path::new(install_name).file_name().and_then(|n| n.to_str())
+            && let Some(&idx) = self.basename_to_idx.get(base)
+        {
+            return Some(idx);
+        }
+        let alias_key = self.alias_real.get(install_name)?;
+        if alias_key.as_os_str().is_empty() {
+            return None;
+        }
+        self.real_to_idx.get(alias_key).copied()
+    }
+
+    fn dep_name(&self, binder_idx: usize, ordinal: u32) -> Result<&str, LoadError> {
+        let deps = self.deps.get(binder_idx).ok_or(LoadError::NotImplemented(
+            "binder image missing for bind resolve",
+        ))?;
+        let idx = ordinal
+            .checked_sub(1)
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or_else(|| LoadError::Resolve(format!("invalid dylib ordinal {ordinal}")))?;
+        deps.get(idx).map(String::as_str).ok_or_else(|| {
+            LoadError::Resolve(format!(
+                "dylib ordinal {ordinal} out of range ({} deps)",
+                deps.len()
+            ))
+        })
+    }
+}
+
 /// Fill exports, then bind each mapped image.
 ///
 /// Preference per image:
@@ -56,36 +181,64 @@ pub struct BindSite {
 ///
 /// Call **after** map and (non-chained) section rebase.
 pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
-    fill_exports(session)?;
+    crate::load_timing::time_result("bind_fill_exports", || fill_exports(session))?;
+    let cache = crate::load_timing::time(
+        "bind_resolve_cache",
+        || BindResolveCache::build(session.images()),
+    );
 
-    let paths: Vec<_> = session
-        .images
-        .iter()
-        .map(|img| {
-            (
-                img.path.clone(),
-                matches!(img.status, ImageLoadStatus::Mapped),
-            )
-        })
-        .collect();
-
+    let n = session.images.len();
     let mut used_any = false;
-    for (idx, (path, mapped)) in paths.into_iter().enumerate() {
-        if !mapped || path.as_os_str().is_empty() {
+    for idx in 0..n {
+        let mapped = session
+            .images
+            .get(idx)
+            .is_some_and(|i| matches!(i.status, ImageLoadStatus::Mapped));
+        if !mapped {
             continue;
         }
-        let bytes = read_thin_arm64(&path)?;
-        if crate::chained::bytes_have_chained_fixups(&bytes)? {
-            crate::chained::apply_chained_fixups(session, idx, &bytes)?;
+        // Prefer container from parse (mmap or heap; no second disk pass).
+        let container =
+            if let Some(b) = session.images.get_mut(idx).and_then(|i| i.file_bytes.take()) {
+                b
+            } else {
+                let path = session
+                    .images
+                    .get(idx)
+                    .map(|i| i.path.clone())
+                    .unwrap_or_default();
+                if path.as_os_str().is_empty() {
+                    continue;
+                }
+                crate::load_timing::time_result("bind_reread_file", || {
+                    crate::FileImage::open(&path)
+                })?
+            };
+        // Bind/chained operate on the arm64 thin view (identity for thin files).
+        // Keep `container` alive for the duration — no full-file copy.
+        if crate::chained::bytes_have_chained_fixups(container.as_slice())? {
+            crate::load_timing::time_result("bind_chained", || {
+                crate::chained::apply_chained_fixups(
+                    session,
+                    idx,
+                    container.as_slice(),
+                    &cache,
+                )
+            })?;
             used_any = true;
             continue;
         }
-        let sites = collect_bind_sites(&bytes)?;
+        let sites = crate::load_timing::time_result("bind_collect_sites", || {
+            collect_bind_sites(container.as_slice())
+        })?;
         if sites.is_empty() {
             continue;
         }
         used_any = true;
-        apply_bind_sites(session, idx, &sites)?;
+        crate::load_timing::time_result("bind_apply_sites", || {
+            apply_bind_sites(session, idx, &sites, &cache)
+        })?;
+        drop(container);
     }
 
     if !used_any {
@@ -97,10 +250,8 @@ pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
 
 /// Bind an unresolved strong import to a named missing trampoline (or anonymous
 /// `_kh_missing_symbol` if the named handler is absent).
-fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, LoadError> {
-    let named = lookup_flat(images, "_kh_missing_symbol_named", false).ok();
-    let anon = lookup_flat(images, "_kh_missing_symbol", false).ok();
-    if let Some(handler) = named {
+fn resolve_missing_stub(cache: &BindResolveCache, name: &str) -> Result<u64, LoadError> {
+    if let Some(handler) = cache.missing_named {
         match crate::missing_stub::trampoline_for(name, handler) {
             Ok(va) => {
                 // Expected for incomplete libSystem; list at debug, not every run.
@@ -120,14 +271,14 @@ fn resolve_missing_stub(images: &[ProcessImage], name: &str) -> Result<u64, Load
             }
         }
     }
-    if let Some(stub) = anon {
+    if let Some(stub) = cache.missing_anon {
         tracing::debug!(
             name = %name,
             "unresolved strong symbol; bound to _kh_missing_symbol"
         );
         return Ok(stub);
     }
-    if let Some(handler) = named {
+    if let Some(handler) = cache.missing_named {
         // No trampoline path; still better than hard fail for load.
         tracing::debug!(
             name = %name,
@@ -394,6 +545,7 @@ fn apply_bind_sites(
     session: &mut LoadSession,
     image_idx: usize,
     sites: &[BindSite],
+    cache: &BindResolveCache,
 ) -> Result<(), LoadError> {
     let slide = session.images.get(image_idx).map_or(0, ProcessImage::slide);
 
@@ -405,7 +557,7 @@ fn apply_bind_sites(
                 "non-POINTER classic bind type (TEXT absolute/pcrel)",
             ));
         }
-        let resolved = resolve_bind_symbol(session.images(), image_idx, site)?;
+        let resolved = resolve_bind_symbol(cache, session.images(), image_idx, site)?;
         let value = if site.addend == 0 {
             resolved
         } else {
@@ -428,24 +580,26 @@ fn apply_bind_sites(
 
 /// Resolve a two-level (or special/flat) import for bind / chained fixups.
 pub(crate) fn resolve_bind_symbol(
+    cache: &BindResolveCache,
     images: &[ProcessImage],
     binder_idx: usize,
     site: &BindSite,
 ) -> Result<u64, LoadError> {
-    match resolve_bind_symbol_inner(images, binder_idx, site) {
+    match resolve_bind_symbol_inner(cache, images, binder_idx, site) {
         Ok(va) => Ok(va),
         Err(LoadError::UnresolvedSymbol { name }) if !site.weak => {
             // Large guests (curl) import more libc surface than freestanding
             // libSystem implements. Point each strong miss at a per-name
             // trampoline → `_kh_missing_symbol_named` so the first *call*
             // prints which import we still need (G1).
-            resolve_missing_stub(images, &name)
+            resolve_missing_stub(cache, &name)
         }
         Err(err) => Err(err),
     }
 }
 
 fn resolve_bind_symbol_inner(
+    cache: &BindResolveCache,
     images: &[ProcessImage],
     binder_idx: usize,
     site: &BindSite,
@@ -465,26 +619,23 @@ fn resolve_bind_symbol_inner(
         -2 => {
             // BIND_SPECIAL_DYLIB_FLAT_LOOKUP
             debug_assert_eq!(BIND_SPECIAL_DYLIB_FLAT_LOOKUP, 0xe);
-            lookup_flat(images, &site.name, site.weak)
+            lookup_flat(cache, &site.name, site.weak)
         }
         -3 => {
             // BIND_SPECIAL_DYLIB_WEAK_LOOKUP (object/macho: -3; not in goblin yet).
             // Search all loaded images for a definition (weak coalescing). Same
             // map walk as flat lookup for our micro loader.
-            lookup_flat(images, &site.name, site.weak)
+            lookup_flat(cache, &site.name, site.weak)
         }
         n if n > 0 => {
-            let binder = images.get(binder_idx).ok_or(LoadError::NotImplemented(
-                "binder image missing for bind resolve",
-            ))?;
             let ordinal_u32 = u32::try_from(n)
                 .map_err(|_| LoadError::Resolve(format!("bind ordinal out of u32 range: {n}")))?;
-            let dep_name = nth_dependent_dylib(binder, ordinal_u32)?;
-            if let Some(img) = find_mapped_by_install_name(images, &dep_name) {
-                lookup_in_image(Some(img), &site.name, site.weak)
+            let dep_name = cache.dep_name(binder_idx, ordinal_u32)?;
+            if let Some(idx) = cache.find_mapped_idx(dep_name) {
+                lookup_in_image(images.get(idx), &site.name, site.weak)
             } else if site.weak {
                 Ok(0)
-            } else if let Ok(va) = lookup_flat(images, &site.name, false) {
+            } else if let Ok(va) = lookup_flat(cache, &site.name, false) {
                 // Framework skipped (e.g. CoreFoundation) but freestanding
                 // libSystem may still export a stub for G1 probes (curl).
                 tracing::debug!(
@@ -506,24 +657,6 @@ fn resolve_bind_symbol_inner(
     }
 }
 
-fn nth_dependent_dylib(binder: &ProcessImage, ordinal: u32) -> Result<String, LoadError> {
-    let image = binder
-        .image
-        .as_ref()
-        .ok_or(LoadError::NotImplemented("binder has no Mach-O image"))?;
-    let deps = dependent_dylib_names(image);
-    let idx = ordinal
-        .checked_sub(1)
-        .and_then(|i| usize::try_from(i).ok())
-        .ok_or_else(|| LoadError::Resolve(format!("invalid dylib ordinal {ordinal}")))?;
-    deps.get(idx).cloned().ok_or_else(|| {
-        LoadError::Resolve(format!(
-            "dylib ordinal {ordinal} out of range ({} deps)",
-            deps.len()
-        ))
-    })
-}
-
 fn dependent_dylib_names(image: &MachOImage) -> Vec<String> {
     image
         .dylibs
@@ -531,43 +664,6 @@ fn dependent_dylib_names(image: &MachOImage) -> Vec<String> {
         .filter(|d| d.kind != DylibKind::Id)
         .map(|d| d.name.clone())
         .collect()
-}
-
-fn find_mapped_by_install_name<'a>(
-    images: &'a [ProcessImage],
-    install_name: &str,
-) -> Option<&'a ProcessImage> {
-    if let Some(img) = images.iter().find(|img| {
-        matches!(img.status, ImageLoadStatus::Mapped)
-            && (img.install_name == install_name
-                || img
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| install_name.ends_with(n)))
-    }) {
-        return Some(img);
-    }
-
-    // Bottle alias: `libc++.1.dylib` → same real path as already-mapped
-    // `libSystem.B.dylib` is recorded as `skipped:duplicate`. Reuse the mapped
-    // image so two-level binds against the alias ordinal still resolve.
-    //
-    // Use the load-time cached `real_path` (no per-bind `canonicalize` /
-    // readlinkat storm — roadmap A4).
-    let alias = images.iter().find(|img| {
-        matches!(
-            img.status,
-            ImageLoadStatus::Skipped(crate::session::SkipReason::Duplicate)
-        ) && img.install_name == install_name
-    })?;
-    let alias_key = &alias.real_path;
-    if alias_key.as_os_str().is_empty() {
-        return None;
-    }
-    images
-        .iter()
-        .find(|img| matches!(img.status, ImageLoadStatus::Mapped) && img.real_path == *alias_key)
 }
 
 fn lookup_in_image(img: Option<&ProcessImage>, name: &str, weak: bool) -> Result<u64, LoadError> {
@@ -590,13 +686,12 @@ fn lookup_in_image(img: Option<&ProcessImage>, name: &str, weak: bool) -> Result
         };
     }
     let slide = img.slide();
-    if let Some(exp) = img.exports.iter().find(|e| e.name == name) {
-        return Ok(exp.value.wrapping_add(slide));
+    if let Some(&pref) = img.export_by_name.get(name) {
+        return Ok(pref.wrapping_add(slide));
     }
-    // curl imports unadorned `dyld_stub_binder`; freestanding libSystem exports
-    // the C nlist `_dyld_stub_binder` (see `build_export_map` alias).
-    if name == "dyld_stub_binder"
-        && let Some(exp) = img.exports.iter().find(|e| e.name == "_dyld_stub_binder")
+    // Fallback when index not built (tests / nlist-only path).
+    if img.export_by_name.is_empty()
+        && let Some(exp) = img.exports.iter().find(|e| e.name == name)
     {
         return Ok(exp.value.wrapping_add(slide));
     }
@@ -609,9 +704,8 @@ fn lookup_in_image(img: Option<&ProcessImage>, name: &str, weak: bool) -> Result
     }
 }
 
-fn lookup_flat(images: &[ProcessImage], name: &str, weak: bool) -> Result<u64, LoadError> {
-    let map = build_export_map(images);
-    match map.get(name) {
+fn lookup_flat(cache: &BindResolveCache, name: &str, weak: bool) -> Result<u64, LoadError> {
+    match cache.flat.get(name) {
         Some(&va) => Ok(va),
         None if weak => Ok(0),
         None => Err(LoadError::UnresolvedSymbol {

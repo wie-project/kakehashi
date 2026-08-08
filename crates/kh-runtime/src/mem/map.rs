@@ -9,12 +9,17 @@
 //!   then `MAP_FIXED_NOREPLACE` neighbours fails on Linux when ASLR put the
 //!   first mapping next to another VMA — common for preferred base `0` dylibs.)
 //! - `__PAGEZERO`-style regions (no access, no file, huge span) are skipped.
-//! - File-backed content is copied into private anonymous pages (simpler than
-//!   partial-page `MAP_PRIVATE` file maps). Executable pages start RW, then
-//!   `mprotect` applies final permissions (W^X friendly).
+//! - File-backed content: **host-page-aligned** full segments map the file
+//!   once with final prot (no anon+overlay, no bulk I-cache flush). Partial
+//!   edge pages still copy into an anon map. BSS beyond `filesize` stays
+//!   anonymous zeros. Interiors that are only page-aligned still use
+//!   `MAP_PRIVATE` file remap over anon (CoW on first write).
+//! - I-cache flush only after **userspace stores** into RX (edge fills /
+//!   residual `svc`→`brk` patches) — pure file maps stay demand-paged.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::ptr;
 
 use thiserror::Error;
@@ -45,6 +50,9 @@ pub struct MappedRegion {
     pub file_bytes: u64,
     /// Virtual size requested by the image (may be smaller than host map).
     pub vmsize: u64,
+    /// Relative `(offset, len)` within [`Self::file_bytes`] for residual `svc`
+    /// scan (instruction sections). Empty → scan whole `file_bytes`.
+    pub svc_scan_ranges: Vec<(u64, u64)>,
 }
 
 // SAFETY: `MappedRegion` uniquely owns the mapping; the pointer is never shared
@@ -113,6 +121,12 @@ pub struct MapRequest {
     pub initprot: u32,
     /// Maximum protection (`maxprot`, Darwin bits).
     pub maxprot: u32,
+    /// Relative `(offset, len)` ranges within mapped file content to scan for
+    /// residual Darwin `svc` (instruction sections only).
+    ///
+    /// Empty → trap backend falls back to the whole `filesize` span (fixtures
+    /// without section flags, or unknown layout).
+    pub svc_scan_ranges: Vec<(u64, u64)>,
 }
 
 impl MapRequest {
@@ -185,6 +199,29 @@ impl GuestMemory {
         requests: &[MapRequest],
         file: &mut File,
     ) -> Result<Self, MapError> {
+        let mut src = SegmentSource::File(file);
+        Self::map_image_with(host, preferred_base, requests, &mut src)
+    }
+
+    /// Like [`Self::map_image`], but fills segments from an in-memory container
+    /// (same bytes already read for Mach-O parse). Avoids a second disk pass
+    /// for large tools (any guest, not tool-specific).
+    pub fn map_image_bytes(
+        host: HostPageSize,
+        preferred_base: u64,
+        requests: &[MapRequest],
+        bytes: &[u8],
+    ) -> Result<Self, MapError> {
+        let mut src = SegmentSource::Bytes(bytes);
+        Self::map_image_with(host, preferred_base, requests, &mut src)
+    }
+
+    fn map_image_with(
+        host: HostPageSize,
+        preferred_base: u64,
+        requests: &[MapRequest],
+        src: &mut SegmentSource<'_>,
+    ) -> Result<Self, MapError> {
         let active: Vec<&MapRequest> = requests.iter().filter(|r| !r.should_skip()).collect();
         if active.is_empty() {
             return Ok(Self {
@@ -196,7 +233,7 @@ impl GuestMemory {
         }
 
         // Attempt 1: preferred VAs (slide = 0, never clobber host maps).
-        match Self::try_map_all(host, preferred_base, 0, &active, file, FixedMode::NoReplace) {
+        match Self::try_map_all(host, preferred_base, 0, &active, src, FixedMode::NoReplace) {
             Ok(regions) => {
                 return Ok(Self {
                     regions,
@@ -211,7 +248,7 @@ impl GuestMemory {
         }
 
         // Attempt 2: reserve full image span, slide every segment into it.
-        match Self::try_map_slid_reserved(host, preferred_base, &active, file) {
+        match Self::try_map_slid_reserved(host, preferred_base, &active, src) {
             Ok(mem) => return Ok(mem),
             Err(err) => {
                 tracing::debug!(error = %err, "reserved-span slid map failed; trying first-region slide");
@@ -220,7 +257,7 @@ impl GuestMemory {
 
         // Attempt 3 (legacy): free-place first region, fixed-relative rest.
         // Works when the image is a single segment or the kernel left a hole.
-        Self::try_map_slid_first_region(host, preferred_base, &active, file)
+        Self::try_map_slid_first_region(host, preferred_base, &active, src)
     }
 
     /// Kernel-chosen contiguous span for the whole image, then `MAP_FIXED` each segment.
@@ -228,7 +265,7 @@ impl GuestMemory {
         host: HostPageSize,
         preferred_base: u64,
         active: &[&MapRequest],
-        file: &mut File,
+        src: &mut SegmentSource<'_>,
     ) -> Result<Self, MapError> {
         let (span_lo, span_hi) = image_preferred_span(host, active)?;
         let span_len_u64 = span_hi.saturating_sub(span_lo);
@@ -268,7 +305,7 @@ impl GuestMemory {
             preferred_base,
             slide,
             active,
-            file,
+            src,
             FixedMode::Replace,
         ) {
             Ok(regions) => {
@@ -297,19 +334,19 @@ impl GuestMemory {
         host: HostPageSize,
         preferred_base: u64,
         active: &[&MapRequest],
-        file: &mut File,
+        src: &mut SegmentSource<'_>,
     ) -> Result<Self, MapError> {
         let first = active
             .first()
             .copied()
             .ok_or(MapError::Invalid("no active regions"))?;
-        let first_map = map_one(host, first, first.preferred_va, file, FixedMode::Free)?;
+        let first_map = map_one(host, first, first.preferred_va, src, FixedMode::Free)?;
         let slide = first_map.guest_addr.wrapping_sub(first.preferred_va);
 
         let mut regions = vec![first_map];
         for req in active.iter().skip(1) {
             let target = req.preferred_va.wrapping_add(slide);
-            match map_one(host, req, target, file, FixedMode::NoReplace) {
+            match map_one(host, req, target, src, FixedMode::NoReplace) {
                 Ok(region) => regions.push(region),
                 Err(err) => {
                     drop(regions);
@@ -332,13 +369,13 @@ impl GuestMemory {
         preferred_base: u64,
         slide: u64,
         active: &[&MapRequest],
-        file: &mut File,
+        src: &mut SegmentSource<'_>,
         fixed: FixedMode,
     ) -> Result<Vec<MappedRegion>, MapError> {
         let mut regions = Vec::with_capacity(active.len());
         for req in active {
             let target = req.preferred_va.wrapping_add(slide);
-            match map_one(host, req, target, file, fixed) {
+            match map_one(host, req, target, src, fixed) {
                 Ok(region) => regions.push(region),
                 Err(err) => {
                     drop(regions);
@@ -512,11 +549,51 @@ enum FixedMode {
     Replace,
 }
 
+/// Where segment file content comes from (disk or already-read container).
+enum SegmentSource<'a> {
+    File(&'a mut File),
+    Bytes(&'a [u8]),
+}
+
+impl SegmentSource<'_> {
+    fn copy_into(
+        &mut self,
+        fileoff: u64,
+        dst: &mut [u8],
+        region_name: &str,
+    ) -> Result<(), MapError> {
+        match self {
+            SegmentSource::File(file) => {
+                file.seek(SeekFrom::Start(fileoff))
+                    .map_err(|source| MapError::File {
+                        name: region_name.to_owned(),
+                        source,
+                    })?;
+                file.read_exact(dst).map_err(|source| MapError::File {
+                    name: region_name.to_owned(),
+                    source,
+                })
+            }
+            SegmentSource::Bytes(bytes) => {
+                let start = usize::try_from(fileoff).map_err(|_| MapError::Invalid("fileoff"))?;
+                let end = start
+                    .checked_add(dst.len())
+                    .ok_or(MapError::Invalid("file range overflow"))?;
+                let Some(src) = bytes.get(start..end) else {
+                    return Err(MapError::Invalid("fileoff past container end"));
+                };
+                dst.copy_from_slice(src);
+                Ok(())
+            }
+        }
+    }
+}
+
 fn map_one(
     host: HostPageSize,
     req: &MapRequest,
     target_guest: u64,
-    file: &mut File,
+    src: &mut SegmentSource<'_>,
     mode: FixedMode,
 ) -> Result<MappedRegion, MapError> {
     let host_page = host.bytes();
@@ -528,8 +605,20 @@ fn map_one(
         return Err(MapError::Invalid("zero map length"));
     }
 
-    let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
     let fixed = matches!(mode, FixedMode::NoReplace | FixedMode::Replace);
+    let fixed_addr = if fixed { Some(target_guest) } else { None };
+
+    // Fast path: whole host map is one host-page-aligned file image.
+    // CLT tools (clang __TEXT ~100+ MiB) hit this — avoid anon+overlay and
+    // bulk I-cache flush so the guest stays demand-paged until first use.
+    if let SegmentSource::File(file) = src
+        && let Some(region) =
+            try_map_pure_file(host, req, target_guest, file, mode, map_len, fixed)
+    {
+        return Ok(region);
+    }
+
+    let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
     match mode {
         FixedMode::Free => {}
         FixedMode::NoReplace => flags |= host::fixed_map_flag(),
@@ -538,7 +627,6 @@ fn map_one(
 
     // Map RW first so we can fill file content; tighten with mprotect after.
     let prot_rw = libc::PROT_READ | libc::PROT_WRITE;
-    let fixed_addr = if fixed { Some(target_guest) } else { None };
 
     let Some(base) = host::mmap(fixed_addr, map_len, prot_rw, flags, -1, 0) else {
         return Err(MapError::Sys {
@@ -559,28 +647,43 @@ fn map_one(
         prot: req.initprot,
         file_bytes: 0,
         vmsize: req.vmsize,
+        svc_scan_ranges: req.svc_scan_ranges.clone(),
     };
 
-    // Copy file-backed bytes into the mapping.
+    // True when userspace stores wrote instruction (or any) bytes into the map.
+    let mut dirtied = false;
+
+    // Fill file-backed bytes: prefer page-aligned file MAP_PRIVATE (any guest).
     if req.filesize > 0 {
         let copy_len = usize::try_from(req.filesize.min(req.vmsize))
             .map_err(|_| MapError::Invalid("filesize too large"))?;
         if copy_len > map_len {
             return Err(MapError::Invalid("filesize exceeds map length"));
         }
-        file.seek(SeekFrom::Start(req.fileoff))
-            .map_err(|source| MapError::File {
-                name: req.name.clone(),
-                source,
-            })?;
-        let dst = region.host_bytes_mut();
-        let Some(slice) = dst.get_mut(..copy_len) else {
-            return Err(MapError::Invalid("copy slice out of range"));
+        let fill = match src {
+            SegmentSource::File(file) => fill_segment_file(
+                file,
+                base,
+                map_len,
+                req.fileoff,
+                copy_len,
+                host_page,
+                &req.name,
+            )?,
+            SegmentSource::Bytes(bytes) => {
+                fill_segment_bytes(bytes, base, map_len, req.fileoff, copy_len, host_page)?
+            }
         };
-        file.read_exact(slice).map_err(|source| MapError::File {
-            name: req.name.clone(),
-            source,
-        })?;
+        if fill.ok {
+            dirtied = fill.dirtied;
+        } else {
+            let dst = region.host_bytes_mut();
+            let Some(slice) = dst.get_mut(..copy_len) else {
+                return Err(MapError::Invalid("copy slice out of range"));
+            };
+            src.copy_into(req.fileoff, slice, &req.name)?;
+            dirtied = true;
+        }
         region.file_bytes = u64::try_from(copy_len).unwrap_or(0);
     }
 
@@ -593,10 +696,20 @@ fn map_one(
         });
     }
 
-    // aarch64: after writing instructions then mprotect(RX), flush I-cache so
-    // the CPU does not execute stale/garbage bytes (G4 SEGV with odd PC/addr).
-    if req.initprot & VM_PROT_EXECUTE != 0 {
-        clear_icache(base, map_len);
+    // aarch64: only flush after userspace wrote executable bytes. Pure file
+    // MAP_PRIVATE overlays leave D/I coherent for demand faults; flushing a
+    // 100+ MiB TEXT forced every page into RSS at load (any large guest).
+    if dirtied && req.initprot & VM_PROT_EXECUTE != 0 {
+        let flush_len = if region.file_bytes == 0 {
+            let page = usize::try_from(host_page).unwrap_or(4096);
+            map_len.min(page).max(4)
+        } else {
+            usize::try_from(region.file_bytes)
+                .unwrap_or(0)
+                .min(map_len)
+                .max(4)
+        };
+        clear_icache(base, flush_len);
     }
 
     // When fixed, require exact placement.
@@ -611,6 +724,243 @@ fn map_one(
     }
 
     Ok(region)
+}
+
+/// Map a whole segment as one `MAP_PRIVATE` file image with final prot.
+///
+/// Requires host-page-aligned `fileoff`, file bytes covering the full host map
+/// length (no BSS tail), and fixed guest VA page-aligned when fixed.
+fn try_map_pure_file(
+    host: HostPageSize,
+    req: &MapRequest,
+    target_guest: u64,
+    file: &File,
+    mode: FixedMode,
+    map_len: usize,
+    fixed: bool,
+) -> Option<MappedRegion> {
+    let host_page = u64::from(host.bytes());
+    if host_page == 0 {
+        return None;
+    }
+    let copy_u64 = req.filesize.min(req.vmsize);
+    if copy_u64 == 0 {
+        return None;
+    }
+    let Ok(copy_len) = usize::try_from(copy_u64) else {
+        return None;
+    };
+    // Full host mapping must be file-backed (no zero tail beyond filesize).
+    if copy_len != map_len {
+        return None;
+    }
+    if !req.fileoff.is_multiple_of(host_page) {
+        return None;
+    }
+    if fixed && !target_guest.is_multiple_of(host_page) {
+        return None;
+    }
+
+    let mut flags = libc::MAP_PRIVATE;
+    match mode {
+        FixedMode::Free => {}
+        FixedMode::NoReplace => flags |= host::fixed_map_flag(),
+        FixedMode::Replace => flags |= libc::MAP_FIXED,
+    }
+    let host_prot = darwin_to_host_prot(req.initprot);
+    let fixed_addr = if fixed { Some(target_guest) } else { None };
+    let fd = file.as_raw_fd();
+    let Ok(file_off) = i64::try_from(req.fileoff) else {
+        return None;
+    };
+    let Some(base) = host::mmap(fixed_addr, map_len, host_prot, flags, fd, file_off) else {
+        // Preferred-base collision etc. — caller falls back to anon+fill.
+        return None;
+    };
+    let actual_host = host::ptr_addr_u64(base);
+    if fixed && actual_host != target_guest {
+        let _ = host::munmap(base, map_len);
+        return None;
+    }
+    let guest_addr = if fixed { target_guest } else { actual_host };
+    Some(MappedRegion {
+        name: req.name.clone(),
+        guest_addr,
+        ptr: base,
+        len: map_len,
+        prot: req.initprot,
+        file_bytes: copy_u64,
+        vmsize: req.vmsize,
+        svc_scan_ranges: req.svc_scan_ranges.clone(),
+    })
+}
+
+/// Read `dst.len()` bytes from `file` at absolute `off`.
+fn read_file_range(file: &File, off: u64, dst: &mut [u8], name: &str) -> Result<(), MapError> {
+    let mut clone = file.try_clone().map_err(|source| MapError::File {
+        name: name.to_owned(),
+        source,
+    })?;
+    clone
+        .seek(SeekFrom::Start(off))
+        .map_err(|source| MapError::File {
+            name: name.to_owned(),
+            source,
+        })?;
+    clone.read_exact(dst).map_err(|source| MapError::File {
+        name: name.to_owned(),
+        source,
+    })
+}
+
+/// Result of filling a segment mapping from file or bytes.
+struct FillOutcome {
+    /// Fill completed (false → caller should fall back to full `copy_into`).
+    ok: bool,
+    /// Userspace stores touched the mapping (edge copies / memcpy).
+    dirtied: bool,
+}
+
+/// Fill `[0, copy_len)` of an anonymous mapping from a host file.
+///
+/// Host-page-aligned interior is remapped `MAP_PRIVATE` from the file (no
+/// full-TEXT `memcpy`). Partial edge pages are still copied.
+fn fill_segment_file(
+    file: &File,
+    base: *mut u8,
+    map_len: usize,
+    fileoff: u64,
+    copy_len: usize,
+    host_page: u32,
+    name: &str,
+) -> Result<FillOutcome, MapError> {
+    let page = u64::from(host_page);
+    if page == 0 || copy_len == 0 || copy_len > map_len {
+        return Ok(FillOutcome {
+            ok: false,
+            dirtied: false,
+        });
+    }
+
+    let content_lo = fileoff;
+    let content_hi = fileoff.saturating_add(u64::try_from(copy_len).unwrap_or(0));
+    // Full host pages strictly inside [content_lo, content_hi).
+    let aligned_lo = content_lo.div_ceil(page).saturating_mul(page);
+    let aligned_hi = content_hi
+        .checked_div(page)
+        .unwrap_or(0)
+        .saturating_mul(page);
+
+    // Mapping-relative offsets.
+    let lead = usize::try_from(aligned_lo.saturating_sub(content_lo)).unwrap_or(0);
+    let trail_off = usize::try_from(aligned_hi.saturating_sub(content_lo)).unwrap_or(0);
+    let mut dirtied = false;
+
+    // Interior: file-backed MAP_PRIVATE (kernel page cache / CoW).
+    if aligned_hi > aligned_lo {
+        let mid_len = usize::try_from(aligned_hi.saturating_sub(aligned_lo)).unwrap_or(0);
+        if mid_len == 0 || lead.saturating_add(mid_len) > map_len {
+            return Ok(FillOutcome {
+                ok: false,
+                dirtied: false,
+            });
+        }
+        // SAFETY: dest is within the anon mapping we just created.
+        let dest = unsafe { base.add(lead) };
+        let fd = file.as_raw_fd();
+        let flags = libc::MAP_PRIVATE | libc::MAP_FIXED;
+        let Some(mapped) = host::mmap(
+            Some(host::ptr_addr_u64(dest)),
+            mid_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            fd,
+            i64::try_from(aligned_lo).unwrap_or(0),
+        ) else {
+            return Err(MapError::Sys {
+                name: name.to_owned(),
+                source: std::io::Error::last_os_error(),
+            });
+        };
+        if mapped != dest {
+            let _ = host::munmap(mapped, mid_len);
+            return Err(MapError::Sys {
+                name: name.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "file-backed MAP_FIXED moved",
+                ),
+            });
+        }
+    }
+
+    // No full pages: whole range is partial — one copy.
+    if aligned_hi <= aligned_lo {
+        // SAFETY: base..base+copy_len inside map_len.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, copy_len) };
+        read_file_range(file, fileoff, dst, name)?;
+        return Ok(FillOutcome {
+            ok: true,
+            dirtied: true,
+        });
+    }
+
+    // Leading partial page.
+    if lead > 0 {
+        let n = lead.min(copy_len);
+        // SAFETY: lead < map_len when interior was validated (or no interior).
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, n) };
+        read_file_range(file, fileoff, dst, name)?;
+        dirtied = true;
+    }
+    // Trailing partial page.
+    if trail_off < copy_len {
+        let n = copy_len.saturating_sub(trail_off);
+        if n > 0 && trail_off < map_len {
+            let len = n.min(map_len.saturating_sub(trail_off));
+            // SAFETY: trail_off+len <= map_len.
+            let dst = unsafe { std::slice::from_raw_parts_mut(base.add(trail_off), len) };
+            let seek_at = fileoff.saturating_add(u64::try_from(trail_off).unwrap_or(0));
+            read_file_range(file, seek_at, dst, name)?;
+            dirtied = true;
+        }
+    }
+
+    Ok(FillOutcome {
+        ok: true,
+        dirtied,
+    })
+}
+
+/// Fill from an in-memory container (mmap of the same file or heap).
+///
+/// Uses the same partial-page policy: full host pages are still `memcpy` from
+/// the container (already demand-paged); edges match. Avoids a second disk
+/// path when the loader holds `FileImage`.
+fn fill_segment_bytes(
+    bytes: &[u8],
+    base: *mut u8,
+    map_len: usize,
+    fileoff: u64,
+    copy_len: usize,
+    _host_page: u32,
+) -> Result<FillOutcome, MapError> {
+    let start = usize::try_from(fileoff).map_err(|_| MapError::Invalid("fileoff"))?;
+    let end = start
+        .checked_add(copy_len)
+        .ok_or(MapError::Invalid("file range overflow"))?;
+    let Some(src) = bytes.get(start..end) else {
+        return Err(MapError::Invalid("fileoff past container end"));
+    };
+    if copy_len > map_len {
+        return Err(MapError::Invalid("filesize exceeds map length"));
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(base, copy_len) };
+    dst.copy_from_slice(src);
+    Ok(FillOutcome {
+        ok: true,
+        dirtied: true,
+    })
 }
 
 // libgcc / compiler-rt — same symbol as hypercall tramp setup.
@@ -749,6 +1099,7 @@ pub fn map_stack(host: HostPageSize, size: u64) -> Result<MappedRegion, MapError
         prot: VM_PROT_READ | VM_PROT_WRITE,
         file_bytes: 0,
         vmsize: map_len_u64,
+        svc_scan_ranges: Vec::new(),
     })
 }
 
@@ -818,6 +1169,7 @@ mod tests {
             filesize: 0,
             initprot: 0,
             maxprot: 0,
+            svc_scan_ranges: Vec::new(),
         };
         assert!(req.should_skip());
     }
@@ -839,6 +1191,7 @@ mod tests {
             filesize: u64::try_from(payload.len()).unwrap(),
             initprot: VM_PROT_READ | VM_PROT_WRITE,
             maxprot: VM_PROT_READ | VM_PROT_WRITE,
+            svc_scan_ranges: Vec::new(),
         }];
 
         let mem = GuestMemory::map_image(host, preferred, &reqs, &mut file).expect("map");
@@ -888,6 +1241,7 @@ mod tests {
                 filesize: u64::try_from(payload.len()).unwrap(),
                 initprot: VM_PROT_READ | VM_PROT_EXECUTE,
                 maxprot: VM_PROT_READ | VM_PROT_EXECUTE,
+                svc_scan_ranges: Vec::new(),
             },
             MapRequest {
                 name: "__DATA".into(),
@@ -897,6 +1251,7 @@ mod tests {
                 filesize: 0,
                 initprot: VM_PROT_READ | VM_PROT_WRITE,
                 maxprot: VM_PROT_READ | VM_PROT_WRITE,
+                svc_scan_ranges: Vec::new(),
             },
             MapRequest {
                 name: "__LINKEDIT".into(),
@@ -906,6 +1261,7 @@ mod tests {
                 filesize: 0,
                 initprot: VM_PROT_READ,
                 maxprot: VM_PROT_READ,
+                svc_scan_ranges: Vec::new(),
             },
         ];
 
@@ -945,6 +1301,7 @@ mod tests {
                 filesize: 0,
                 initprot: VM_PROT_READ,
                 maxprot: VM_PROT_READ,
+                svc_scan_ranges: Vec::new(),
             },
             MapRequest {
                 name: "b".into(),
@@ -954,6 +1311,7 @@ mod tests {
                 filesize: 0,
                 initprot: VM_PROT_READ,
                 maxprot: VM_PROT_READ,
+                svc_scan_ranges: Vec::new(),
             },
         ];
         let refs: Vec<&MapRequest> = reqs.iter().collect();

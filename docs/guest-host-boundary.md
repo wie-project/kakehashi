@@ -133,6 +133,7 @@ Fault PC inside **host** `libgcc_s` during worker exit signals illegal
 | `KAKEHASHI_FUTEX_STATS` | off | Print guest park/wake counters at exit |
 | `KAKEHASHI_BOUNDARY_STATS` | off | Count BSD/helper dispatches at exit (`1`/`on` = counts; `ns`/`time` = counts + host-side ns in `syscall::dispatch`) |
 | `KAKEHASHI_BOUNDARY_BENCH_ITERS` | (test default) | Iteration count for host dispatch class microbench (`boundary_bench` / `scripts/bench-boundary-classes.sh`) |
+| `KAKEHASHI_LOAD_TIMING` | off | Dump load-path phase wall times to stderr before guest entry (`1`/`on`); see `kh-loader::load_timing` |
 
 ### Bottle dirfd
 

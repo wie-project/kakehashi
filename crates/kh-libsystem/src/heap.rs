@@ -12,6 +12,21 @@
 //! power-of-two payload class (`16 … 128KiB`) make reuse **O(1)** per class
 //! (plus a short walk over empty larger classes).
 //!
+//! ## Alignment policy (clang / modern `ld`)
+//!
+//! - **Arena** (`<` [`MMAP_THRESHOLD`]): 16-byte alignment, freelist reuse.
+//!   Mid-size traffic (LLVM/clang working set) **must** stay here — routing
+//!   every `≥256` B alloc through anonymous `mmap`/`munmap` caused ~15k
+//!   boundary crossings per `-cc1` on `g4-mini` (~50× wall residual).
+//! - **mmap path** (`≥` [`MMAP_THRESHOLD`]): user pointer is **16 KiB-aligned**
+//!   (Darwin arm64 page). Covers large buffers and, with over-alloc,
+//!   `posix_memalign` / `operator new(align)` when align is a page.
+//! - **`vm_allocate`**: separate soft path in `posix.rs` (also page-aligned)
+//!   for modern `ld` `UnsafeHeaderWriter` when it uses Mach VM, not `malloc`.
+//!
+//! Do **not** re-introduce a blunt “every mid-size malloc is page-aligned mmap”
+//! shortcut for G5 — fix alignment on the explicit align / large / VM paths.
+//!
 //! ## Heap stats (`KAKEHASHI_HEAP_STATS`)
 //!
 //! **Off by default.** Opt-in counters for plate-A residual digs. Hot path when
@@ -37,17 +52,17 @@ const ARENA_SIZE: usize = 64 * 1024 * 1024;
 const PAGE: usize = 16_384;
 /// Allocations ≥ this size go straight to anonymous `mmap` (and `munmap` on free).
 ///
-/// At page size so modern Apple `ld` (`UnsafeHeaderWriter`) gets page-aligned
-/// `buffer.data()` (arm64 minHeaderAlignment == page). Arena bump only
-/// guarantees 16-byte alignment.
+/// Equal to Darwin arm64 page so large `malloc` returns a **page-aligned** user
+/// pointer (host Linux mmap is often only 4 KiB-aligned). Arena path only
+/// guarantees [`ALIGN`] (16). Mid-size (`ALIGN … PAGE`) stays on the freelist.
 const MMAP_THRESHOLD: usize = PAGE;
 const MAGIC_ARENA: u32 = 0x4B48_4152; // "KHAR"
 const MAGIC_MMAP: u32 = 0x4B48_4D4D; // "KHMM"
 const FLAG_FREE: u32 = 1;
 
 /// Power-of-two payload classes: `16 << i` for `i ∈ 0..NUM_CLASSES`.
-/// Last class is 128 KiB; requests in `(128KiB, MMAP_THRESHOLD)` still use the
-/// last freelist / bump (mmap only at ≥ [`MMAP_THRESHOLD`]).
+/// Last class is 128 KiB; live arena traffic is only `<` [`MMAP_THRESHOLD`]
+/// (larger requests use the page-aligned mmap path).
 const NUM_CLASSES: usize = 14; // 16 … 128KiB
 
 /// Header immediately before every user pointer.
@@ -169,7 +184,8 @@ static STAT_SIZE_BUCKET: [AtomicU64; SIZE_BUCKETS] = {
 
 #[inline]
 fn size_bucket(need: usize) -> usize {
-    // 0: <64, 1: <256, 2: <1k, 3: <4k, 4: <16k, 5: <64k, 6: <256k, 7: ≥256k
+    // 0: <64, 1: <256, 2: <1k, 3: <4k, 4: <16k (arena), 5: <64k mmap,
+    // 6: <256k mmap, 7: ≥256k mmap
     if need < 64 {
         0
     } else if need < 256 {
@@ -178,11 +194,11 @@ fn size_bucket(need: usize) -> usize {
         2
     } else if need < 4096 {
         3
-    } else if need < 16_384 {
+    } else if need < PAGE {
         4
     } else if need < 65_536 {
         5
-    } else if need < MMAP_THRESHOLD {
+    } else if need < 256 * 1024 {
         6
     } else {
         7
@@ -633,14 +649,8 @@ fn allocate(size: usize) -> *mut c_void {
     let need = align_up(need, ALIGN);
     note_size_bucket(need);
 
-    // G5: modern `ld` UnsafeHeaderWriter requires buffer.data() page-aligned
-    // (16 KiB Darwin arm64). Any non-trivial alloc uses page-aligned mmap so
-    // host 4 KiB pages still yield a 16 KiB-aligned user pointer. Tiny allocs
-    // stay on the arena (16-byte) for speed.
-    if need >= 256 {
-        return allocate_mmap(need);
-    }
-
+    // Large / page-class: anonymous mmap with 16 KiB-aligned user (see module
+    // docs). Mid-size stays on the size-class arena — do not force mmap here.
     if need >= MMAP_THRESHOLD {
         return allocate_mmap(need);
     }
@@ -656,6 +666,25 @@ fn allocate(size: usize) -> *mut c_void {
         return allocate_mmap(need);
     }
     p
+}
+
+/// Allocate `size` bytes with user pointer aligned to `align` (power of two).
+///
+/// Returned pointer is freeable with [`free`] (heap header immediately before
+/// the user address). Used by `posix_memalign` and high-align `operator new`.
+///
+/// - `align ≤ 16`: ordinary [`allocate`] (arena or large mmap).
+/// - `align > 16`: page-aligned mmap path (satisfies any power-of-two align
+///   up to Darwin page; larger align uses that align for the user pointer).
+pub(crate) fn allocate_aligned(size: usize, align: usize) -> *mut c_void {
+    let align = align.max(1).next_power_of_two().max(ALIGN);
+    let need = if size == 0 { 1 } else { size };
+    if align <= ALIGN {
+        return allocate(need);
+    }
+    // PAGE-aligned mmap user also satisfies smaller power-of-two aligns.
+    let user_align = align.max(PAGE);
+    allocate_mmap_aligned(need, user_align)
 }
 
 fn allocate_arena(need: usize) -> *mut c_void {
@@ -739,16 +768,29 @@ fn allocate_arena(need: usize) -> *mut c_void {
 }
 
 fn allocate_mmap(need: usize) -> *mut c_void {
-    // Layout (G5 / modern ld UnsafeHeaderWriter):
-    // Host Linux mmap is often 4 KiB-aligned, but guest `minHeaderAlignment` is
-    // Darwin arm64 page (16 KiB). User pointer must be **16 KiB-aligned**.
-    //   mmap base (host-aligned)
-    //   … pad …
-    //   Hdr immediately before user
-    //   user @ align_up(base+HDR_SIZE, PAGE)
-    // free stores original base in Hdr.next.
+    allocate_mmap_aligned(need, PAGE)
+}
+
+/// Anonymous mmap with user pointer aligned to `user_align` (power of two ≥ 16).
+///
+/// Layout:
+///   mmap base (host-aligned)
+///   … pad …
+///   Hdr immediately before user
+///   user @ align_up(base+HDR_SIZE, user_align)
+///
+/// `Hdr.next` = original mmap base; `Hdr.flags` = map length (bytes) for munmap
+/// (not a freelist link; MAGIC_MMAP never uses freelist).
+fn allocate_mmap_aligned(need: usize, user_align: usize) -> *mut c_void {
     let need = need.max(1);
-    let total = align_up(HDR_SIZE.saturating_add(need), PAGE).saturating_add(PAGE);
+    let user_align = user_align.max(ALIGN).next_power_of_two();
+    // Worst-case pad to user_align, then round map length to PAGE for host.
+    let total = align_up(
+        HDR_SIZE
+            .saturating_add(need)
+            .saturating_add(user_align),
+        PAGE,
+    );
     let prot = 3_u64; // PROT_READ | PROT_WRITE
     let flags = 0x1000_u64 | 0x0002_u64; // MAP_ANON | MAP_PRIVATE
     // Darwin `fd = -1` for MAP_ANON (sign-extended in the register).
@@ -781,12 +823,28 @@ fn allocate_mmap(need: usize) -> *mut c_void {
         }
         return core::ptr::null_mut();
     }
-    let user_addr = align_up(base.saturating_add(HDR_SIZE), PAGE);
-    debug_assert!(user_addr.saturating_add(need) <= base.saturating_add(total));
+    let user_addr = align_up(base.saturating_add(HDR_SIZE), user_align);
+    if user_addr.saturating_add(need) > base.saturating_add(total)
+        || user_addr < base.saturating_add(HDR_SIZE)
+    {
+        let _ = unsafe {
+            sys::syscall2(
+                SYS_MUNMAP,
+                u64::try_from(base).unwrap_or(0),
+                u64::try_from(total).unwrap_or(0),
+            )
+        };
+        errno::set_errno(12);
+        if stats_on_fast() {
+            STAT_ENOMEM.fetch_add(1, Ordering::Relaxed);
+        }
+        return core::ptr::null_mut();
+    }
     let h = core::ptr::with_exposed_provenance_mut::<Hdr>(user_addr.saturating_sub(HDR_SIZE));
     unsafe {
         (*h).magic = MAGIC_MMAP;
-        (*h).flags = 0;
+        // flags: map length for munmap (fits in u32 for our sizes; use size_t via cast).
+        (*h).flags = u32::try_from(total).unwrap_or(u32::MAX);
         (*h).size = need;
         // Stash mapping base for munmap (not a freelist link).
         (*h).next = core::ptr::with_exposed_provenance_mut::<Hdr>(base);
@@ -805,11 +863,19 @@ unsafe fn free_inner(ptr: *mut c_void) {
     match magic {
         MAGIC_MMAP => {
             let size = unsafe { (*h).size };
-            // Original mmap base stashed in next (see allocate_mmap).
+            // Original mmap base stashed in next; map length in flags (see allocate_mmap_aligned).
             let base = unsafe { (*h).next.addr() };
-            let total = align_up(HDR_SIZE.saturating_add(size), PAGE).saturating_add(PAGE);
+            let total = {
+                let fl = usize::try_from(unsafe { (*h).flags }).unwrap_or(0);
+                if fl >= size && fl >= HDR_SIZE {
+                    fl
+                } else {
+                    // Legacy formula (pre-flags stash): same as old allocate_mmap.
+                    align_up(HDR_SIZE.saturating_add(size), PAGE).saturating_add(PAGE)
+                }
+            };
             let addr = u64::try_from(base).unwrap_or(0);
-            // SAFETY: whole mapping from allocate_mmap.
+            // SAFETY: whole mapping from allocate_mmap_aligned.
             let _ = unsafe { sys::syscall2(SYS_MUNMAP, addr, u64::try_from(total).unwrap_or(0)) };
             if stats_on_fast() {
                 STAT_MUNMAP.fetch_add(1, Ordering::Relaxed);

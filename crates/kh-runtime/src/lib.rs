@@ -42,6 +42,7 @@ pub use dyld_table::{
 pub use process::{ProcessState, reset_run};
 
 pub use entry::{EntryError, call_guest, call_guest_args, jump_to_guest, jump_to_guest_args};
+pub use host::MappedFile;
 pub use mem::{
     AddressSpace, DARWIN_ARM64_PAGE_SIZE, GuestMemory, GuestPageSize, HostPageSize, MapError,
     MapRequest, MappedRegion, PageError, PageLayout, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,

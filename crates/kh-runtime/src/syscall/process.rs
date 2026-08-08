@@ -258,6 +258,7 @@ fn inject_kh_env(envp: &[String], kind: ExecEnvKind) -> Vec<CString> {
         "KAKEHASHI_BOUNDARY_STATS",
         "KAKEHASHI_FUTEX_STATS",
         "KAKEHASHI_HEAP_STATS",
+        "KAKEHASHI_LOAD_TIMING",
     ] {
         let prefix = format!("{key}=");
         if envp.iter().any(|e| e.starts_with(&prefix)) {

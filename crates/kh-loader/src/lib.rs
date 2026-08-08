@@ -8,17 +8,21 @@ pub mod chained;
 pub mod deps;
 pub mod error;
 pub mod execute;
+pub mod file_image;
 pub mod fixture;
 pub mod image;
 pub mod init;
 pub mod link;
+pub mod load_timing;
 pub mod missing_stub;
 pub mod parse;
 pub mod rebase;
 pub mod resolve;
 pub mod session;
 
-pub use bind::{BindSite, bind_process, collect_bind_sites, encode_pointer_bind};
+pub use bind::{
+    BindResolveCache, BindSite, bind_process, collect_bind_sites, encode_pointer_bind,
+};
 pub use chained::{
     ChainDecode, ChainedImport, DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET,
     apply_chained_fixups, bytes_have_chained_fixups, decode_ptr_64, encode_chained_fixups_blob,
@@ -27,6 +31,7 @@ pub use chained::{
 pub use deps::{DepEdge, MAX_DYLIBS, is_followable};
 pub use error::LoadError;
 pub use execute::{RunOptions, RunResult, run_micro};
+pub use file_image::FileImage;
 pub use image::{
     DylibDep, DylibKind, ImagePlan, LoadCommandInfo, MachOImage, MachOSummary, PlannedMapping,
     SectionInfo, SegmentInfo,

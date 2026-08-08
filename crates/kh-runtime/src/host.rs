@@ -5,8 +5,10 @@
 //! BSD handlers. Each function documents the ownership / validity contract.
 #![allow(unsafe_code)]
 
+use std::fs::File;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::Path;
 use std::ptr;
 
 /// Linux `MAP_FIXED_NOREPLACE` (do not clobber existing maps).
@@ -722,6 +724,94 @@ pub fn clock_gettime(clock_id: libc::clockid_t) -> Option<libc::timespec> {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::clock_gettime(clock_id, std::ptr::addr_of_mut!(ts)) };
     if rc == 0 { Some(ts) } else { None }
+}
+
+/// Read-only file-backed mapping of an entire file (lazy page faults).
+///
+/// Used by the loader to parse and fill guest segments without
+/// `fs::read` of multi‑hundred‑MiB containers (demand-paged I/O).
+///
+/// Dropping unmaps the range. Safe for concurrent shared reads only while
+/// this owner is alive (not `Sync`; single-threaded load path).
+pub struct MappedFile {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl std::fmt::Debug for MappedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedFile")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: unique owner of the mapping; no interior mutation after create.
+unsafe impl Send for MappedFile {}
+
+impl MappedFile {
+    /// `mmap` the whole file `PROT_READ` / `MAP_PRIVATE`. Empty files yield a
+    /// zero-length mapping (`as_slice` is empty).
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len_u64 = file.metadata()?.len();
+        let len = usize::try_from(len_u64).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "file too large to map")
+        })?;
+        if len == 0 {
+            return Ok(Self {
+                ptr: ptr::null_mut(),
+                len: 0,
+            });
+        }
+        let fd = file.as_raw_fd();
+        // Lazy faults: do **not** use MAP_POPULATE — parse only needs headers;
+        // segment fill touches only file-backed ranges.
+        let Some(base) = mmap(
+            None,
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        ) else {
+            return Err(io::Error::last_os_error());
+        };
+        // Mapping keeps its own reference; fd may close with `file` drop.
+        Ok(Self { ptr: base, len })
+    }
+
+    /// Byte view of the mapped file (or empty).
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            return &[];
+        }
+        // SAFETY: mapping is live, PROT_READ, length is exact file size.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Mapped length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the file was empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            let _ = munmap(self.ptr, self.len);
+            self.ptr = ptr::null_mut();
+            self.len = 0;
+        }
+    }
 }
 
 /// Anonymous or file-backed `mmap`. Returns host base or `None` on failure.

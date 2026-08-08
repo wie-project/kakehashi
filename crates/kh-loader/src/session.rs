@@ -1,7 +1,6 @@
 //! Load session: ties a bottle root, page layout, planned images, and maps.
 
-use std::collections::{HashSet, VecDeque};
-use std::fs::File;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use goblin::mach::header::MH_DYLIB;
@@ -104,6 +103,17 @@ pub struct ProcessImage {
     pub requested_kind: DylibKind,
     /// Defined external nlist symbols (PR2; empty in PR1).
     pub exports: Vec<DefinedSymbol>,
+    /// Preferred-VA index of [`Self::exports`] for O(1) bind / chained resolve.
+    ///
+    /// Built in `fill_exports` (same pass as the nlist scan). Includes the
+    /// `dyld_stub_binder` → `_dyld_stub_binder` alias when present.
+    pub export_by_name: HashMap<String, u64>,
+    /// Full on-disk container from the first parse (`mmap` preferred).
+    ///
+    /// Reused for (1) segment fill without a second disk pass and (2) bind /
+    /// chained fixups (arm64 thin view). Any guest benefits — not tool-specific.
+    /// Taken/dropped during bind after use.
+    pub file_bytes: Option<crate::FileImage>,
 }
 
 impl ProcessImage {
@@ -147,6 +157,8 @@ impl ProcessImage {
 struct StagedMain {
     image: MachOImage,
     plan: ImagePlan,
+    /// Full container (fat or thin) from `parse_path_with_bytes`.
+    file_bytes: crate::FileImage,
 }
 
 /// Configuration and state for loading one guest process image set.
@@ -339,9 +351,13 @@ impl LoadSession {
         if self.staged_main.is_some() {
             return Ok(());
         }
-        let image = parse::parse_path(&self.executable)?;
+        let (image, file_bytes) = parse::parse_path_with_bytes(&self.executable)?;
         let plan = image.plan(self.pages.guest);
-        self.staged_main = Some(StagedMain { image, plan });
+        self.staged_main = Some(StagedMain {
+            image,
+            plan,
+            file_bytes,
+        });
         Ok(())
     }
 
@@ -352,10 +368,45 @@ impl LoadSession {
     /// Bind prefers chained fixups, then classic opcodes, else nlist → `__got`.
     /// Section rebase is skipped for images that use chained fixups.
     pub fn map_process(&mut self) -> Result<&[ProcessImage], LoadError> {
+        // parse_main + mmap_main recorded inside map_main_only when timing is on.
         self.map_main_only()?;
-        self.walk_dependencies()?;
-        let _ = rebase::rebase_process(self)?;
+        crate::load_timing::time_result("walk_deps", || self.walk_dependencies())?;
+        let _ = crate::load_timing::time_result("rebase", || rebase::rebase_process(self))?;
+        // bind records sub-phases (fill_exports / chained|sites / apply).
         bind::bind_process(self)?;
+        if crate::load_timing::enabled() {
+            let mapped = self
+                .images
+                .iter()
+                .filter(|i| matches!(i.status, ImageLoadStatus::Mapped))
+                .count();
+            let skipped = self.images.len().saturating_sub(mapped);
+            let mut file_bytes: u64 = 0;
+            for img in &self.images {
+                if !matches!(img.status, ImageLoadStatus::Mapped) {
+                    continue;
+                }
+                if let Ok(meta) = std::fs::metadata(&img.path) {
+                    file_bytes = file_bytes.saturating_add(meta.len());
+                }
+            }
+            crate::load_timing::note(format!(
+                "images mapped={mapped} skipped={skipped} file_bytes={file_bytes}"
+            ));
+            for img in &self.images {
+                if matches!(img.status, ImageLoadStatus::Mapped) {
+                    let sz = std::fs::metadata(&img.path).map_or(0, |m| m.len());
+                    crate::load_timing::note(format!(
+                        "  {}  bytes={sz}  {}",
+                        match img.role {
+                            ImageRole::Main => "main ",
+                            ImageRole::Dylib => "dylib",
+                        },
+                        img.path.display()
+                    ));
+                }
+            }
+        }
         Ok(self.images())
     }
 
@@ -436,15 +487,24 @@ impl LoadSession {
         // Drop previous process set (unmaps dylibs + main via GuestMemory Drop).
         self.images.clear();
 
-        self.ensure_staged_main()?;
-        let StagedMain { image, plan } = self
+        crate::load_timing::time_result("parse_main", || self.ensure_staged_main())?;
+        let StagedMain {
+            image,
+            plan,
+            file_bytes,
+        } = self
             .staged_main
             .take()
             .ok_or(LoadError::NotImplemented("image missing after load"))?;
         let requests = map_requests_from_plan(&plan);
         let preferred = plan.preferred_base;
-        let mut file = File::open(&self.executable)?;
-        let memory = GuestMemory::map_image(self.pages.host, preferred, &requests, &mut file)?;
+        // Prefer path/`File` map so host-page-aligned interiors use file-backed
+        // `MAP_PRIVATE` (no full-TEXT memcpy). `file_bytes` stays for bind.
+        let memory = crate::load_timing::time_result("mmap_main", || {
+            let mut file = std::fs::File::open(&self.executable)?;
+            GuestMemory::map_image(self.pages.host, preferred, &requests, &mut file)
+                .map_err(LoadError::from)
+        })?;
 
         let main = ProcessImage {
             role: ImageRole::Main,
@@ -457,6 +517,8 @@ impl LoadSession {
             memory: Some(memory),
             requested_kind: DylibKind::Load,
             exports: Vec::new(),
+            export_by_name: HashMap::new(),
+            file_bytes: Some(file_bytes),
         };
         self.images.push(main);
         Ok(())
@@ -548,7 +610,7 @@ impl LoadSession {
                 continue;
             }
 
-            let parsed = parse::parse_path(&host_path)?;
+            let (parsed, file_bytes) = parse::parse_path_with_bytes(&host_path)?;
             if parsed.summary.file_type_raw != MH_DYLIB {
                 return Err(LoadError::NotDylib(host_path.display().to_string()));
             }
@@ -556,8 +618,10 @@ impl LoadSession {
             let plan = parsed.plan(self.pages.guest);
             let requests = map_requests_from_plan(&plan);
             let preferred = plan.preferred_base;
-            let mut file = File::open(&host_path)?;
-            let memory = GuestMemory::map_image(self.pages.host, preferred, &requests, &mut file)?;
+            let memory = {
+                let mut file = std::fs::File::open(&host_path)?;
+                GuestMemory::map_image(self.pages.host, preferred, &requests, &mut file)?
+            };
 
             // Prefer the **LC_LOAD** install name (`edge.install_name`) over the
             // dylib's LC_ID. Bottle aliases (`libc++.1.dylib` / `libcurl.4.dylib`
@@ -600,6 +664,8 @@ impl LoadSession {
                 memory: Some(memory),
                 requested_kind: edge.kind,
                 exports: Vec::new(),
+                export_by_name: HashMap::new(),
+                file_bytes: Some(file_bytes),
             });
 
             for child in child_edges {
@@ -638,6 +704,8 @@ impl LoadSession {
             memory: None,
             requested_kind: kind,
             exports: Vec::new(),
+            export_by_name: HashMap::new(),
+            file_bytes: None,
         });
     }
 
@@ -660,6 +728,8 @@ impl LoadSession {
             memory: None,
             requested_kind: kind,
             exports: Vec::new(),
+            export_by_name: HashMap::new(),
+            file_bytes: None,
         });
     }
 }
@@ -722,6 +792,7 @@ fn mapping_to_request(m: &PlannedMapping) -> MapRequest {
         filesize: m.filesize,
         initprot: m.initprot,
         maxprot: m.maxprot,
+        svc_scan_ranges: m.svc_scan_ranges.clone(),
     }
 }
 

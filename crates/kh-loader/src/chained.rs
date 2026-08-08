@@ -88,10 +88,14 @@ pub fn bytes_have_chained_fixups(bytes: &[u8]) -> Result<bool, LoadError> {
 /// Apply chained fixups for one mapped image (rebase + bind into guest memory).
 ///
 /// Returns the number of pointer slots rewritten.
+///
+/// `cache` is process-wide (export index, install-name map) — built once in
+/// `bind_process` so each site is O(1) rather than rebuilding a flat map.
 pub fn apply_chained_fixups(
     session: &mut LoadSession,
     image_idx: usize,
     bytes: &[u8],
+    cache: &bind::BindResolveCache,
 ) -> Result<usize, LoadError> {
     // Offsets in LC_DYLD_CHAINED_FIXUPS are thin-relative.
     let thin = thin_arm64_bytes(bytes)?;
@@ -146,7 +150,8 @@ pub fn apply_chained_fixups(
                     lib_ordinal: import.lib_ordinal,
                     is_lazy: false,
                 };
-                let resolved = bind::resolve_bind_symbol(session.images(), image_idx, &site)?;
+                let resolved =
+                    bind::resolve_bind_symbol(cache, session.images(), image_idx, &site)?;
                 if site.addend == 0 {
                     resolved
                 } else {

@@ -81,6 +81,9 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         ));
     }
 
+    crate::load_timing::begin_run();
+    crate::load_timing::note(format!("executable={}", path.display()));
+
     set_bottle_root(opts.root.clone());
     // Guest-visible main path for `_NSGetExecutablePath` (clang -cc1 re-spawn).
     let guest_exec = host_path_to_guest(path).or_else(|| {
@@ -91,7 +94,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // Drop any previous active address space (unmaps owned guest mmaps).
     drop(registry_take());
 
-    let mut session = LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)?;
+    let mut session = crate::load_timing::time_result("open_session", || {
+        LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)
+    })?;
+    // Sub-phases recorded inside `map_process` (map_main / walk_deps / rebase / bind).
     let _ = session.map_process()?;
 
     let slide = session
@@ -109,7 +115,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         .map(kh_runtime::GuestMemory::host)
         .ok_or(LoadError::NotImplemented("memory missing"))?;
 
-    let mut stack = map_stack(host, DEFAULT_STACK_SIZE)?;
+    let mut stack =
+        crate::load_timing::time_result("map_stack", || map_stack(host, DEFAULT_STACK_SIZE))?;
 
     // Prefer full guest absolute path as argv0 (Darwin-style); basename fallback.
     let argv0 = guest_exec.as_deref().filter(|s| !s.is_empty()).map_or_else(
@@ -171,43 +178,53 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let env_refs: Vec<&str> = env_owned.iter().map(String::as_str).collect();
 
     let stack_base = stack.guest_addr;
-    let sp = bootstrap_stack(stack.host_bytes_mut(), stack_base, &argv_refs, &env_refs)
-        .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))?;
+    let sp = crate::load_timing::time_result("bootstrap_stack", || {
+        bootstrap_stack(stack.host_bytes_mut(), stack_base, &argv_refs, &env_refs)
+            .map_err(|err| LoadError::NotImplemented(stack_err_static(&err)))
+    })?;
 
     // Build process address space, then install for trap-path checks / mmap bookkeeping.
     // Hypercall NEON tramp is mapped separately (once, process-local); residual `svc`→`brk`
     // needs the registry only for later mmap bookkeeping and SIGTRAP translation.
-    let mut address_space = AddressSpace::new();
-    for img in session.images() {
-        if let Some(memory) = img.memory.as_ref() {
-            for region in memory.regions() {
-                address_space.register_borrowed(region);
+    crate::load_timing::time("registry_install", || {
+        let mut address_space = AddressSpace::new();
+        for img in session.images() {
+            if let Some(memory) = img.memory.as_ref() {
+                for region in memory.regions() {
+                    address_space.register_borrowed(region);
+                }
             }
         }
-    }
-    address_space.register_borrowed(&stack);
-    drop(registry_install(address_space));
+        address_space.register_borrowed(&stack);
+        drop(registry_install(address_space));
+    });
 
     // Wire freestanding libSystem → `kh_hypercall_entry` (sole production BSD path).
     // Residual Darwin `svc` in fixtures/apps is always rewritten to `brk` below;
     // that is *not* a second production path (see invariants 7, 12).
     warn_if_hypercall_env_opt_out();
-    let hypercall_wired = install_libsystem_hypercall(&mut session);
+    let hypercall_wired =
+        crate::load_timing::time("wire_hypercall", || install_libsystem_hypercall(&mut session));
     // Rewrite any leftover Darwin `svc` so Linux never executes them as host syscalls.
     let mut patched_svc = 0usize;
-    for memory in session.mapped_memories_mut() {
-        patched_svc = patched_svc
-            .saturating_add(patch_svc_to_brk(memory.regions_mut()).map_err(trap_to_load)?);
-    }
+    crate::load_timing::time_result("patch_svc", || {
+        for memory in session.mapped_memories_mut() {
+            patched_svc = patched_svc
+                .saturating_add(patch_svc_to_brk(memory.regions_mut()).map_err(trap_to_load)?);
+        }
+        Ok::<(), LoadError>(())
+    })?;
 
-    install_trap_handlers(&TrapConfig {
-        max_events: opts.max_events,
-        max_syscalls: opts.max_syscalls,
-    })
-    .map_err(trap_to_load)?;
+    crate::load_timing::time_result("install_traps", || {
+        install_trap_handlers(&TrapConfig {
+            max_events: opts.max_events,
+            max_syscalls: opts.max_syscalls,
+        })
+        .map_err(trap_to_load)
+    })?;
 
     // Main-thread guest TLS (TPIDR_EL0) before constructors / LC_MAIN touch errno.
-    let main_tls = install_main_guest_tls();
+    let main_tls = crate::load_timing::time("main_tls", install_main_guest_tls);
     if main_tls != 0 {
         tracing::debug!(
             main_tls = format_args!("{main_tls:#x}"),
@@ -216,7 +233,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     }
 
     // dyld-order: constructors (dylibs bottom-up, then main) before LC_MAIN.
-    let initializers_run = init::run_initializers(&session, sp)?;
+    let initializers_run =
+        crate::load_timing::time_result("initializers", || init::run_initializers(&session, sp))?;
 
     tracing::info!(
         entry = format_args!("{entry:#x}"),
@@ -245,7 +263,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
 
     // Publish mapped images for freestanding `dlopen`/`dlsym` (e.g. clang's
     // `-lto_library` re-open of already-loaded `@rpath/libLTO.dylib`).
-    register_dyld_images(&session);
+    crate::load_timing::time("dyld_table", || register_dyld_images(&session));
+
+    // Dump load phases before guest entry (guest may noreturn via `_exit`).
+    crate::load_timing::dump("pre-entry");
 
     // Keep stack / session alive across the call (may noreturn via guest exit).
     // `forget` retains all GuestMemory owners if exit traps.
@@ -255,10 +276,14 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // SAFETY: image is mapped RX, entry points into __TEXT, stack is bootstrapped,
     // trap handlers installed for Linux aarch64. Uses `blr` so `return` from
     // `main` resumes the host (dyld-equivalent); guest `exit` still `_exit`s.
+    let guest_t0 = std::time::Instant::now();
     let status = unsafe {
         call_guest_args(entry, sp, argc, argv_ptr, envp_ptr, apple_ptr)
             .map_err(|err| LoadError::PageLayout(err.to_string()))?
     };
+    let guest_ns = u64::try_from(guest_t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    crate::load_timing::record("guest_main_return", guest_ns);
+    crate::load_timing::dump("post-return");
 
     // Dump freestanding heap stats (guest stderr) before host process exit.
     if let Some(va) = heap_dump_va {

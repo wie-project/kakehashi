@@ -200,6 +200,11 @@ pub struct PlannedMapping {
     pub vmaddr_guest_aligned: bool,
     /// True when `vmsize` is a guest-page multiple (or zero).
     pub vmsize_guest_aligned: bool,
+    /// Residual `svc` scan ranges relative to this segment's file content
+    /// (`offset` from segment `fileoff`, `len`). Instruction sections only
+    /// (`S_ATTR_PURE_INSTRUCTIONS` / `S_ATTR_SOME_INSTRUCTIONS`). Empty →
+    /// trap backend scans the whole segment filesize.
+    pub svc_scan_ranges: Vec<(u64, u64)>,
 }
 
 /// Planned virtual memory layout for a loaded image (pre-mmap, slide = 0).
@@ -259,6 +264,8 @@ impl ImagePlan {
                 preferred_base = seg.vmaddr;
             }
 
+            let svc_scan_ranges = instruction_scan_ranges(seg);
+
             mappings.push(PlannedMapping {
                 name: seg.name.clone(),
                 vmaddr: seg.vmaddr,
@@ -272,6 +279,7 @@ impl ImagePlan {
                 maxprot: seg.maxprot,
                 vmaddr_guest_aligned: vmaddr_ok,
                 vmsize_guest_aligned: vmsize_ok,
+                svc_scan_ranges,
             });
         }
 
@@ -293,4 +301,41 @@ impl ImagePlan {
     pub fn segment_count(&self) -> usize {
         self.mappings.len()
     }
+}
+
+/// Darwin section attribute: pure instructions (code).
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+/// Darwin section attribute: some instructions mixed in.
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
+
+/// Collect residual-`svc` scan ranges for a segment (instruction sections only).
+///
+/// Offsets are relative to the segment's thin `fileoff` / mapped file content.
+/// Scanning only pure/some-instruction sections avoids rewriting data that
+/// merely looks like an `svc` encoding in `__const` / `__cstring` (CLT tools
+/// had false positives on a full-TEXT walk) and skips non-code bytes.
+fn instruction_scan_ranges(seg: &SegmentInfo) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for sect in &seg.sections {
+        if sect.flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) == 0 {
+            continue;
+        }
+        if sect.size == 0 {
+            continue;
+        }
+        let sect_off = u64::from(sect.offset);
+        if sect_off < seg.fileoff {
+            continue;
+        }
+        let rel = sect_off.saturating_sub(seg.fileoff);
+        if rel >= seg.filesize {
+            continue;
+        }
+        let max_len = seg.filesize.saturating_sub(rel);
+        let len = sect.size.min(max_len);
+        if len > 0 {
+            out.push((rel, len));
+        }
+    }
+    out
 }

@@ -127,42 +127,214 @@ static EVENTS: Mutex<Vec<TrapEvent>> = Mutex::new(Vec::new());
 /// Patches every AArch64 `svc` in executable regions to `brk #IMM`.
 ///
 /// Residual sites only: freestanding libSystem uses hypercall, not `svc`.
+/// Applies to **any** guest image that embeds Darwin `svc` (fixtures, rare
+/// apps); product tools that only call through freestanding typically have
+/// **zero** hits — we still scan, but skip `mprotect` RW/RX when none found.
 pub fn patch_svc_to_brk(regions: &mut [MappedRegion]) -> Result<usize, TrapError> {
     let mut patched = 0_usize;
     for region in regions.iter_mut() {
         if region.prot & VM_PROT_EXECUTE == 0 {
             continue;
         }
+        // Only walk image content; BSS tail cannot hold code from disk.
+        let file_len = usize::try_from(region.file_bytes)
+            .unwrap_or(0)
+            .min(region.host_len());
+        if file_len < 4 {
+            continue;
+        }
+
+        // Prefer instruction-section ranges from the Mach-O plan (any guest).
+        // Full-TEXT walks hit false-positive `svc` encodings in `__const` /
+        // `__cstring` and force-fault non-code pages of large CLT tools.
+        let ranges = resolve_svc_scan_ranges(region, file_len);
+        if ranges.is_empty() {
+            continue;
+        }
+
+        // Pass 1: read-only scan of instruction ranges only.
+        let hits = {
+            let bytes = region.host_bytes();
+            let mut hits = Vec::new();
+            for &(start, len) in &ranges {
+                let end = start.saturating_add(len).min(file_len);
+                if end.saturating_sub(start) < 4 {
+                    continue;
+                }
+                let Some(scan) = bytes.get(start..end) else {
+                    continue;
+                };
+                hits.extend(find_svc_offsets(scan).into_iter().map(|o| start.saturating_add(o)));
+            }
+            hits
+        };
+        if hits.is_empty() {
+            continue;
+        }
+
+        // Pass 2: mprotect RW only when there is something to rewrite.
         mprotect_rw(region)?;
         let bytes = region.host_bytes_mut();
-        let mut off = 0_usize;
-        while off.saturating_add(4) <= bytes.len() {
+        let brk = brk_encoding(BRK_TRAP_IMM).to_le_bytes();
+        for off in &hits {
             let end = off.saturating_add(4);
-            let Some(word) = bytes.get(off..end) else {
-                break;
-            };
-            let Ok(word_bytes) = <[u8; 4]>::try_from(word) else {
-                break;
-            };
-            let insn = u32::from_le_bytes(word_bytes);
-            if is_svc(insn) {
-                let brk = brk_encoding(BRK_TRAP_IMM).to_le_bytes();
-                if let Some(slot) = bytes.get_mut(off..end) {
-                    slot.copy_from_slice(&brk);
-                    patched = patched.saturating_add(1);
-                }
+            if let Some(slot) = bytes.get_mut(*off..end) {
+                slot.copy_from_slice(&brk);
+                patched = patched.saturating_add(1);
             }
-            off = end;
         }
         let restore = (region.prot | VM_PROT_READ | VM_PROT_EXECUTE) & !VM_PROT_WRITE;
         mprotect_darwin(region, restore)?;
         region.prot = restore;
+        // Flush only patched sites (not whole TEXT — pure file maps stay lazy
+        // until first demand fault / these CoW writes).
+        let base = region.host_bytes().as_ptr();
+        for off in hits {
+            // SAFETY: `off` is within file_bytes of this live mapping.
+            let ptr = unsafe { base.add(off).cast_mut() };
+            clear_icache(ptr, 4);
+        }
     }
     Ok(patched)
 }
 
+/// Instruction ranges to scan, or whole `file_len` when the plan had none.
+fn resolve_svc_scan_ranges(region: &MappedRegion, file_len: usize) -> Vec<(usize, usize)> {
+    if region.svc_scan_ranges.is_empty() {
+        return vec![(0, file_len)];
+    }
+    let mut out = Vec::with_capacity(region.svc_scan_ranges.len());
+    for &(off, len) in &region.svc_scan_ranges {
+        let start = usize::try_from(off).unwrap_or(usize::MAX);
+        let len = usize::try_from(len).unwrap_or(0);
+        if start >= file_len || len == 0 {
+            continue;
+        }
+        let len = len.min(file_len.saturating_sub(start));
+        if len >= 4 {
+            out.push((start, len));
+        }
+    }
+    out
+}
+
 const fn is_svc(insn: u32) -> bool {
     (insn & SVC_MASK) == SVC_BASE
+}
+
+/// Scan little-endian AArch64 insn stream for `svc` encodings.
+///
+/// Unrolled word loads; large regions (≥8 MiB) fan out across worker threads
+/// so CLT-sized TEXT does not serialize page-fault + scan on one core.
+#[allow(clippy::integer_division)] // insn stream: 4-byte AArch64 words
+fn find_svc_offsets(scan: &[u8]) -> Vec<usize> {
+    const PARALLEL_MIN: usize = 8 << 20; // 8 MiB
+    if scan.len() >= PARALLEL_MIN {
+        return find_svc_offsets_parallel(scan);
+    }
+    find_svc_offsets_range(scan, 0)
+}
+
+/// Parallel `svc` scan over word-aligned chunks (any guest with large RX).
+#[allow(clippy::integer_division)]
+fn find_svc_offsets_parallel(scan: &[u8]) -> Vec<usize> {
+    let nthreads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    if nthreads <= 1 {
+        return find_svc_offsets_range(scan, 0);
+    }
+    let total = scan.len() & !3_usize;
+    if total < 4 {
+        return Vec::new();
+    }
+    let chunk = (total
+        .checked_div(nthreads)
+        .unwrap_or(total)
+        & !3_usize)
+        .max(4);
+    let mut hits = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(nthreads);
+        let mut start = 0_usize;
+        while start < total {
+            let end = (start.saturating_add(chunk)).min(total);
+            let Some(part) = scan.get(start..end) else {
+                break;
+            };
+            let base_off = start;
+            handles.push(scope.spawn(move || find_svc_offsets_range(part, base_off)));
+            start = end;
+        }
+        for h in handles {
+            if let Ok(mut part) = h.join() {
+                hits.append(&mut part);
+            }
+        }
+    });
+    hits.sort_unstable();
+    hits
+}
+
+/// Scan `scan` for `svc`; returned offsets are relative to the full image
+/// when `base_off` is the absolute start of this slice.
+#[allow(clippy::integer_division)]
+fn find_svc_offsets_range(scan: &[u8], base_off: usize) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let words = scan.len() / 4;
+    if words == 0 {
+        return hits;
+    }
+    // SAFETY: scan is a live host mapping; unaligned u32 load is fine on
+    // aarch64/x86_64.
+    let base = scan.as_ptr();
+    let mut i = 0_usize;
+    while i.saturating_add(4) <= words {
+        // SAFETY: i..i+3 < words.
+        let w0 = unsafe { base.add(i.saturating_mul(4)).cast::<u32>().read_unaligned() };
+        let w1 = unsafe {
+            base.add(i.saturating_add(1).saturating_mul(4))
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let w2 = unsafe {
+            base.add(i.saturating_add(2).saturating_mul(4))
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let w3 = unsafe {
+            base.add(i.saturating_add(3).saturating_mul(4))
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        if is_svc(u32::from_le(w0)) {
+            hits.push(base_off.saturating_add(i.saturating_mul(4)));
+        }
+        if is_svc(u32::from_le(w1)) {
+            hits.push(
+                base_off.saturating_add(i.saturating_add(1).saturating_mul(4)),
+            );
+        }
+        if is_svc(u32::from_le(w2)) {
+            hits.push(
+                base_off.saturating_add(i.saturating_add(2).saturating_mul(4)),
+            );
+        }
+        if is_svc(u32::from_le(w3)) {
+            hits.push(
+                base_off.saturating_add(i.saturating_add(3).saturating_mul(4)),
+            );
+        }
+        i = i.saturating_add(4);
+    }
+    while i < words {
+        let w = unsafe { base.add(i.saturating_mul(4)).cast::<u32>().read_unaligned() };
+        if is_svc(u32::from_le(w)) {
+            hits.push(base_off.saturating_add(i.saturating_mul(4)));
+        }
+        i = i.saturating_add(1);
+    }
+    hits
 }
 
 /// Round `len` up to a multiple of `page` (page must be a power of two ≥ 1).
@@ -195,6 +367,9 @@ fn clear_icache(ptr: *mut u8, len: usize) {
         __clear_cache(start, end);
     }
 }
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+fn clear_icache(_ptr: *mut u8, _len: usize) {}
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
