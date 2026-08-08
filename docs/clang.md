@@ -21,6 +21,7 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | G3 | Compile trivial `hello.c` → object or executable under bottle | **pass** (Docker: `return_zero.c` → Mach-O arm64 `.o`; also `stdio_hello.c` with SDK) |
 | G4 | Link + run guest binary produced by guest clang (optional stretch) | **pass** (Docker: multi-file `g4-mini` via `ld-classic` + SDK TBDs; product runs `g4-mini PASS`, exit 0) |
 | G5 | Standard multi-file link with **modern `ld`** (no `ld-classic`) + run | **pass** (Docker: objs + SDK; full clang-driver multi-file with live `-lto_library` → `g4-mini PASS` in ~7s; nested re-exec + `DYLD_LIBRARY_PATH` fixed — no soft-ENOENT) |
+| G5+LTO | `clang -flto` multi-file link + run under freestanding + live CLT `libLTO` | **pass** (Docker: mini exit 0; `g4-mini` `-flto` → `g4-mini PASS`, exit 0) |
 
 ### Progress log (Docker Colima, 2026-08)
 
@@ -74,6 +75,11 @@ Clean-room rules: [legal-method.md](legal-method.md). See also:
 | Page-aligned freestanding `malloc` (≥256 B mmap) | **landed** — same assert class as `vm_allocate` |
 | **G5 standard link** (modern `ld`, explicit TBD / SDK) | **pass** (Docker: modern `ld` + `libSystem.B.tbd` → product `g4-mini PASS`; classic still green) |
 | G4 regression after G5 soft surface | **pass** (Docker: classic link + `g4-mini PASS`) |
+| Darwin `TMPDIR` / `confstr(_CS_DARWIN_USER_TEMP_DIR)` ≈ host `/var/folders/…/T/` | **landed** — freestanding no longer seeds short `/tmp` for LTO object paths |
+| `basic_string` `__recommend` (MacOSX.sdk alternate layout) | **landed** |
+| Darwin `regex_t` 32-byte layout (`re_magic`/`re_nsub`/`re_endp`/`re_g`) | **fixed** — was 16-byte `{nsub,opaque}`; `re_nsub` read host handle |
+| `std::__get_classname` → Apple `_CTYPE_*` mask + soft ctype table bits | **fixed** — was pointer return; unblocked live `libLTO` `APPLE_1_*` bitcode version check |
+| **G5+LTO `clang -flto` mini + `g4-mini`** | **pass** (Docker: product `g4-mini PASS`, exit 0) |
 
 ### Standard path (modern `ld` + ObjC) — inventory
 
@@ -125,7 +131,7 @@ missing `svc` numbers.
 | modern `ld` + `-lto_library` (clang default) | freestanding + loader | **pass** non-bitcode (Docker, ~1s after one re-exec). Root cause: Apple `ld` stages `/tmp/ld-support-*/libLTO.dylib`, sets `DYLD_LIBRARY_PATH`, and **re-execs** itself. Nested `kh run` dropped `DYLD_*` from guest stack/soft env and ignored it for `@rpath` → infinite re-exec (~45 hops / 25s). Fixed: (1) real `mkdtemp`/`mkpath_np`/`create_symlink` + host-translated symlink targets; (2) seed/pass `DYLD_LIBRARY_PATH` on nested re-exec; (3) prefer `DYLD_LIBRARY_PATH` before LC_RPATH for `@rpath`. No soft-ENOENT hide |
 | Microbench g4-mini full driver (no `-flto`) | host vs kh | **native** Apple clang 17 host ~**0.13s**; **kh** bottle clang 21 ~**6.35s** (~**49×**). Split: native `-c`×4 ~0.48s / `ld` ~0.10s; kh `-c`×4 ~7.6s / `ld`+`-lto_library` ~1.5s |
 | `KAKEHASHI_BOUNDARY_STATS=ns` (driver) | analyzer | Parent clang: **~1044** crossings, dominated by **`wait4`** (~5.6s of ~6.3s wall — children are separate `kh` after fork/exec). Top count: `mmap`/`munmap`/`kh_wake`. Nested re-exec now inherits `KAKEHASHI_BOUNDARY_STATS` |
-| `-flto` multifile | freestanding + live libLTO | **in progress**. Bitcode `-c` OK; live LTO loads (`LTO support using: LLVM 21`). Soft: locale/facets/`__get_classname`/`__get_collation_name`; ctype table fixed SEGV `table['.']`. **`sscanf` rewritten in C `va_list`** (Rust fixed-arg soft broke arm64 variadic — unit tests now `%u.%u.%u` → n=3). Remaining: `ld: malformed version number 'N.0.\x18\x03'` (not triple `N.0.0`; major tracks minOS, minor always 0 + 2 garbage bytes) + sometimes `unknown function pointer alignment type` on multi-file. No daemon planned for perf |
+| `-flto` multifile | freestanding + live libLTO | **pass** (Docker, 2026-08). Bitcode compile + modern `ld` + live CLT `libLTO` (LLVM 21) → product runs. Root causes fixed (fact-first, no argv crutches / soft-ENOENT): (1) **Darwin temp layout** — seed `TMPDIR` + `confstr(_CS_DARWIN_USER_TEMP_DIR)` to `/var/folders/…/T/` so `-object_path_lto` is ~60 chars like host (short `/tmp` broke materialize); (2) **`basic_string` `__recommend`** match MacOSX.sdk alternate layout; (3) **Darwin `regex_t` layout** (32 B: `magic`/`nsub`/`endp`/`re_g`) — wrong 16 B layout made `re_nsub` read the handle; (4) **`std::__get_classname` → `ctype_base::mask` (`uint32_t`)** + Apple `_CTYPE_*` table bits — old soft returned a pointer, so embedded `std::regex` `[[:digit:]]` never matched → `Invalid bitcode version (Producer: 'APPLE_1_…' Reader: '…')`. Also: locale/rune table offsets, ctype facet soft table, `sscanf` in C `va_list`. |
 | Perf note | process model | ~50× on g4-mini is mostly start/`wait4` tax. Target ~5× on long builds **without** `khserver`/wineserver-style daemon — prefer fewer outer processes, cheaper map, less crossings |
 | Wall time under kh (UTM/Docker) | process model | g4-mini ~**6–7s** full driver is expected today: each outer `kh run` remaps freestanding+clang; parent spends wall in `wait4` of nested `-cc1`/`ld`. Prefer `make one CC="kh run clang --"` (one outer process). Default Makefile no longer forces `ld-classic` |
 | Soft Foundation / deeper ObjC if driver pulls more | freestanding | On demand |
@@ -138,7 +144,7 @@ Clang links `libSystem`, `libc++.1`, `libz`, `libresolv`. Bottle aliases
 guest path requires. Multi-file **modern `ld`** is green with absolute `-L` to
 SDK `usr/lib` + `-lSystem` (and with explicit TBD). The default clang driver
 path (modern `ld`, `-syslibroot`, live CLT `libLTO` on disk, no absolute TBD,
-no soft-ENOENT) is green for non-bitcode links.
+no soft-ENOENT) is green for non-bitcode **and** `-flto` multi-file links.
 
 ## Method (trace-first)
 
@@ -207,6 +213,21 @@ working `xcrun`.
   /Volumes/linux/src/tests/clang-probe/g4-mini/src/main.c \
   -o /Volumes/linux/out/g4-mini-driver
 # then:  kh run /Volumes/linux/out/g4-mini-driver   →  g4-mini PASS
+
+# G5+LTO full-bitcode multi-file (live libLTO; same sources)
+./scripts/docker-clang.sh \
+  -flto -O0 -std=c11 -arch arm64 \
+  -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/calc.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/report.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/words.c \
+  /Volumes/linux/src/tests/clang-probe/g4-mini/src/main.c \
+  -o /Volumes/linux/out/g4-mini-flto
+# then:  kh run /Volumes/linux/out/g4-mini-flto   →  g4-mini PASS
+#
+# Or under kh inside the container:
+#   make -C /Volumes/linux/src/tests/clang-probe/g4-mini flto-one \
+#     CC="kh run clang --" OUT=/Volumes/linux/out/g4-mini-flto
 ```
 
 Process notes for PRs: internet allowed for catalog/install; clippy `-D warnings`

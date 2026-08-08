@@ -139,7 +139,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             .to_owned(),
         home,
-        "TMPDIR=/tmp".to_owned(),
+        // Match Darwin `confstr(_CS_DARWIN_USER_TEMP_DIR)` length class
+        // (`/var/folders/…/T/`, ~49 chars). Soft `/tmp` made clang `-flto`
+        // `-object_path_lto` paths too short for freestanding LTO materialize.
+        "TMPDIR=/var/folders/xx/kakehashi_default_user_temp000/T/".to_owned(),
     ];
     // Apple clang without a working `xcrun` does not auto-pick
     // `…/SDKs/MacOSX.sdk` (see `clang -v`: only CLT usr/include). Point the

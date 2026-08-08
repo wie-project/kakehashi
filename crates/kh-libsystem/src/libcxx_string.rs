@@ -94,13 +94,50 @@ fn set_short(this: *mut c_void, s: *const u8, len: usize) {
     }
 }
 
-fn set_long(this: *mut c_void, s: *const u8, len: usize) {
-    let need = len.saturating_add(1);
-    // Even capacity ≥ need (classic libc++ parity habit; not required for flag).
-    let mut cap = need.max(2);
-    if cap % 2 == 1 {
-        cap = cap.saturating_add(1);
+/// Apple libc++ `__min_cap` for `char` on arm64 alternate layout: 23.
+/// (`(sizeof(__long)-1)/sizeof(char)` → 23; SSO holds `__min_cap-1` = 22.)
+const MIN_CAP: usize = 23;
+/// Host `__alignment` for `basic_string` growth (see SDK `string` `__recommend`).
+const STR_ALIGN: usize = 8;
+
+/// Apple `basic_string::__recommend(s)` — **usable** capacity to request.
+///
+/// From MacOSX.sdk `string` (verified against host dumps):
+/// ```text
+/// if s < __min_cap: return __min_cap - 1
+/// guess = align_it<8>(s + 1) - 1
+/// if guess == __min_cap: guess += __endian_factor   // LE alternate: 1
+/// return guess
+/// ```
+/// Then allocate `recommend + 1` and `__set_long_cap(allocation.count)`.
+/// `capacity()` = `__get_long_cap() - 1`.
+fn recommend(s: usize) -> usize {
+    if s < MIN_CAP {
+        return MIN_CAP.saturating_sub(1);
     }
+    // align_it<8>(s+1) - 1
+    let aligned = s
+        .saturating_add(1)
+        .saturating_add(STR_ALIGN.saturating_sub(1))
+        & !(STR_ALIGN.saturating_sub(1));
+    let mut guess = aligned.saturating_sub(1);
+    // LE + ALTERNATE_STRING_LAYOUT: __endian_factor = 1
+    if guess == MIN_CAP {
+        guess = guess.saturating_add(1);
+    }
+    guess
+}
+
+/// Allocation size (bytes including NUL) for a long string holding `len` chars.
+///
+/// Equals host `allocate(__recommend(len) + 1)` then `__set_long_cap(count)`.
+fn recommend_long_alloc(len: usize) -> usize {
+    recommend(len).saturating_add(1).max(2)
+}
+
+fn set_long(this: *mut c_void, s: *const u8, len: usize) {
+    // Capacity word = allocation size (incl. NUL); matches host field dump.
+    let cap = recommend_long_alloc(len);
     let p = unsafe { malloc(cap) }.cast::<u8>();
     if p.is_null() {
         trace::force_note(b"[kh-libsystem] basic_string OOM\n");
@@ -393,6 +430,7 @@ pub(crate) unsafe extern "C" fn string_reserve(this: *mut c_void, res: usize) {
     if res <= SSO_CAP && !is_long(this) {
         return;
     }
+    // `long_cap` is allocation size; usable capacity is alloc - 1 (host).
     if is_long(this) && long_cap(this).saturating_sub(1) >= res {
         return;
     }
@@ -408,29 +446,27 @@ pub(crate) unsafe extern "C" fn string_reserve(this: *mut c_void, res: usize) {
     }
     dispose(this);
     if need > SSO_CAP {
-        set_long(this, tmp, len);
-        // Ensure capacity ≥ res+1.
-        if is_long(this) && long_cap(this) < res.saturating_add(1) {
-            // re-set with larger
-            let s = long_data(this);
-            let old_len = long_size(this);
-            let mut cap = res.saturating_add(1).max(2);
-            if cap % 2 == 1 {
-                cap = cap.saturating_add(1);
-            }
+        // set_long sizes for `len` with spare; if res needs more, allocate directly.
+        if res > len {
+            let cap = recommend_long_alloc(res);
             let p = unsafe { malloc(cap) }.cast::<u8>();
-            if !p.is_null() {
+            if p.is_null() {
                 unsafe {
-                    if old_len > 0 {
-                        ptr::copy_nonoverlapping(s, p, old_len);
-                    }
-                    p.add(old_len).write(0);
-                    free(s.cast());
-                    this.cast::<*mut u8>().write(p);
-                    this.cast::<usize>().add(1).write(old_len);
-                    this.cast::<usize>().add(2).write(cap | LONG_FLAG);
+                    free(tmp.cast());
                 }
+                return;
             }
+            unsafe {
+                if len > 0 {
+                    ptr::copy_nonoverlapping(tmp, p, len);
+                }
+                p.add(len).write(0);
+                this.cast::<*mut u8>().write(p);
+                this.cast::<usize>().add(1).write(len);
+                this.cast::<usize>().add(2).write(cap | LONG_FLAG);
+            }
+        } else {
+            set_long(this, tmp, len);
         }
     } else {
         set_short(this, tmp, len);
@@ -465,16 +501,18 @@ pub(crate) unsafe extern "C" fn string_grow_by(
     }
     let n_copy = n_copy.min(old_sz);
     let after_del = old_sz.saturating_sub(n_copy).saturating_sub(n_del);
-    // Capacity growth: max(old+delta, 2*old), then +1 for NUL slot (libc++).
-    let mut rec = old_cap.saturating_add(delta_cap).max(old_cap.saturating_mul(2));
-    rec = rec
-        .max(n_copy.saturating_add(n_add).saturating_add(after_del))
-        .max(SSO_CAP);
-    // Stored long cap is allocation count including NUL (capacity()+1).
-    let mut alloc_count = rec.saturating_add(1).max(2);
-    if alloc_count % 2 == 1 {
-        alloc_count = alloc_count.saturating_add(1);
-    }
+    // Host `__grow_by` (SDK string ~2560):
+    //   __cap = recommend(max(old_cap+delta, 2*old_cap))
+    //   allocate(__cap + 1); __set_long_cap(allocation.count)
+    //   if (old_cap + 1 != __min_cap) deallocate(old, old_cap + 1)
+    //   does NOT set size
+    // `old_cap` is usable `capacity()`, not the raw field.
+    let want = old_cap
+        .saturating_add(delta_cap)
+        .max(old_cap.saturating_mul(2));
+    let new_sz_min = n_copy.saturating_add(n_add).saturating_add(after_del);
+    let usable = recommend(want.max(new_sz_min));
+    let alloc_count = usable.saturating_add(1);
 
     let was_long = is_long(this);
     let old_ptr = current_data(this);
@@ -507,17 +545,16 @@ pub(crate) unsafe extern "C" fn string_grow_by(
     }
     if was_long {
         let old_data = long_data(this);
-        // Only free if it was a real long allocation (old_cap+1 != min short).
-        // libc++: if (__old_cap + 1 != __min_cap) deallocate.
-        // SSO_CAP+1 == 23 is the short buffer size in elements with NUL.
-        if !old_data.is_null() && old_cap.saturating_add(1) != SSO_CAP.saturating_add(1) {
+        // Host: if (__old_cap + 1 != __min_cap) deallocate — short was never
+        // heap-allocated. `old_cap` is usable capacity (22 for short).
+        if !old_data.is_null() && old_cap.saturating_add(1) != MIN_CAP {
             unsafe {
                 free(old_data.cast());
             }
         }
     }
     // Install long rep: data*, size UNCHANGED (ABI), cap|FLAG.
-    // Size field may be garbage if we were short; caller must set it.
+    // Capacity word = allocation count (host `__set_long_cap(allocation.count)`).
     unsafe {
         this.cast::<*mut u8>().write(p);
         // Keep existing size word if already long; if short, write old_sz as a
@@ -550,12 +587,12 @@ pub(crate) unsafe extern "C" fn string_grow_by_and_replace(
     let n_copy = n_copy.min(old_sz);
     let after_del = old_sz.saturating_sub(n_copy).saturating_sub(n_del);
     let new_sz = n_copy.saturating_add(n_add).saturating_add(after_del);
-    let mut rec = old_cap.saturating_add(delta_cap).max(old_cap.saturating_mul(2));
-    rec = rec.max(new_sz).max(SSO_CAP);
-    let mut alloc_count = rec.saturating_add(1).max(2);
-    if alloc_count % 2 == 1 {
-        alloc_count = alloc_count.saturating_add(1);
-    }
+    // Same growth formula as host `__grow_by_and_replace`.
+    let want = old_cap
+        .saturating_add(delta_cap)
+        .max(old_cap.saturating_mul(2));
+    let usable = recommend(want.max(new_sz));
+    let alloc_count = usable.saturating_add(1);
     let was_long = is_long(this);
     let old_ptr = current_data(this);
     let p = unsafe { malloc(alloc_count) }.cast::<u8>();
@@ -583,7 +620,7 @@ pub(crate) unsafe extern "C" fn string_grow_by_and_replace(
     }
     if was_long {
         let old_data = long_data(this);
-        if !old_data.is_null() && old_cap.saturating_add(1) != SSO_CAP.saturating_add(1) {
+        if !old_data.is_null() && old_cap.saturating_add(1) != MIN_CAP {
             unsafe {
                 free(old_data.cast());
             }
@@ -906,6 +943,18 @@ impl StringRep {
             bytes: [0_u8; REP_SIZE],
         }
     }
+
+    /// Build a returned-by-value string from a byte slice (copy).
+    #[inline]
+    pub(crate) fn from_ptr_len(data: *const u8, len: usize) -> Self {
+        let mut out = Self::empty();
+        let p = out.bytes.as_mut_ptr().cast::<c_void>();
+        zero_rep(p);
+        if !data.is_null() && len > 0 {
+            assign_bytes(p, data, len);
+        }
+        out
+    }
 }
 
 /// `operator+` free: `string operator+(char const*, string const&)`
@@ -1029,6 +1078,40 @@ pub(crate) unsafe extern "C" fn to_string_ull(v: u64) -> StringRep {
 #[unsafe(export_name = "_ZNSt3__19to_stringEx")]
 pub(crate) unsafe extern "C" fn to_string_ll(v: i64) -> StringRep {
     string_from_i64(v)
+}
+
+/// `std::to_string(double)` — soft integer truncation (libLTO import).
+#[unsafe(export_name = "_ZNSt3__19to_stringEd")]
+pub(crate) unsafe extern "C" fn to_string_double(v: f64) -> StringRep {
+    // Soft integer part; `1.844…e19` ≈ u64::MAX without `u64 as f64`.
+    let neg = v < 0.0;
+    let abs = if neg { -v } else { v };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = if abs >= 1.844_674_407_370_955_2e19 {
+        u64::MAX
+    } else {
+        abs as u64
+    };
+    if neg {
+        // negate carefully
+        if whole == 0 {
+            string_from_i64(0)
+        } else if whole > (i64::MAX as u64) {
+            string_from_i64(i64::MIN)
+        } else {
+            string_from_i64(-(whole as i64))
+        }
+    } else if whole > (i64::MAX as u64) {
+        string_from_u64(whole)
+    } else {
+        string_from_i64(whole as i64)
+    }
+}
+
+/// `std::to_string(float)` — soft integer truncation (libLTO import).
+#[unsafe(export_name = "_ZNSt3__19to_stringEf")]
+pub(crate) unsafe extern "C" fn to_string_float(v: f32) -> StringRep {
+    unsafe { to_string_double(f64::from(v)) }
 }
 
 /// `std::stoi(string const&, size_t* idx, int base)` — Apple `ld-classic` (G4).

@@ -957,7 +957,6 @@ fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
     };
     let is_ere = cflags & DARWIN_REG_EXTENDED != 0;
     let mut rust_pat = if is_ere { pat } else { bre_to_rust(&pat) };
-    let nsub = count_groups(&rust_pat);
     if cflags & DARWIN_REG_NEWLINE != 0 {
         rust_pat.insert_str(0, "(?m)");
     }
@@ -966,6 +965,12 @@ fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
     }
     let Ok(re) = regex::Regex::new(&rust_pat) else {
         return SyscallResult::ok(name, DARWIN_REG_BADPAT);
+    };
+    // Engine capture count (includes group 0); Darwin `re_nsub` is parenthesized only.
+    // Fall back to paren-scan if the crate reports 0 (should not happen on success).
+    let nsub = match re.captures_len().saturating_sub(1) {
+        0 => count_groups(&rust_pat),
+        n => n,
     };
     let nosub = cflags & DARWIN_REG_NOSUB != 0;
     let host = HostRegex { re, nosub };

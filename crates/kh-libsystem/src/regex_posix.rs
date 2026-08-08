@@ -1,15 +1,23 @@
-//! Freestanding POSIX `regex.h` for Apple `git` (`regcomp` / `regexec` / …).
+//! Freestanding POSIX `regex.h` for Apple `git` / `libLTO` (`regcomp` / …).
 //!
 //! Compile/match run on the **host** via `KH_HELPER_REG*` (no `regex-automata`
 //! in freestanding — workspace feature-unification with `tracing-subscriber`
 //! would pull `std` and clash with our `#[panic_handler]`).
 //!
-//! Darwin layout (arm64):
+//! Darwin layout (arm64, `sizeof == 32`, public `_regex.h`):
 //! ```c
-//! typedef struct { size_t re_nsub; void *__opaque; } regex_t;
+//! typedef struct {
+//!     int re_magic;
+//!     size_t re_nsub;           /* offsetof 8 */
+//!     const char *re_endp;      /* offsetof 16 — REG_PEND */
+//!     struct re_guts *re_g;     /* offsetof 24 — we store host handle */
+//! } regex_t;
 //! typedef struct { regoff_t rm_so; regoff_t rm_eo; } regmatch_t;
 //! ```
-
+//!
+//! A wrong 16-byte `{nsub, opaque}` layout made `re_nsub` read the host handle
+//! (often `1`) — libLTO then fails `APPLE_1_*` bitcode version parse with
+//! `Invalid bitcode version (Producer: 'APPLE_1_…' Reader: '…')`.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
@@ -49,14 +57,21 @@ const REG_INVARG: c_int = 16;
 /// Guest addresses in the low 4 GiB are invalid (Darwin PAGEZERO).
 const PAGEZERO_END: u64 = 1 << 32;
 
+/// Apple libregex `MAGIC1` = `(('r'^0200)<<8)|'e'` = `0xF265` (native regcomp).
+const RE_MAGIC: c_int = 0xF265;
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
-/// Darwin `regex_t` (size_t + opaque pointer).
+/// Darwin `regex_t` — must match public SDK `_regex.h` (32 bytes on arm64).
+/// Field names mirror Darwin ABI (`re_*`); do not rename for clippy.
 #[repr(C)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct RegexT {
+    re_magic: c_int,
+    /// Host handle (slot id + 1), stored in `re_g` (guts pointer slot).
     re_nsub: usize,
-    /// Host handle (slot id + 1), stored as pointer-sized integer.
-    opaque: usize,
+    re_endp: usize,
+    re_g: usize,
 }
 
 /// Darwin `regmatch_t`.
@@ -116,8 +131,10 @@ pub(crate) unsafe extern "C" fn regcomp(
         return code;
     }
     unsafe {
-        (*preg).opaque = usize::try_from(out[0]).unwrap_or(0);
+        (*preg).re_magic = RE_MAGIC;
+        (*preg).re_g = usize::try_from(out[0]).unwrap_or(0);
         (*preg).re_nsub = usize::try_from(out[1]).unwrap_or(0);
+        (*preg).re_endp = 0;
     }
     0
 }
@@ -134,8 +151,8 @@ pub(crate) unsafe extern "C" fn regexec(
     if preg.is_null() || !guest_ptr_ok(preg as u64) {
         return REG_INVARG;
     }
-    let handle = unsafe { (*preg).opaque };
-    if handle == 0 {
+    let (magic, handle) = unsafe { ((*preg).re_magic, (*preg).re_g) };
+    if magic != RE_MAGIC || handle == 0 {
         return REG_INVARG;
     }
     if string.is_null() || !guest_ptr_ok(string as u64) {
@@ -145,19 +162,10 @@ pub(crate) unsafe extern "C" fn regexec(
         handle: u64::try_from(handle).unwrap_or(0),
         string: string as u64,
         nmatch: u64::try_from(nmatch).unwrap_or(0),
-        pmatch: if pmatch.is_null() {
-            0
-        } else {
-            pmatch as u64
-        },
+        pmatch: if pmatch.is_null() { 0 } else { pmatch as u64 },
         eflags: u64::from(eflags.cast_unsigned()),
     };
-    let rc = unsafe {
-        sys::helper1(
-            KH_HELPER_REGEXEC,
-            core::ptr::addr_of!(req) as u64,
-        )
-    };
+    let rc = unsafe { sys::helper1(KH_HELPER_REGEXEC, core::ptr::addr_of!(req) as u64) };
     if rc < 0 {
         return REG_ESPACE;
     }
@@ -170,13 +178,15 @@ pub(crate) unsafe extern "C" fn regfree(preg: *mut RegexT) {
     if preg.is_null() || !guest_ptr_ok(preg as u64) {
         return;
     }
-    let handle = unsafe { (*preg).opaque };
+    let handle = unsafe { (*preg).re_g };
     if handle != 0 {
         let _ = unsafe { sys::helper1(KH_HELPER_REGFREE, u64::try_from(handle).unwrap_or(0)) };
     }
     unsafe {
-        (*preg).opaque = 0;
+        (*preg).re_magic = 0;
+        (*preg).re_g = 0;
         (*preg).re_nsub = 0;
+        (*preg).re_endp = 0;
     }
 }
 

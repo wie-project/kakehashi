@@ -271,6 +271,49 @@ unsafe extern "C" fn soft_xsgetn(_this: *mut c_void, _s: *mut u8, _n: usize) -> 
     0
 }
 
+/// `basic_stringbuf::str() const` → nlist
+/// `_ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv`
+///
+/// **libLTO imports this** (not only inlined ld). Without the export, bind
+/// lands on `_kh_missing_symbol` and LTO diagnostic / materialize paths that
+/// snapshot the stream see garbage/empty error strings (`materialize …: ''`).
+///
+/// Layout (see module comment): return bytes `[pbase, max(hm, pptr))`, falling
+/// back to the embedded `basic_string` when put pointers are unset.
+#[unsafe(export_name = "_ZNKSt3__115basic_stringbufIcNS_11char_traitsIcEENS_9allocatorIcEEE3strEv")]
+pub(crate) unsafe extern "C" fn stringbuf_str(
+    this: *const c_void,
+) -> crate::libcxx_string::StringRep {
+    if this.is_null() {
+        return crate::libcxx_string::StringRep::empty();
+    }
+    let this_mut = this.cast_mut();
+    // SAFETY: freestanding stringbuf soft layout; put pointers are either null
+    // or point into the embedded string / prior overflow buffer.
+    unsafe {
+        let pbase = sb_load_ptr(this_mut, SB_PBASE);
+        let pptr = sb_load_ptr(this_mut, SB_PPTR);
+        let mut hm = sb_load_ptr(this_mut, SB_HM);
+        if !pbase.is_null() && !pptr.is_null() && pptr >= pbase {
+            if hm.is_null() || hm < pptr {
+                hm = pptr;
+                sb_store_ptr(this_mut, SB_HM, hm);
+            }
+            if !hm.is_null() && hm >= pbase {
+                let n = hm.offset_from(pbase) as usize;
+                if n <= (1 << 20) {
+                    return crate::libcxx_string::StringRep::from_ptr_len(pbase, n);
+                }
+            }
+        }
+        // Fallback: copy embedded string (may be empty SSO).
+        let s = this_mut.cast::<u8>().add(SB_STRING).cast::<c_void>();
+        let data = crate::libcxx_string::string_data(s);
+        let len = crate::libcxx_string::string_len(s);
+        crate::libcxx_string::StringRep::from_ptr_len(data, len)
+    }
+}
+
 // Soft filebuf layout (owned by our ctor/open; not host libc++ layout):
 //   +0x00 vptr
 //   +0x08 unused/locale
@@ -368,11 +411,7 @@ unsafe extern "C" fn file_overflow(this: *mut c_void, ch: isize) -> isize {
             1,
         )
     };
-    if ret < 0 {
-        -1
-    } else {
-        ch
-    }
+    if ret < 0 { -1 } else { ch }
 }
 
 /// Soft filebuf `xsputn` — write to fd.
@@ -440,6 +479,16 @@ static mut ZTV_STRINGSTREAM: [usize; SS_ZTV_WORDS] = [0; SS_ZTV_WORDS];
 #[used]
 static mut ZTT_STRINGSTREAM: [usize; SS_ZTT_WORDS] = [0; SS_ZTT_WORDS];
 
+/// `basic_ostringstream` — libLTO imports ZTV/ZTT (diag / path formatting).
+/// Soft: same construction-vtable shape as stringstream (host sizeof 264).
+#[unsafe(export_name = "_ZTVNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE")]
+#[used]
+static mut ZTV_OSTRINGSTREAM: [usize; SS_ZTV_WORDS] = [0; SS_ZTV_WORDS];
+
+#[unsafe(export_name = "_ZTTNSt3__119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE")]
+#[used]
+static mut ZTT_OSTRINGSTREAM: [usize; SS_ZTT_WORDS] = [0; SS_ZTT_WORDS];
+
 // ── streambuf / stringbuf ZTV ───────────────────────────────────────────────
 
 const SB_ZTV_WORDS: usize = 24;
@@ -504,50 +553,56 @@ struct SoftFacetObj {
     pad: [usize; 15],
 }
 
-/// libc++-shaped `ctype_base::mask` bits (public ABI values, ASCII "C").
-const M_SPACE: u32 = 1 << 0;
-const M_PRINT: u32 = 1 << 1;
-const M_CNTRL: u32 = 1 << 2;
-const M_UPPER: u32 = 1 << 3;
-const M_LOWER: u32 = 1 << 4;
-const M_ALPHA: u32 = 1 << 5;
-const M_DIGIT: u32 = 1 << 6;
-const M_PUNCT: u32 = 1 << 7;
-const M_XDIGIT: u32 = 1 << 8;
-const M_BLANK: u32 = 1 << 9;
+/// Apple `ctype_base::mask` / `_CTYPE_*` (see public `_ctype.h` + `__locale`).
+/// Must match `locale.rs` runetype bits — libLTO embeds `std::regex` and uses
+/// these masks via `__get_classname` + `ctype` table lookups.
+const M_ALPHA: u32 = 0x0000_0100; // _CTYPE_A
+const M_CNTRL: u32 = 0x0000_0200; // _CTYPE_C
+const M_DIGIT: u32 = 0x0000_0400; // _CTYPE_D
+const M_GRAPH: u32 = 0x0000_0800; // _CTYPE_G
+const M_LOWER: u32 = 0x0000_1000; // _CTYPE_L
+const M_PUNCT: u32 = 0x0000_2000; // _CTYPE_P
+const M_SPACE: u32 = 0x0000_4000; // _CTYPE_S
+const M_UPPER: u32 = 0x0000_8000; // _CTYPE_U
+const M_XDIGIT: u32 = 0x0001_0000; // _CTYPE_X
+const M_BLANK: u32 = 0x0002_0000; // _CTYPE_B
+const M_PRINT: u32 = 0x0004_0000; // _CTYPE_R
+/// libc++ Apple `ctype_base::__regex_word`.
+const M_REGEX_WORD: u32 = 0x80;
 
 const fn ascii_ctype_mask(c: u8) -> u32 {
     let mut m = 0_u32;
-    if c == b' ' || c == b'\t' {
-        m |= M_BLANK | M_SPACE;
-    }
-    if c == b'\n' || c == b'\r' || c == b'\x0c' || c == b'\x0b' {
-        m |= M_SPACE;
-    }
     if c < 0x20 || c == 0x7f {
         m |= M_CNTRL;
     }
-    if c >= 0x20 && c < 0x7f {
-        m |= M_PRINT;
+    if c == b' ' || (c >= 0x09 && c <= 0x0d) {
+        m |= M_SPACE;
     }
-    if c >= b'A' && c <= b'Z' {
-        m |= M_UPPER | M_ALPHA;
-    }
-    if c >= b'a' && c <= b'z' {
-        m |= M_LOWER | M_ALPHA;
+    if c == b' ' || c == b'\t' {
+        m |= M_BLANK;
     }
     if c >= b'0' && c <= b'9' {
-        m |= M_DIGIT | M_XDIGIT;
+        m |= M_DIGIT | M_XDIGIT | M_GRAPH | M_PRINT;
     }
     if (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F') {
         m |= M_XDIGIT;
     }
-    if m & (M_ALPHA | M_DIGIT | M_SPACE | M_CNTRL) == 0 && c > 0x20 && c < 0x7f {
-        m |= M_PUNCT;
+    if c >= b'a' && c <= b'z' {
+        m |= M_LOWER | M_ALPHA | M_GRAPH | M_PRINT;
+    }
+    if c >= b'A' && c <= b'Z' {
+        m |= M_UPPER | M_ALPHA | M_GRAPH | M_PRINT;
+    }
+    if c >= 0x21 && c <= 0x7e {
+        m |= M_PRINT;
+        let alnum =
+            (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z');
+        if !alnum {
+            m |= M_PUNCT | M_GRAPH;
+        }
     }
     m
 }
-
 const fn build_classic_table() -> [u32; 256] {
     let mut t = [0_u32; 256];
     let mut i = 0_usize;
@@ -651,6 +706,7 @@ pub(crate) fn ensure_iostream_vtables() {
     // Single-flight soft: double-fill is idempotent.
     unsafe {
         init_stringstream_vtables();
+        init_ostringstream_vtables();
         init_buf_vtables();
         init_fstream_vtables();
     }
@@ -761,6 +817,60 @@ unsafe fn init_stringstream_vtables() {
     }
 
     let _ = base;
+}
+
+/// Same soft VTT/ZTV pattern as stringstream (libLTO uses ostringstream for
+/// some LLVM diagnostic / path formatting under `-flto`).
+unsafe fn init_ostringstream_vtables() {
+    let ztv = &raw mut ZTV_OSTRINGSTREAM;
+    let ztt = &raw mut ZTT_OSTRINGSTREAM;
+    let base = ztv as *mut usize as usize;
+    let d1 = fn_usize(soft_dtor);
+    let d0 = fn_usize(soft_deleting_dtor);
+    let v0 = fn_usize1(soft_virt0);
+
+    for i in 0..SS_ZTV_WORDS {
+        (*ztv)[i] = 0;
+    }
+    (*ztv)[0] = 128;
+    (*ztv)[1] = 0;
+    (*ztv)[2] = 0;
+    (*ztv)[3] = d1;
+    (*ztv)[4] = d0;
+    (*ztv)[5] = 112;
+    (*ztv)[6] = (-16_isize) as usize;
+    (*ztv)[7] = 0;
+    (*ztv)[8] = v0;
+    (*ztv)[9] = v0;
+    (*ztv)[10] = (-128_isize) as usize;
+    (*ztv)[11] = (-128_isize) as usize;
+    (*ztv)[12] = 0;
+    (*ztv)[13] = v0;
+    (*ztv)[14] = v0;
+    for i in 15..SS_ZTV_WORDS {
+        if (*ztv)[i] == 0 {
+            (*ztv)[i] = v0;
+        }
+    }
+    // Mirror the stringstream construction groups (ld / libLTO scan similar slots).
+    for &idx in &[25_usize, 40, 50] {
+        if idx + 4 < SS_ZTV_WORDS {
+            (*ztv)[idx] = 128;
+            (*ztv)[idx + 1] = 0;
+            (*ztv)[idx + 2] = 0;
+            (*ztv)[idx + 3] = d1;
+            (*ztv)[idx + 4] = d0;
+        }
+    }
+    let offs: [usize; 10] = [24, 224, 344, 384, 424, 464, 304, 264, 104, 64];
+    for i in 0..SS_ZTT_WORDS {
+        (*ztt)[i] = 0;
+    }
+    for (i, off) in offs.iter().enumerate() {
+        if i < SS_ZTT_WORDS {
+            (*ztt)[i] = base.wrapping_add(*off);
+        }
+    }
 }
 
 unsafe fn init_buf_vtables() {
@@ -1001,10 +1111,7 @@ pub(crate) unsafe extern "C" fn locale_use_facet(
 
 /// `locale::has_facet(id const&) const` → true (pairs with soft `use_facet`).
 #[unsafe(export_name = "_ZNKSt3__16locale9has_facetERKNS0_2idE")]
-pub(crate) unsafe extern "C" fn locale_has_facet(
-    _this: *const c_void,
-    _id: *const c_void,
-) -> bool {
+pub(crate) unsafe extern "C" fn locale_has_facet(_this: *const c_void, _id: *const c_void) -> bool {
     true
 }
 
@@ -1012,25 +1119,62 @@ pub(crate) unsafe extern "C" fn locale_has_facet(
 ///
 /// libLTO pulls this; return empty `basic_string` by value (AArch64 sret).
 #[unsafe(export_name = "_ZNKSt3__16locale4nameEv")]
-pub(crate) unsafe extern "C" fn locale_name(_this: *const c_void) -> crate::libcxx_string::StringRep {
+pub(crate) unsafe extern "C" fn locale_name(
+    _this: *const c_void,
+) -> crate::libcxx_string::StringRep {
     crate::libcxx_string::StringRep::empty()
 }
 
-/// `std::__1::__get_classname(char const*, bool)` — demangle helper for typeinfo.
+/// `std::__1::__get_classname(char const*, bool)` → `ctype_base::mask` (`uint32_t`).
 ///
-/// Observed under `-flto` / live libLTO after soft facets. Soft: return the
-/// mangled name pointer as-is (no demangle); never null when input is non-null.
+/// Public libc++ (`regex`): character-class name → Apple `_CTYPE_*` mask used by
+/// embedded `std::basic_regex` inside live `libLTO`. Returning a pointer (old soft
+/// demangle stub) made `[[:digit:]]` never match →
+/// `Invalid bitcode version (Producer: 'APPLE_1_…' Reader: '…')`.
+///
+/// Spec: MacOSX.sdk `c++/v1/regex` + native `std::__get_classname` values.
 #[unsafe(export_name = "_ZNSt3__115__get_classnameEPKcb")]
-pub(crate) unsafe extern "C" fn get_classname(
-    mangled: *const c_char,
-    _trim: bool,
-) -> *const c_char {
-    if mangled.is_null() {
-        // Static empty C string.
-        static EMPTY: [u8; 1] = [0];
-        return EMPTY.as_ptr().cast();
+pub(crate) unsafe extern "C" fn get_classname(name: *const c_char, icase: bool) -> u32 {
+    if name.is_null() {
+        return 0;
     }
-    mangled
+    // Read up to 16 bytes of class name (longest std names are short).
+    let mut buf = [0_u8; 16];
+    let mut n = 0_usize;
+    unsafe {
+        while n < buf.len() {
+            let b = *name.add(n) as u8;
+            if b == 0 {
+                break;
+            }
+            // Fold ASCII upper for case-insensitive names.
+            buf[n] = if b.is_ascii_uppercase() { b + 32 } else { b };
+            n += 1;
+        }
+    }
+    let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut m = match s {
+        "d" | "digit" => M_DIGIT,
+        "xdigit" => M_XDIGIT,
+        "a" | "alpha" => M_ALPHA,
+        "alnum" => M_ALPHA | M_DIGIT,
+        "s" | "space" => M_SPACE,
+        "blank" => M_BLANK,
+        "c" | "cntrl" => M_CNTRL,
+        "g" | "graph" => M_GRAPH,
+        "l" | "lower" => M_LOWER,
+        "u" | "upper" => M_UPPER,
+        "p" | "print" => M_PRINT,
+        "punct" => M_PUNCT,
+        // Apple libc++: "w" → alnum | __regex_word; bare "word" falls through (0).
+        "w" => M_ALPHA | M_DIGIT | M_REGEX_WORD,
+        _ => 0,
+    };
+    // When icase, alpha classes include both cases (host libc++ does this).
+    if icase && m != 0 && m & (M_LOWER | M_UPPER | M_ALPHA) != 0 {
+        m |= M_LOWER | M_UPPER | M_ALPHA;
+    }
+    m
 }
 
 /// `std::__1::__get_collation_name(char const*)` — collate facet name helper.
@@ -1219,6 +1363,65 @@ pub(crate) unsafe extern "C" fn ostream_insert_ull(this: *mut c_void, v: u64) ->
     ensure_iostream_vtables();
     unsafe {
         ostream_put_decimal(this, v, false);
+    }
+    this
+}
+
+/// `operator<<(ostream&, unsigned int)`.
+#[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEj")]
+pub(crate) unsafe extern "C" fn ostream_insert_uint(this: *mut c_void, v: u32) -> *mut c_void {
+    ensure_iostream_vtables();
+    unsafe {
+        ostream_put_decimal(this, u64::from(v), false);
+    }
+    this
+}
+
+/// `operator<<(ostream&, unsigned long)` (LP64 = u64).
+#[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEm")]
+pub(crate) unsafe extern "C" fn ostream_insert_ulong(this: *mut c_void, v: u64) -> *mut c_void {
+    unsafe { ostream_insert_ull(this, v) }
+}
+
+/// `operator<<(ostream&, unsigned short)`.
+#[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEt")]
+pub(crate) unsafe extern "C" fn ostream_insert_ushort(this: *mut c_void, v: u16) -> *mut c_void {
+    ensure_iostream_vtables();
+    unsafe {
+        ostream_put_decimal(this, u64::from(v), false);
+    }
+    this
+}
+
+/// `operator<<(ostream&, void const*)` — hex-ish soft decimal of address.
+#[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEPKv")]
+pub(crate) unsafe extern "C" fn ostream_insert_ptr(
+    this: *mut c_void,
+    p: *const c_void,
+) -> *mut c_void {
+    ensure_iostream_vtables();
+    unsafe {
+        ostream_put_decimal(this, p.addr() as u64, false);
+    }
+    this
+}
+
+/// `operator<<(ostream&, double)` — soft fixed-ish decimal (no full printf).
+#[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEElsEd")]
+pub(crate) unsafe extern "C" fn ostream_insert_double(this: *mut c_void, v: f64) -> *mut c_void {
+    ensure_iostream_vtables();
+    // Soft: truncate toward zero to integer part only (enough for version-ish dumps).
+    // `1.844…e19` ≈ u64::MAX without `u64 as f64` (mantissa cannot hold all u64).
+    let neg = v < 0.0;
+    let abs = if neg { -v } else { v };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = if abs >= 1.844_674_407_370_955_2e19 {
+        u64::MAX
+    } else {
+        abs as u64
+    };
+    unsafe {
+        ostream_put_decimal(this, whole, neg);
     }
     this
 }

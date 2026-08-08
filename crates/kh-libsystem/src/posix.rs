@@ -1432,6 +1432,47 @@ pub(crate) unsafe extern "C" fn sysconf(name: c_int) -> i64 {
     }
 }
 
+/// Darwin `_CS_DARWIN_USER_TEMP_DIR` (`unistd.h` = 65537).
+const CS_DARWIN_USER_TEMP_DIR: c_int = 65_537;
+/// Darwin `_CS_DARWIN_USER_CACHE_DIR` = 65538 (soft: same tree sibling).
+const CS_DARWIN_USER_CACHE_DIR: c_int = 65_538;
+/// Darwin `_CS_DARWIN_USER_DIR` = 65536.
+const CS_DARWIN_USER_DIR: c_int = 65_536;
+
+/// C `confstr` → nlist `_confstr`.
+///
+/// Host clang/ld probe `_CS_DARWIN_USER_TEMP_DIR` for temp file bases. Without
+/// this, guests only see soft `TMPDIR=/tmp` (short paths).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn confstr(name: c_int, buf: *mut c_char, len: usize) -> usize {
+    let val: &[u8] = match name {
+        CS_DARWIN_USER_TEMP_DIR => DARWIN_USER_TEMP_DIR,
+        // Soft: cache dir next to temp (Darwin uses …/C/ vs …/T/).
+        CS_DARWIN_USER_CACHE_DIR => {
+            b"/var/folders/xx/kakehashi_default_user_temp000/C/\0"
+        }
+        CS_DARWIN_USER_DIR => b"/var/folders/xx/kakehashi_default_user_temp000/\0",
+        _ => {
+            errno::set_errno(EINVAL);
+            return 0;
+        }
+    };
+    // Return value includes the trailing NUL (POSIX).
+    let need = val.len(); // already includes NUL in our literals
+    if buf.is_null() || len == 0 {
+        return need;
+    }
+    let copy = need.min(len);
+    unsafe {
+        core::ptr::copy_nonoverlapping(val.as_ptr(), buf.cast::<u8>(), copy);
+        // Guarantee NUL if truncated.
+        if copy > 0 {
+            buf.add(copy.saturating_sub(1)).write(0);
+        }
+    }
+    need
+}
+
 /// C `sysctl` → nlist `_sysctl`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn sysctl(
@@ -1751,6 +1792,16 @@ fn soft_env_rebuild_environ() {
     }
 }
 
+/// Darwin user temp directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`).
+///
+/// Real macOS returns a path under `/var/folders/…/T/` (~49 chars). Host
+/// `clang -flto` then passes `-object_path_lto $TMPDIR/cc-XXXX.o` (~60 chars).
+/// Seeding `TMPDIR=/tmp` made those paths 9–20 chars; freestanding LTO
+/// materialize fails for short `-object_path_lto` / `-o` combinations that
+/// never appear on real Apple. Match Darwin length class (not `/tmp`).
+const DARWIN_USER_TEMP_DIR: &[u8] =
+    b"/var/folders/xx/kakehashi_default_user_temp000/T/\0";
+
 /// Seed PATH/HOME/TMPDIR to match the loader stack env (execute.rs), plus
 /// host `GIT_*` (clone nested re-exec: `GIT_DIR` must reach git-remote-http).
 fn soft_env_seed_defaults() {
@@ -1765,7 +1816,8 @@ fn soft_env_seed_defaults() {
     // PATH; without libexec they fall back to a broken `git remote-https` spawn.
     let path = b"/Library/Developer/CommandLineTools/usr/libexec/git-core:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0";
-    let tmp = b"/tmp\0";
+    // Already NUL-terminated static (see `DARWIN_USER_TEMP_DIR`).
+    let tmp: &[u8] = DARWIN_USER_TEMP_DIR;
     // HOME via host helper → `/Volumes/linux{host $HOME}` so host
     // `git config --global` / `~/.gitconfig` is visible under `kh run`.
     let mut home_buf = [0_u8; 512];
@@ -1789,7 +1841,7 @@ fn soft_env_seed_defaults() {
     for (name, val) in [
         (b"PATH\0".as_slice(), path.as_slice()),
         (b"HOME\0".as_slice(), home),
-        (b"TMPDIR\0".as_slice(), tmp.as_slice()),
+        (b"TMPDIR\0".as_slice(), tmp),
         (b"SDKROOT\0".as_slice(), sdkroot.as_slice()),
         (b"DEVELOPER_DIR\0".as_slice(), developer_dir.as_slice()),
     ] {
