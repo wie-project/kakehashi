@@ -142,7 +142,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // Without this, clone dies: "remote-curl: fetch attempted without a local repo".
     let mut env_owned = vec![
         // git-core first so `execvp("git-remote-https")` finds CLT helpers (G4).
+        // CLT usr/bin next: guest make/cc look up gcc/clang via PATH (bottle
+        // has no /usr/bin gcc shim — only git is symlinked there).
         "PATH=/Library/Developer/CommandLineTools/usr/libexec/git-core:\
+/Library/Developer/CommandLineTools/usr/bin:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             .to_owned(),
         home,

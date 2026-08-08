@@ -940,6 +940,16 @@ pub(crate) unsafe extern "C" fn execve(
     })
 }
 
+/// C `execv` → nlist `_execv` (`execve` with current `environ`).
+///
+/// GNU make / shell spawn paths call this (not always `execve`/`execvp`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn execv(path: *const c_char, argv: *const *const c_char) -> c_int {
+    soft_env_seed_defaults();
+    let envp = unsafe { environ };
+    unsafe { execve(path, argv, envp.cast_const().cast()) }
+}
+
 /// C `execvp` → nlist `_execvp` (PATH search then [`execve`]).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
@@ -1607,6 +1617,16 @@ pub(crate) unsafe extern "C" fn signal(_sig: c_int, _handler: *mut c_void) -> *m
     core::ptr::null_mut()
 }
 
+/// C `bsd_signal` → nlist `_bsd_signal` (POSIX.1-2001; same no-op as `signal`).
+///
+/// GNU make and other BSD-leaning tools bind this instead of `_signal`. Real
+/// libc sets SA_RESTART via `sigaction`; we only need the symbol so the guest
+/// does not hit the missing-symbol trampoline (exit 127).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn bsd_signal(sig: c_int, handler: *mut c_void) -> *mut c_void {
+    unsafe { signal(sig, handler) }
+}
+
 /// Darwin `_NSGetExecutablePath` → Mach-O nlist `__NSGetExecutablePath`.
 ///
 /// On Darwin the C name is `_NSGetExecutablePath`; the object export is
@@ -1855,7 +1875,10 @@ fn soft_env_seed_defaults() {
     }
     // git-core first: Apple `git` execvp's `git-remote-https` (and friends) via
     // PATH; without libexec they fall back to a broken `git remote-https` spawn.
+    // CLT `usr/bin` next so guest `make` finds `gcc`/`clang` (real macOS has
+    // `/usr/bin` shims; bottle only symlinks `git` there by default).
     let path = b"/Library/Developer/CommandLineTools/usr/libexec/git-core:\
+/Library/Developer/CommandLineTools/usr/bin:\
 /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\0";
     // Already NUL-terminated static (see `DARWIN_USER_TEMP_DIR`).
     let tmp: &[u8] = DARWIN_USER_TEMP_DIR;
