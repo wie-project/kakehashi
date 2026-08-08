@@ -91,6 +91,8 @@ pub enum BsdSyscall {
     Rename,
     /// `ftruncate`.
     Ftruncate,
+    /// `fchmod`.
+    Fchmod,
     /// `fsync`.
     Fsync,
     /// `openat`.
@@ -208,6 +210,7 @@ impl BsdSyscall {
             Self::Getcwd => "__getcwd",
             Self::Rename => "rename",
             Self::Ftruncate => "ftruncate",
+            Self::Fchmod => "fchmod",
             Self::Fsync => "fsync",
             Self::Openat => "openat",
             Self::Fstatat => "fstatat",
@@ -292,6 +295,7 @@ impl BsdSyscall {
             Self::Pread => 153,
             Self::Pwrite => 154,
             Self::Ftruncate => 201,
+            Self::Fchmod => 124,
             Self::Sysctl => 202,
             Self::ClockGettime => 266,
             Self::Sysctlbyname => 274,
@@ -382,6 +386,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         106 => Some(BsdSyscall::Listen),
         116 => Some(BsdSyscall::Gettimeofday),
         118 => Some(BsdSyscall::Getsockopt),
+        124 => Some(BsdSyscall::Fchmod),
         128 => Some(BsdSyscall::Rename),
         153 | 474 => Some(BsdSyscall::Pread),  // pread / pread_nocancel-ish
         154 | 475 => Some(BsdSyscall::Pwrite), // pwrite
@@ -468,6 +473,7 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (137, "rmdir"),
         (344, "__getcwd"),
         (201, "ftruncate"),
+        (124, "fchmod"),
         (338, "stat"),
         (339, "fstat"),
         (340, "lstat"),

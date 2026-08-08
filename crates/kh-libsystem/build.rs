@@ -25,10 +25,12 @@ fn main() {
     println!("cargo:rerun-if-changed=src/printf_fmt.c");
     println!("cargo:rerun-if-changed=src/curl_varargs.c");
     println!("cargo:rerun-if-changed=src/fcntl_varargs.c");
+    println!("cargo:rerun-if-changed=src/open_varargs.c");
     cc::Build::new()
         .file("src/printf_fmt.c")
         .file("src/curl_varargs.c")
         .file("src/fcntl_varargs.c")
+        .file("src/open_varargs.c")
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-builtin-printf")
@@ -65,13 +67,27 @@ fn main() {
         "_vsscanf",
         "___snprintf_chk",
         "___vsnprintf_chk",
+        "___sprintf_chk",
+        "___vsprintf_chk",
         "___assert_rtn",
+        // BSD err(3) — CLT ar/ranlib
+        "_warn",
+        "_warnx",
+        "_vwarn",
+        "_vwarnx",
+        "_err",
+        "_errx",
+        "_verr",
+        "_verrx",
         // modern `ld` mach_o::Error message path (printf_fmt.c).
         // C identifier is `_simple_vsprintf` → Darwin Mach-O `__simple_vsprintf`.
         "__simple_vsprintf",
         "_curl_easy_setopt",
         "_curl_easy_getinfo",
         "_fcntl",
+        // open/openat varargs (mode on stack) — must export C wrappers, not only impl.
+        "_open",
+        "_openat",
     ] {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,{sym}");
     }

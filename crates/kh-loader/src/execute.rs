@@ -261,12 +261,37 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let heap_dump_va = freestanding_export_va(&session, "_kh_heap_stats_dump")
         .or_else(|| freestanding_export_va(&session, "kh_heap_stats_dump"));
 
+    // Darwin crt0: `setprogname(argv[0])` before main so `___progname` /
+    // `getprogname()` match the invoked basename. CLT multi-call tools
+    // (`ranlib` → `libtool`) branch on progname; freestanding default
+    // `"kh-guest"` made `ar`'s internal `ranlib -q` fail with "unknown option -q".
+    let setprogname_va = freestanding_export_va(&session, "_setprogname")
+        .or_else(|| freestanding_export_va(&session, "setprogname"));
+
     // Publish mapped images for freestanding `dlopen`/`dlsym` (e.g. clang's
     // `-lto_library` re-open of already-loaded `@rpath/libLTO.dylib`).
     crate::load_timing::time("dyld_table", || register_dyld_images(&session));
 
     // Dump load phases before guest entry (guest may noreturn via `_exit`).
     crate::load_timing::dump("pre-entry");
+
+    // Call setprogname while stack is still a live MappedRegion (read argv[0]).
+    if let Some(va) = setprogname_va {
+        let argv0_cstr = {
+            let rel = sp.wrapping_sub(stack_base).wrapping_add(8);
+            let off = usize::try_from(rel).unwrap_or(usize::MAX);
+            stack
+                .host_bytes()
+                .get(off..off.saturating_add(8))
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_le_bytes)
+                .filter(|&p| p != 0)
+        };
+        if let Some(ptr) = argv0_cstr {
+            // SAFETY: freestanding `_setprogname`; `ptr` is a stack C string.
+            let _ = unsafe { call_guest(va, sp, ptr) };
+        }
+    }
 
     // Keep stack / session alive across the call (may noreturn via guest exit).
     // `forget` retains all GuestMemory owners if exit traps.

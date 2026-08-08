@@ -38,7 +38,7 @@
 use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::posix::{close, open};
+use crate::posix::{close, kh_open_impl};
 
 // ── Soft virtual functions ──────────────────────────────────────────────────
 
@@ -1494,7 +1494,7 @@ pub(crate) unsafe extern "C" fn filebuf_open(
     if app {
         flags |= 0x8; // O_APPEND
     }
-    let fd = unsafe { open(path, flags, 0o666) };
+    let fd = unsafe { kh_open_impl(path, flags, 0o666) };
     if fd < 0 {
         return core::ptr::null_mut();
     }

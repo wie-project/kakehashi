@@ -80,6 +80,8 @@ pub(crate) const SYS_PREAD: u32 = 153;
 pub(crate) const SYS_PWRITE: u32 = 154;
 /// BSD `ftruncate`.
 pub(crate) const SYS_FTRUNCATE: u32 = 201;
+/// BSD `fchmod`.
+pub(crate) const SYS_FCHMOD: u32 = 124;
 /// BSD `sysctl`.
 pub(crate) const SYS_SYSCTL: u32 = 202;
 /// BSD `sysctlbyname`.

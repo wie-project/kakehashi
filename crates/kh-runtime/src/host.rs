@@ -697,6 +697,14 @@ pub fn ftruncate_fd(fd: RawFd, length: i64) -> Option<()> {
     if rc == 0 { Some(()) } else { None }
 }
 
+/// `fchmod(fd, mode)` — needed so guest `ld` can mark products executable.
+pub fn fchmod_fd(fd: RawFd, mode: u32) -> Option<()> {
+    let mode = libc::mode_t::try_from(mode).unwrap_or(0);
+    // SAFETY: live fd; mode is Darwin permission bits (subset of POSIX).
+    let rc = unsafe { libc::fchmod(fd, mode) };
+    if rc == 0 { Some(()) } else { None }
+}
+
 /// `fsync(fd)`.
 pub fn fsync_fd(fd: RawFd) -> Option<()> {
     // SAFETY: live fd.

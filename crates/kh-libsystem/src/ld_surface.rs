@@ -782,6 +782,42 @@ pub(crate) unsafe extern "C" fn dirname(path: *mut c_char) -> *mut c_char {
     }
 }
 
+/// Darwin `dirname_r` → nlist `_dirname_r` (thread-safe; writes into `result`).
+///
+/// Soft: same rules as `dirname` but non-destructive; `result` must hold ≥ `PATH_MAX`.
+/// Observed: CLT `libtool` undefined import.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn dirname_r(
+    path: *const c_char,
+    result: *mut c_char,
+    size: usize,
+) -> *mut c_char {
+    if result.is_null() || size == 0 {
+        return core::ptr::null_mut();
+    }
+    // Default "."
+    if path.is_null() {
+        if size >= 2 {
+            unsafe {
+                result.write(b'.'.cast_signed());
+                result.add(1).write(0);
+            }
+            return result;
+        }
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        // Copy path into result then dirname in place (bounded).
+        let len = strlen(path);
+        if len + 1 > size {
+            return core::ptr::null_mut();
+        }
+        core::ptr::copy_nonoverlapping(path, result, len + 1);
+        let _ = dirname(result);
+        result
+    }
+}
+
 // ── misc ────────────────────────────────────────────────────────────────────
 
 /// C `sleep` → nlist `_sleep` (seconds).
@@ -903,11 +939,7 @@ pub(crate) unsafe extern "C" fn mkpath_np(path: *const c_char, mode: u16) -> c_i
         buf[j] = 0;
         let cpath = buf.as_ptr().cast::<c_char>();
         let rc = unsafe { crate::posix::mkdir(cpath, mode_i) };
-        let err = if rc != 0 {
-            errno::get_errno()
-        } else {
-            0
-        };
+        let err = if rc != 0 { errno::get_errno() } else { 0 };
         buf[j] = saved;
         if rc != 0 && err != 17 {
             // EEXIST is fine; anything else fails the whole path.
@@ -942,6 +974,39 @@ pub(crate) unsafe extern "C" fn pthread_attr_setstacksize(
     _size: usize,
 ) -> c_int {
     0
+}
+
+/// Darwin `qsort_b` — Block comparator (CLT `libtool`/`ranlib` TOC sort).
+///
+/// ```c
+/// void qsort_b(void *base, size_t nel, size_t width,
+///              int (^compar)(const void *, const void *));
+/// ```
+///
+/// Soft: treat `compar` as a Block with invoke at +16 (same as GCD soft path).
+/// `invoke(block, a, b) → int`. Trace-first from `libtool -static` missing
+/// `_qsort_b`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn qsort_b(
+    base: *mut c_void,
+    nel: usize,
+    width: usize,
+    compar: *mut c_void,
+) {
+    if base.is_null() || nel < 2 || width == 0 || compar.is_null() {
+        return;
+    }
+    // Block_layout.invoke @ +16 on Darwin arm64.
+    let invoke = unsafe { compar.cast::<usize>().add(2).read() };
+    if invoke == 0 {
+        return;
+    }
+    let invoke: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void) -> c_int =
+        unsafe { core::mem::transmute(invoke) };
+    // Reuse BSD qsort_r with block as thunk.
+    unsafe {
+        qsort_r(base, nel, width, compar, Some(invoke));
+    }
 }
 
 /// Darwin BSD `qsort_r` (thunk **before** compar — not GNU order).

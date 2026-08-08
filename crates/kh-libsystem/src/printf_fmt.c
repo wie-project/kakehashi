@@ -93,6 +93,7 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
       continue;
     }
     int zero_pad = 0;
+    int left_just = 0;
     size_t width = 0;
     int prec = -1; /* -1 = unspecified */
     for (;;) {
@@ -102,7 +103,12 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         i++;
         continue;
       }
-      if (f == '-' || f == '+' || f == ' ' || f == '#') {
+      if (f == '-') {
+        left_just = 1;
+        i++;
+        continue;
+      }
+      if (f == '+' || f == ' ' || f == '#') {
         i++;
         continue;
       }
@@ -145,6 +151,12 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         i++;
         continue;
       }
+      /* BSD `q` = quad (long long) — CLT `ar` archive headers use %-10qd. */
+      if (m == 'q') {
+        long_mod = 2;
+        i++;
+        continue;
+      }
       if (m == 'z' || m == 't' || m == 'h' || m == 'j') {
         if (m == 'z')
           long_mod = 3;
@@ -169,14 +181,18 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
       size_t n = c_strlen(s);
       if (prec >= 0 && (size_t)prec < n)
         n = (size_t)prec;
-      /* optional left-pad to width (git rarely needs it for %s) */
-      if (width > n) {
-        size_t pad = width - n;
+      size_t pad = width > n ? width - n : 0;
+      /* right-justify (default): pad before; left (`%-`): pad after — ar headers */
+      if (!left_just) {
         for (size_t p = 0; p < pad; p++)
           push_byte(dst, cap, &out_len, ' ');
       }
       for (size_t k = 0; k < n; k++)
         push_byte(dst, cap, &out_len, (unsigned char)s[k]);
+      if (left_just) {
+        for (size_t p = 0; p < pad; p++)
+          push_byte(dst, cap, &out_len, ' ');
+      }
     } else if (spec == 'd' || spec == 'i') {
       int64_t v;
       if (long_mod >= 2)
@@ -185,7 +201,25 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         v = va_arg(ap, long);
       else
         v = va_arg(ap, int);
-      push_i64(dst, cap, &out_len, v, width, zero_pad);
+      /* ar uses %-12ld etc.; left-just with spaces when `-` set */
+      if (left_just && width > 0)
+        zero_pad = 0;
+      push_i64(dst, cap, &out_len, v, left_just ? 0 : width, zero_pad);
+      if (left_just && width > 0) {
+        size_t used = (v < 0) ? 1 : 0;
+        uint64_t t = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+        if (t == 0)
+          used++;
+        while (t > 0) {
+          used++;
+          t /= 10;
+        }
+        if (width > used) {
+          size_t p = width - used;
+          for (size_t k = 0; k < p; k++)
+            push_byte(dst, cap, &out_len, ' ');
+        }
+      }
     } else if (spec == 'u') {
       uint64_t v;
       if (long_mod >= 2)
@@ -194,7 +228,20 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         v = va_arg(ap, unsigned long);
       else
         v = va_arg(ap, unsigned);
-      push_u64(dst, cap, &out_len, v, width, zero_pad, 10, 0);
+      push_u64(dst, cap, &out_len, v, left_just ? 0 : width, zero_pad, 10, 0);
+      if (left_just && width > 0) {
+        size_t used = 0;
+        uint64_t t = v;
+        if (t == 0)
+          used = 1;
+        while (t > 0) {
+          used++;
+          t /= 10;
+        }
+        if (width > used)
+          for (size_t k = 0; k < width - used; k++)
+            push_byte(dst, cap, &out_len, ' ');
+      }
     } else if (spec == 'o') {
       /* Octal — git tree entries: strbuf_addf("%o %s%c", mode, path, 0) */
       uint64_t v;
@@ -204,7 +251,20 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         v = va_arg(ap, unsigned long);
       else
         v = va_arg(ap, unsigned);
-      push_u64(dst, cap, &out_len, v, width, zero_pad, 8, 0);
+      push_u64(dst, cap, &out_len, v, left_just ? 0 : width, zero_pad, 8, 0);
+      if (left_just && width > 0) {
+        size_t used = 0;
+        uint64_t t = v;
+        if (t == 0)
+          used = 1;
+        while (t > 0) {
+          used++;
+          t /= 8;
+        }
+        if (width > used)
+          for (size_t k = 0; k < width - used; k++)
+            push_byte(dst, cap, &out_len, ' ');
+      }
     } else if (spec == 'x' || spec == 'X') {
       uint64_t v;
       if (long_mod >= 2)
@@ -213,7 +273,21 @@ static int vsnprintf_impl(char *dst, size_t cap, const char *fmt, va_list ap) {
         v = va_arg(ap, unsigned long);
       else
         v = va_arg(ap, unsigned);
-      push_u64(dst, cap, &out_len, v, width, zero_pad, 16, spec == 'X');
+      push_u64(dst, cap, &out_len, v, left_just ? 0 : width, zero_pad, 16,
+               spec == 'X');
+      if (left_just && width > 0) {
+        size_t used = 0;
+        uint64_t t = v;
+        if (t == 0)
+          used = 1;
+        while (t > 0) {
+          used++;
+          t /= 16;
+        }
+        if (width > used)
+          for (size_t k = 0; k < width - used; k++)
+            push_byte(dst, cap, &out_len, ' ');
+      }
     } else if (spec == 'p') {
       void *p = va_arg(ap, void *);
       push_byte(dst, cap, &out_len, '0');
@@ -259,6 +333,24 @@ int __vsnprintf_chk(char *dst, size_t cap, int flag, size_t slen,
   (void)flag;
   (void)slen;
   return vsnprintf_impl(dst, cap, fmt, ap);
+}
+
+/* Fortify `__sprintf_chk` — CLT `ar` / archive tools (trace-first). */
+int __vsprintf_chk(char *dst, int flag, size_t slen, const char *fmt,
+                   va_list ap) {
+  (void)flag;
+  size_t cap = slen;
+  if (cap == 0)
+    cap = (size_t)-1 / 2;
+  return vsnprintf_impl(dst, cap, fmt, ap);
+}
+
+int __sprintf_chk(char *dst, int flag, size_t slen, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = __vsprintf_chk(dst, flag, slen, fmt, ap);
+  va_end(ap);
+  return n;
 }
 
 int vfprintf(void *stream, const char *fmt, va_list ap) {
@@ -391,6 +483,97 @@ void __assert_rtn(const char *func, const char *file, int line,
   /* exit via guest _exit if linked; else spin */
   extern void _exit(int) __attribute__((noreturn));
   _exit(134);
+}
+
+/* ── BSD err/warn family (CLT `ar` / `ranlib`; public man err(3)) ─────────── */
+extern void _exit(int) __attribute__((noreturn));
+extern int *__error(void);
+
+static void err_write(const char *pfx, const char *fmt, va_list ap, int with_errno) {
+  char buf[1024];
+  size_t n = 0;
+  const char *p = pfx ? pfx : "tool";
+  while (*p && n + 1 < sizeof(buf))
+    buf[n++] = *p++;
+  if (fmt && *fmt) {
+    if (n + 2 < sizeof(buf)) {
+      buf[n++] = ':';
+      buf[n++] = ' ';
+    }
+    int m = vsnprintf_impl(buf + n, sizeof(buf) - n, fmt, ap);
+    if (m > 0) {
+      size_t add = (size_t)m;
+      if (add >= sizeof(buf) - n)
+        add = sizeof(buf) - n - 1;
+      n += add;
+    }
+  }
+  if (with_errno) {
+    int *ep = __error();
+    int e = ep ? *ep : 0;
+    const char *es = "error";
+    /* Soft short errno tag (no full strerror table yet). */
+    if (e == 2)
+      es = "No such file or directory";
+    else if (e == 13)
+      es = "Permission denied";
+    else if (e == 17)
+      es = "File exists";
+    else if (e == 22)
+      es = "Invalid argument";
+    if (n + 2 < sizeof(buf)) {
+      buf[n++] = ':';
+      buf[n++] = ' ';
+    }
+    while (*es && n + 1 < sizeof(buf))
+      buf[n++] = *es++;
+  }
+  if (n + 1 < sizeof(buf))
+    buf[n++] = '\n';
+  (void)write(2, buf, n);
+}
+
+void vwarn(const char *fmt, va_list ap) { err_write("ar", fmt, ap, 1); }
+void vwarnx(const char *fmt, va_list ap) { err_write("ar", fmt, ap, 0); }
+
+void warn(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vwarn(fmt, ap);
+  va_end(ap);
+}
+
+void warnx(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vwarnx(fmt, ap);
+  va_end(ap);
+}
+
+void verr(int eval, const char *fmt, va_list ap) {
+  err_write("ar", fmt, ap, 1);
+  _exit(eval);
+}
+
+void verrx(int eval, const char *fmt, va_list ap) {
+  err_write("ar", fmt, ap, 0);
+  _exit(eval);
+}
+
+void err(int eval, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verr(eval, fmt, ap);
+  va_end(ap);
+  _exit(eval);
+}
+
+void errx(int eval, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verrx(eval, fmt, ap);
+  va_end(ap);
+  _exit(eval);
 }
 
 /* ── Apple `_simple_vsprintf` (modern ld mach_o::Error) ─────────────────────

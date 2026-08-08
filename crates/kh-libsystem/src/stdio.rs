@@ -400,7 +400,7 @@ pub(crate) unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) 
         return core::ptr::null_mut();
     }
     // SAFETY: path/mode from guest; open is our BSD wrapper.
-    let fd = unsafe { crate::posix::open(path, flags, creat_mode) };
+    let fd = unsafe { crate::posix::kh_open_impl(path, flags, creat_mode) };
     file_from_fd(fd).cast()
 }
 
@@ -839,7 +839,7 @@ pub(crate) unsafe extern "C" fn freopen(
     if !is_std && old_fd >= 0 {
         let _ = unsafe { crate::posix::close(old_fd) };
     }
-    let new_fd = unsafe { crate::posix::open(path, flags, creat_mode) };
+    let new_fd = unsafe { crate::posix::kh_open_impl(path, flags, creat_mode) };
     if new_fd < 0 {
         return core::ptr::null_mut();
     }

@@ -63,9 +63,10 @@ fn take_guest_fd(gfd: i32) -> Option<RawFd> {
     process::fd_take(gfd)
 }
 
-/// `open` — path in `x0`, flags in `x1`, mode in `x2` (ignored unless create).
+/// `open` — path in `x0`, flags in `x1`, mode in `x2` (used when `O_CREAT`).
 pub(crate) fn handle_open(args: SyscallArgs) -> SyscallResult {
-    open_path(args.x0, args.x1, "open")
+    let mode = u32::try_from(args.x2 & 0xFFFF).unwrap_or(0o666);
+    open_path(args.x0, args.x1, mode, "open")
 }
 
 /// `openat` — dirfd `x0`, path `x1`, flags `x2`, mode `x3`.
@@ -79,9 +80,10 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     };
     let path = String::from_utf8_lossy(&bytes).into_owned();
+    let mode = u32::try_from(args.x3 & 0xFFFF).unwrap_or(0o666);
 
     if dirfd == AT_FDCWD || path.starts_with('/') {
-        return open_translated(&path, args.x2, name);
+        return open_translated(&path, args.x2, mode, name);
     }
 
     let Some(host_dir) = guest_to_host_fd_i32(dirfd) else {
@@ -89,7 +91,6 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
     };
 
     let flags = darwin_to_host_open_flags(args.x2);
-    let mode = u32::try_from(args.x3 & 0xFFFF).unwrap_or(0o666);
     // CString rejects interior NUL; our bytes already stop at first NUL.
     let Ok(c_path) = std::ffi::CString::new(bytes) else {
         return SyscallResult::err(name, EFAULT);
@@ -101,7 +102,7 @@ pub(crate) fn handle_openat(args: SyscallArgs) -> SyscallResult {
     finish_open_maybe_thin(name, rc, thin, Some(&path))
 }
 
-fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
+fn open_path(path_ptr: u64, flags: u64, mode: u32, name: &'static str) -> SyscallResult {
     if !registry_check_range(path_ptr, 1, false) {
         return SyscallResult::err(name, EFAULT);
     }
@@ -110,7 +111,7 @@ fn open_path(path_ptr: u64, flags: u64, name: &'static str) -> SyscallResult {
     };
     // Darwin paths are bytes; lossy only for logging / bottle PathBuf.
     let path = String::from_utf8_lossy(&bytes).into_owned();
-    open_translated(&path, flags, name)
+    open_translated(&path, flags, mode, name)
 }
 
 /// Map host `errno` after a failed `open`/`openat` to Darwin errno.
@@ -145,15 +146,15 @@ fn open_fail(name: &'static str, path: &str, why: &str) -> SyscallResult {
     SyscallResult::err(name, darwin)
 }
 
-fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult {
-    let r = open_translated_once(path, flags, name);
+fn open_translated(path: &str, flags: u64, mode: u32, name: &'static str) -> SyscallResult {
+    let r = open_translated_once(path, flags, mode, name);
     if !r.error {
         return r;
     }
     // G5: modern ld may open paths with a dropped `/` (liblib, .sdkusr, …).
     let enoent = r.error && r.retval == Some(ENOENT.unsigned_abs());
     if enoent && let Some(fixed) = bottle::repair_ld_guest_path(path) {
-        let r2 = open_translated_once(&fixed, flags, name);
+        let r2 = open_translated_once(&fixed, flags, mode, name);
         if !r2.error {
             tracing::debug!(guest = %path, fixed = %fixed, "open ok (ld path repair)");
             return r2;
@@ -162,9 +163,11 @@ fn open_translated(path: &str, flags: u64, name: &'static str) -> SyscallResult 
     r
 }
 
-fn open_translated_once(path: &str, flags: u64, name: &'static str) -> SyscallResult {
+fn open_translated_once(path: &str, flags: u64, mode: u32, name: &'static str) -> SyscallResult {
     let host_flags = darwin_to_host_open_flags(flags);
-    let mode = 0o666_u32;
+    // Guest mode for O_CREAT (ld uses 0755 for executables). Was hard-coded
+    // 0666 → host files non-executable even after soft fchmod success.
+    let mode = if mode == 0 { 0o666 } else { mode & 0o7777 };
     let creat = host_flags & libc::O_CREAT != 0;
     // O_EXCL alone is not useful; mkdir-retry only when create is requested and
     // failure looks like missing parent (not EEXIST from --no-clobber).

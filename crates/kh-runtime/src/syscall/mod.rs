@@ -135,6 +135,7 @@ fn dispatch_inner(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Getcwd) => fs::handle_getcwd(args),
         Some(BsdSyscall::Rename) => fs::handle_rename(args),
         Some(BsdSyscall::Ftruncate) => fs::handle_ftruncate(args),
+        Some(BsdSyscall::Fchmod) => fs::handle_fchmod(args),
         Some(BsdSyscall::Fsync) => fs::handle_fsync(args),
         Some(BsdSyscall::Openat) => fd::handle_openat(args),
         Some(BsdSyscall::Fstatat) => fs::handle_fstatat(args),

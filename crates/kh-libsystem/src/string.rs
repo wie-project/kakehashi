@@ -47,6 +47,18 @@ pub(crate) unsafe extern "C" fn memcmp(
     0
 }
 
+/// BSD `index` → nlist `_index` (same as `strchr`; CLT `ar`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn index(s: *const c_char, c: c_int) -> *mut c_char {
+    unsafe { strchr(s, c) }
+}
+
+/// BSD `rindex` → nlist `_rindex` (same as `strrchr`; CLT `ar`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn rindex(s: *const c_char, c: c_int) -> *mut c_char {
+    unsafe { strrchr(s, c) }
+}
+
 /// C `strchr` → nlist `_strchr`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_char {

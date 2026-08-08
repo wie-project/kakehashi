@@ -488,6 +488,19 @@ pub(crate) fn handle_ftruncate(args: SyscallArgs) -> SyscallResult {
     }
 }
 
+/// `fchmod` — fd `x0`, mode `x1` (so guest `ld` can set `+x` on products).
+pub(crate) fn handle_fchmod(args: SyscallArgs) -> SyscallResult {
+    let name = "fchmod";
+    let Some(host_fd) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    let mode = u32::try_from(args.x1 & 0xFFFF).unwrap_or(0);
+    match host::fchmod_fd(host_fd, mode) {
+        Some(()) => SyscallResult::ok(name, 0),
+        None => SyscallResult::err(name, EBADF),
+    }
+}
+
 /// `fsync` — fd `x0`.
 pub(crate) fn handle_fsync(args: SyscallArgs) -> SyscallResult {
     let name = "fsync";

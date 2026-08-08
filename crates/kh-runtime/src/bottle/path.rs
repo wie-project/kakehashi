@@ -283,6 +283,12 @@ pub fn guest_cwd_string() -> Option<String> {
 }
 
 /// Maps an absolute host path to a guest absolute path (bottle or host bridge).
+///
+/// Intermediate directory symlinks are resolved (bottle root may itself be a
+/// symlink), but the **invoked leaf name** is preserved when `canonicalize`
+/// would replace it with a multi-call target (CLT `ranlib` → `libtool`). Darwin
+/// `argv[0]` / `getprogname()` / `_NSGetExecutablePath` use the path as
+/// invoked; restoring the leaf keeps multi-call tools in the right mode.
 #[must_use]
 pub fn host_path_to_guest(host: &Path) -> Option<String> {
     let host_abs = if host.is_absolute() {
@@ -290,34 +296,65 @@ pub fn host_path_to_guest(host: &Path) -> Option<String> {
     } else {
         std::env::current_dir().ok()?.join(host)
     };
-    // Prefer real paths so strip_prefix works across symlinks.
-    let host_real = host_abs.canonicalize().unwrap_or(host_abs);
+    // Leaf before canonicalize resolves multi-call symlinks (ranlib→libtool).
+    let invoked_leaf = host_abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
 
-    if let Some(root) = bottle_root() {
+    // Prefer real paths so strip_prefix works across directory symlinks.
+    let host_real = host_abs.canonicalize().unwrap_or_else(|_| host_abs.clone());
+
+    let mut guest = if let Some(root) = bottle_root() {
         let root_real = root.canonicalize().unwrap_or(root);
         if let Ok(rel) = host_real.strip_prefix(&root_real) {
             if rel.as_os_str().is_empty() {
-                return Some("/".to_owned());
+                "/".to_owned()
+            } else {
+                let mut s = String::from("/");
+                s.push_str(&rel.to_string_lossy());
+                s.replace('\\', "/")
             }
-            let mut s = String::from("/");
-            s.push_str(&rel.to_string_lossy());
-            return Some(s.replace('\\', "/"));
+        } else {
+            host_bridge_guest_path(&host_real)
         }
+    } else {
+        host_bridge_guest_path(&host_real)
+    };
+
+    // Restore invoked basename when only the leaf was a multi-call symlink.
+    if let (Some(inv), Some(real_leaf)) = (
+        invoked_leaf.as_deref(),
+        host_real.file_name().and_then(|s| s.to_str()),
+    ) && inv != real_leaf
+        && let Some((parent, _)) = guest.rsplit_once('/')
+    {
+        guest = if parent.is_empty() {
+            format!("/{inv}")
+        } else {
+            format!("{parent}/{inv}")
+        };
     }
 
+    Some(guest)
+}
+
+/// Host path → guest path outside the bottle (`/private/tmp`, `/Volumes/linux…`).
+fn host_bridge_guest_path(host_real: &Path) -> String {
     let lossy = host_real.to_string_lossy();
     // Prefer Darwin `/private/tmp` for host `/tmp` so realpath/readlink walks
     // stay on the host bridge (see [`host_bridge_guest_to_host`]).
     if lossy == "/tmp" {
-        return Some("/private/tmp".to_owned());
+        return "/private/tmp".to_owned();
     }
     if let Some(rest) = lossy.strip_prefix("/tmp/") {
-        return Some(format!("/private/tmp/{rest}"));
+        return format!("/private/tmp/{rest}");
     }
     if lossy == "/" {
-        return Some(format!("/{}", super::layout::VOLUMES_LINUX));
+        return format!("/{}", super::layout::VOLUMES_LINUX);
     }
-    Some(format!("/{}{lossy}", super::layout::VOLUMES_LINUX).replace('\\', "/"))
+    format!("/{}{lossy}", super::layout::VOLUMES_LINUX).replace('\\', "/")
 }
 
 /// Stack buffer size for typical guest paths (avoids heap on open/stat).
@@ -499,6 +536,24 @@ mod tests {
         set_bottle_root(None);
         let guest = host_path_to_guest(Path::new("/tmp/kh-guest-cwd-test")).expect("map");
         assert_eq!(guest, "/private/tmp/kh-guest-cwd-test");
+    }
+
+    #[test]
+    fn host_path_preserves_multicall_symlink_leaf() {
+        let tmp = std::env::temp_dir().join(format!("kh-ranlib-leaf-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&tmp));
+        let bin = tmp.join("usr/bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let libtool = bin.join("libtool");
+        std::fs::write(&libtool, b"x").expect("write libtool");
+        let ranlib = bin.join("ranlib");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("libtool", &ranlib).expect("symlink ranlib");
+        set_bottle_root(Some(tmp.clone()));
+        let guest = host_path_to_guest(&ranlib).expect("map ranlib");
+        assert_eq!(guest, "/usr/bin/ranlib", "multi-call leaf must stay ranlib");
+        set_bottle_root(None);
+        drop(std::fs::remove_dir_all(&tmp));
     }
 
     #[test]

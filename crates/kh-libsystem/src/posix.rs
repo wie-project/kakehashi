@@ -1,16 +1,26 @@
 //! POSIX / BSD file and process surface (syscalls + soft stubs).
 
+// Freestanding scaffolding: pointer/index arithmetic and C statics (getopt).
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    static_mut_refs
+)]
+
 use core::ffi::{c_char, c_int, c_void};
 
 use crate::errno;
 use crate::heap::{free, malloc};
 use crate::sys::{
-    self, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_FCNTL, SYS_FORK,
-    SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETEGID, SYS_GETEUID,
-    SYS_GETGID, SYS_GETPGRP, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID, SYS_KILL,
-    SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_OPEN,
-    SYS_OPENAT, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR, SYS_SETPGID,
-    SYS_SETSID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
+    self, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_FCNTL, SYS_FCHMOD,
+    SYS_FORK, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETEGID,
+    SYS_GETEUID, SYS_GETGID, SYS_GETPGRP, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID,
+    SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
+    SYS_OPEN, SYS_OPENAT, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR,
+    SYS_SETPGID, SYS_SETSID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::trace;
@@ -83,9 +93,13 @@ fn trunc_i64_to_c_int(v: i64) -> c_int {
 // ── I/O ─────────────────────────────────────────────────────────────────────
 
 
-/// C `open` → nlist `_open`.
+/// Impl for C `open` (varargs wrapper in `open_varargs.c` — mode is stack-passed).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn open(path: *const c_char, oflag: c_int, mode: c_int) -> c_int {
+pub(crate) unsafe extern "C" fn kh_open_impl(
+    path: *const c_char,
+    oflag: c_int,
+    mode: c_int,
+) -> c_int {
     if path.is_null() || path.addr() < crate::stdio::PAGEZERO_END {
         errno::set_errno(14);
         return -1;
@@ -150,7 +164,7 @@ pub(crate) unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
             }
             s >>= 6;
         }
-        let fd = unsafe { open(template, O_RDWR | O_CREAT | O_EXCL, 0o600) };
+        let fd = unsafe { kh_open_impl(template, O_RDWR | O_CREAT | O_EXCL, 0o600) };
         if fd >= 0 {
             return fd;
         }
@@ -163,9 +177,9 @@ pub(crate) unsafe extern "C" fn mkstemp(template: *mut c_char) -> c_int {
     -1
 }
 
-/// C `openat` → nlist `_openat`.
+/// Impl for C `openat` (varargs wrapper in `open_varargs.c`).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn openat(
+pub(crate) unsafe extern "C" fn kh_openat_impl(
     fd: c_int,
     path: *const c_char,
     oflag: c_int,
@@ -468,10 +482,23 @@ pub(crate) unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_
     buf
 }
 
-/// C `chmod` → nlist `_chmod` (soft success; bottle ignores mode bits).
+/// C `chmod` → nlist `_chmod` (soft success for path mode; prefer `fchmod` for `+x`).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn chmod(_path: *const c_char, _mode: c_int) -> c_int {
     0
+}
+
+/// C `fchmod` → nlist `_fchmod` (real BSD; guest `ld` sets executable bits).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fchmod(fd: c_int, mode: c_int) -> c_int {
+    let ret = unsafe {
+        sys::syscall2(
+            SYS_FCHMOD,
+            u64::from(fd.cast_unsigned()),
+            u64::from(mode.cast_unsigned()),
+        )
+    };
+    ret_c_int(ret)
 }
 
 /// C `chown` → nlist `_chown`.
@@ -630,7 +657,7 @@ pub(crate) unsafe extern "C" fn opendir(name: *const c_char) -> *mut c_void {
         return core::ptr::null_mut();
     }
     // O_RDONLY = 0. Directory open succeeds on Linux when path is a dir.
-    let fd = unsafe { open(name, 0, 0) };
+    let fd = unsafe { kh_open_impl(name, 0, 0) };
     if fd < 0 {
         return core::ptr::null_mut();
     }
@@ -769,6 +796,12 @@ pub(crate) unsafe extern "C" fn fork() -> c_int {
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn vfork() -> c_int {
     ret_c_int(unsafe { sys::syscall0(SYS_VFORK) })
+}
+
+/// C `wait` → nlist `_wait` (CLT `ar` may re-exec / wait children).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wait(status: *mut c_int) -> c_int {
+    unsafe { waitpid(-1, status, 0) }
 }
 
 /// C `waitpid` → nlist `_waitpid` (`wait4` without rusage).
@@ -2078,6 +2111,14 @@ fn soft_env_write_kv(
     }
 }
 
+/// Apple `_simple_getenv` → nlist `__simple_getenv` (CLT `ranlib` / tools).
+///
+/// Same contract as `getenv` for the soft environ table (trace-first).
+#[unsafe(export_name = "_simple_getenv")]
+pub(crate) unsafe extern "C" fn simple_getenv(name: *const c_char) -> *mut c_char {
+    unsafe { getenv(name) }
+}
+
 /// C `getenv` → nlist `_getenv` (soft table; null if unset).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
@@ -3069,4 +3110,235 @@ pub(crate) unsafe extern "C" fn posix_memalign(
         memptr.write(p);
     }
     0
+}
+
+// ── flock (POSIX; guest `ar` holds archive advisory lock) ────────────────────
+//
+// Soft: single-process bottle builds don't need cross-process advisory locks.
+// Returns 0 for all well-formed ops; EINVAL on bad `operation` bits.
+// Public contract: flock(2) man page (LOCK_SH/EX/UN/NB).
+//
+const LOCK_SH: c_int = 1;
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
+
+/// C `flock` → nlist `_flock`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn flock(fd: c_int, operation: c_int) -> c_int {
+    let _ = fd;
+    let op = operation & !LOCK_NB;
+    if op != LOCK_SH && op != LOCK_EX && op != LOCK_UN {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // Soft success (no host lock). LOCK_NB ignored.
+    0
+}
+
+// ── getopt (POSIX; guest `ar` / CLI tools) ───────────────────────────────────
+//
+// Trace-first: CLT `ar -rc` calls `_getopt` immediately. Soft freestanding
+// implementation from public POSIX getopt(3) behaviour (man pages / SUS).
+// No Darwin/GPL sources.
+
+/// C `optarg` → nlist `_optarg`.
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut optarg: *mut c_char = core::ptr::null_mut();
+
+/// C `optind` → nlist `_optind` (next `argv` index; starts at 1).
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut optind: c_int = 1;
+
+/// C `opterr` → nlist `_opterr` (print errors to stderr when non-zero).
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut opterr: c_int = 1;
+
+/// C `optopt` → nlist `_optopt` (last unknown / missing-arg option char).
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut optopt: c_int = 0;
+
+/// Position within the current `argv[optind]` option cluster (`-abc`).
+static mut GETOPT_POS: usize = 1;
+
+unsafe fn getopt_reset_scan() {
+    unsafe {
+        GETOPT_POS = 1;
+    }
+}
+
+/// Write a short diagnostic to guest stderr (fd 2) when `opterr != 0`.
+unsafe fn getopt_err(argv0: *const c_char, msg: &[u8], bad: u8) {
+    if unsafe { opterr } == 0 {
+        return;
+    }
+    let mut buf = [0u8; 160];
+    let mut n = 0usize;
+    let push = |buf: &mut [u8], n: &mut usize, b: u8| {
+        if *n < buf.len() {
+            buf[*n] = b;
+            *n += 1;
+        }
+    };
+    let push_str = |buf: &mut [u8], n: &mut usize, s: &[u8]| {
+        for &b in s {
+            push(buf, n, b);
+        }
+    };
+    // argv0
+    if argv0.is_null() {
+        push_str(&mut buf, &mut n, b"getopt");
+    } else {
+        let mut p = argv0;
+        unsafe {
+            while *p != 0 && n < 64 {
+                push(&mut buf, &mut n, *p as u8);
+                p = p.add(1);
+            }
+        }
+    }
+    push_str(&mut buf, &mut n, b": ");
+    push_str(&mut buf, &mut n, msg);
+    push(&mut buf, &mut n, b'\'');
+    push(&mut buf, &mut n, bad);
+    push_str(&mut buf, &mut n, b"'\n");
+    let _ = unsafe { crate::stdio::write(2, buf.as_ptr().cast(), n) };
+}
+
+/// C `getopt` → nlist `_getopt`.
+///
+/// Returns the next option character, `?` / `:` on errors, or `-1` when done.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getopt(
+    argc: c_int,
+    argv: *const *mut c_char,
+    optstring: *const c_char,
+) -> c_int {
+    if argc < 1 || argv.is_null() || optstring.is_null() {
+        return -1;
+    }
+    // SAFETY: globals mutated only on the guest main thread for CLI tools.
+    unsafe {
+        if optind < 1 {
+            optind = 1;
+            getopt_reset_scan();
+        }
+        if optind >= argc {
+            return -1;
+        }
+        let arg = *argv.add(optind as usize);
+        if arg.is_null() {
+            return -1;
+        }
+        let b0 = *arg as u8;
+        // Non-option or bare "-" → done (POSIX: leave optind on that argv).
+        if b0 != b'-' {
+            return -1;
+        }
+        let b1 = *arg.add(1) as u8;
+        if b1 == 0 {
+            return -1;
+        }
+        // "--" end-of-options
+        if b1 == b'-' && *arg.add(2) == 0 {
+            optind += 1;
+            getopt_reset_scan();
+            return -1;
+        }
+
+        let mut pos = GETOPT_POS;
+        if pos == 0 {
+            pos = 1;
+        }
+        let opt_ch = *arg.add(pos) as u8;
+        if opt_ch == 0 {
+            // Should not happen; advance.
+            optind += 1;
+            getopt_reset_scan();
+            return getopt(argc, argv, optstring);
+        }
+        optopt = c_int::from(opt_ch);
+
+        // Find opt_ch in optstring; leading ':' enables silent error mode.
+        let mut sp = optstring;
+        let silent = *sp as u8 == b':';
+        if silent {
+            sp = sp.add(1);
+        }
+        let mut found = false;
+        let mut needs_arg = false;
+        while *sp != 0 {
+            let c = *sp as u8;
+            sp = sp.add(1);
+            if c == opt_ch {
+                found = true;
+                if *sp as u8 == b':' {
+                    needs_arg = true;
+                }
+                break;
+            }
+            // Skip trailing ':' of other options.
+            if *sp as u8 == b':' {
+                sp = sp.add(1);
+            }
+        }
+
+        if !found {
+            // Unknown option.
+            GETOPT_POS = pos + 1;
+            if *arg.add(GETOPT_POS) == 0 {
+                optind += 1;
+                getopt_reset_scan();
+            }
+            let a0 = *argv;
+            if !silent {
+                getopt_err(a0, b"illegal option -- ", opt_ch);
+            }
+            return c_int::from(b'?');
+        }
+
+        if needs_arg {
+            // Argument is rest of this argv, or the next argv.
+            let rest = arg.add(pos + 1);
+            if *rest != 0 {
+                optarg = rest;
+                optind += 1;
+                getopt_reset_scan();
+                return c_int::from(opt_ch);
+            }
+            // Next argv is the argument.
+            if optind + 1 >= argc {
+                optind += 1;
+                getopt_reset_scan();
+                optarg = core::ptr::null_mut();
+                let a0 = *argv;
+                if silent {
+                    return c_int::from(b':');
+                }
+                getopt_err(a0, b"option requires an argument -- ", opt_ch);
+                return c_int::from(b'?');
+            }
+            optarg = *argv.add((optind + 1) as usize);
+            optind += 2;
+            getopt_reset_scan();
+            return c_int::from(opt_ch);
+        }
+
+        // Flag without argument; may be clustered.
+        optarg = core::ptr::null_mut();
+        GETOPT_POS = pos + 1;
+        if *arg.add(GETOPT_POS) == 0 {
+            optind += 1;
+            getopt_reset_scan();
+        }
+        c_int::from(opt_ch)
+    }
 }
