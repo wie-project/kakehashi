@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "kakehashi"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "kh-libsystem"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "cc",
  "miniz_oxide",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "kh-loader"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "goblin",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "kh-runtime"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "flate2",
  "libc",
