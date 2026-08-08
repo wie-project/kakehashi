@@ -127,6 +127,41 @@ pub unsafe fn execve_host(
     last_errno()
 }
 
+/// Host `posix_spawn` without forking this process's address space.
+///
+/// Prefer this over guest `fork`+`execve` when the parent has large mappings
+/// (CLT tools): CoW of a 100+ MiB guest image is pure tax before the child
+/// replaces itself with nested `kh`.
+///
+/// # Safety
+///
+/// `argv` / `envp` must be NULL-terminated C string pointer arrays (as for
+/// `execve`). On success returns the child pid; on failure returns `Err(errno)`.
+pub unsafe fn posix_spawn_host(
+    path: &std::ffi::CStr,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+) -> Result<i32, i32> {
+    let mut pid: libc::pid_t = 0;
+    // Linux libc wants `*const *mut c_char`; our slices are `*const *const`.
+    // SAFETY: argv/envp are live NUL-terminated arrays for the duration of the call.
+    let rc = unsafe {
+        libc::posix_spawn(
+            &raw mut pid,
+            path.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            argv.as_ptr().cast_mut().cast(),
+            envp.as_ptr().cast_mut().cast(),
+        )
+    };
+    if rc != 0 {
+        Err(rc)
+    } else {
+        Ok(pid)
+    }
+}
+
 fn last_errno() -> i32 {
     io::Error::last_os_error()
         .raw_os_error()

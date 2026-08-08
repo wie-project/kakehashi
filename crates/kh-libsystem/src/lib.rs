@@ -40,6 +40,7 @@ mod errno;
 mod extra_stubs;
 mod heap;
 mod iconv;
+mod ld_surface;
 mod libcxx_algo;
 mod libcxx_error;
 mod libcxx_fs;
@@ -47,7 +48,6 @@ mod libcxx_iostream;
 mod libcxx_shared;
 mod libcxx_string;
 mod libcxx_sync;
-mod ld_surface;
 mod locale;
 mod net;
 mod objc_surface;
@@ -141,6 +141,8 @@ pub const KH_HELPER_EXECUTABLE_PATH: u32 = 0x4B48_0012;
 pub const KH_HELPER_DLOPEN: u32 = 0x4B48_0013;
 /// Host-helper id: `dlsym` → guest VA from a `dlopen` handle / `RTLD_DEFAULT`.
 pub const KH_HELPER_DLSYM: u32 = 0x4B48_0014;
+/// Host-helper id: `posix_spawn` without forking the guest address space.
+pub const KH_HELPER_SPAWN: u32 = 0x4B48_0015;
 
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {

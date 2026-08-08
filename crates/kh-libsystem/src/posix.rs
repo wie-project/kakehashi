@@ -14,7 +14,10 @@ use crate::sys::{
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::trace;
-use crate::{KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR};
+use crate::{
+    KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR,
+    KH_HELPER_SPAWN,
+};
 
 const ENOSYS: i32 = 78;
 const ENOMEM: i32 = 12;
@@ -1019,11 +1022,18 @@ pub(crate) unsafe extern "C" fn execlp(_file: *const c_char, _arg0: *const c_cha
 
 // ── posix_spawn (clang driver spawns -cc1; POSIX return = errno, not -1) ─────
 
+/// Host-side spawn via `KH_HELPER_SPAWN` (no guest `fork` of large maps).
+///
 /// Soft: ignore `file_actions` / `attrp` (no chdir/dup2/close list yet).
 /// Observed: Apple clang G3 compile path hits `_posix_spawn` after G1 works.
 ///
 /// Contract (POSIX / public man): **0** on success, error number on failure
 /// (does not use the `-1` + errno libc pattern).
+///
+/// Process model: previously this did guest `fork`+`execve`, which CoW-duplicated
+/// the whole guest address space (CLT `clang` ~hundreds of MiB) before nested
+/// `kh run` replaced the image. The helper host-`posix_spawn`s nested `kh`
+/// directly — same semantics for Mach-O children, far less tax.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn posix_spawn(
     pid: *mut c_int,
@@ -1049,23 +1059,21 @@ pub(crate) unsafe extern "C" fn posix_spawn(
     } else {
         envp
     };
-    let child = unsafe { fork() };
-    if child < 0 {
-        let e = errno::get_errno();
-        return if e == 0 {
-            11 /* EAGAIN */
-        } else {
-            e
-        };
+    // path / argv / envp are guest VAs (identity map under freestanding).
+    let rc = unsafe {
+        sys::helper3(
+            KH_HELPER_SPAWN,
+            u64::try_from(path.addr()).unwrap_or(0),
+            u64::try_from(argv.addr()).unwrap_or(0),
+            u64::try_from(env.addr()).unwrap_or(0),
+        )
+    };
+    if rc < 0 {
+        // Host helper: carry set → positive errno in x0; thin wrapper → -errno.
+        let err = rc.saturating_neg();
+        return c_int::try_from(err).unwrap_or(EINVAL);
     }
-    if child == 0 {
-        // Child: image replace (runtime re-wraps Mach-O as `kh run`).
-        let _ = unsafe { execve(path, argv, env) };
-        // execve only returns on failure.
-        let e = errno::get_errno();
-        let code = if e == 0 { 127 } else { e.clamp(1, 127) };
-        unsafe { crate::process::exit_now(code) };
-    }
+    let child = c_int::try_from(rc).unwrap_or(0);
     if !pid.is_null() {
         unsafe {
             pid.write(child);

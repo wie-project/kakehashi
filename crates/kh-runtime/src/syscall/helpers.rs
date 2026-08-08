@@ -276,6 +276,12 @@ pub(crate) const KH_HELPER_DLOPEN: u32 = KH_HELPER_BASE | 0x13;
 /// Returns guest VA, or 0 if missing.
 pub(crate) const KH_HELPER_DLSYM: u32 = KH_HELPER_BASE | 0x14;
 
+/// Freestanding `posix_spawn`: host-spawn nested `kh run` without guest `fork`.
+///
+/// Args: `x0` = path C string VA, `x1` = argv VA, `x2` = envp VA.
+/// Returns child pid on success (carry clear).
+pub(crate) const KH_HELPER_SPAWN: u32 = KH_HELPER_BASE | 0x15;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -312,6 +318,7 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_EXECUTABLE_PATH => handle_executable_path(args),
         KH_HELPER_DLOPEN => handle_dlopen(args),
         KH_HELPER_DLSYM => handle_dlsym(args),
+        KH_HELPER_SPAWN => super::process::handle_spawn_helper(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
 }

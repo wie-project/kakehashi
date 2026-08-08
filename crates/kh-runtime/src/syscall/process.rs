@@ -304,37 +304,135 @@ fn env_ptrs(env: &[CString]) -> Vec<*const libc::c_char> {
 }
 
 fn reexec_kh_macho(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
-    let Ok(kh) = std::env::current_exe() else {
-        return libc::ENOENT;
-    };
-    let Ok(kh_c) = CString::new(kh.as_os_str().as_bytes()) else {
+    let Some((args_c, env_c)) = kh_run_argv_env(host_path, argv, envp) else {
         return libc::EINVAL;
     };
-    let Ok(path_c) = CString::new(host_path.as_os_str().as_bytes()) else {
-        return libc::EINVAL;
-    };
-    let run = CString::new("run").unwrap_or_default();
-    let dd = CString::new("--").unwrap_or_default();
-
-    // argv: kh run <path> -- [guest args without argv0]
-    let mut args_c: Vec<CString> = vec![kh_c, run, path_c, dd];
-    for a in argv.iter().skip(1) {
-        match CString::new(a.as_str()) {
-            Ok(c) => args_c.push(c),
-            Err(_) => return libc::EINVAL,
-        }
-    }
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
-
-    let env_c = inject_kh_env(envp, ExecEnvKind::NestedKh);
     let env_ptrs = env_ptrs(&env_c);
-
     let Some(path0) = args_c.first() else {
         return libc::EINVAL;
     };
     // SAFETY: NUL-terminated argv/envp; path is CString.
     unsafe { host::execve_host(path0.as_c_str(), &argv_ptrs, &env_ptrs) }
+}
+
+/// Build `kh run <host_path> -- [guest argv without argv0]` + injected env.
+///
+/// Host path is already bottle-translated; the child opens it via `kh run`.
+fn kh_run_argv_env(
+    host_path: &Path,
+    argv: &[String],
+    envp: &[String],
+) -> Option<(Vec<CString>, Vec<CString>)> {
+    let kh = std::env::current_exe().ok()?;
+    let kh_c = CString::new(kh.as_os_str().as_bytes()).ok()?;
+    let path_c = CString::new(host_path.as_os_str().as_bytes()).ok()?;
+    let run = CString::new("run").ok()?;
+    let dd = CString::new("--").ok()?;
+    let mut args_c: Vec<CString> = vec![kh_c, run, path_c, dd];
+    for a in argv.iter().skip(1) {
+        args_c.push(CString::new(a.as_str()).ok()?);
+    }
+    let env_c = inject_kh_env(envp, ExecEnvKind::NestedKh);
+    Some((args_c, env_c))
+}
+
+/// Nested Mach-O spawn without forking the current guest address space.
+///
+/// Used by freestanding `posix_spawn` (`KH_HELPER_SPAWN`): host `posix_spawn` of
+/// `kh run <path> -- …` so large CLT parents do not CoW-duplicate their maps.
+pub(crate) fn spawn_kh_macho(
+    host_path: &Path,
+    argv: &[String],
+    envp: &[String],
+) -> Result<i32, i32> {
+    let (args_c, env_c) = kh_run_argv_env(host_path, argv, envp).ok_or(libc::EINVAL)?;
+    let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(core::ptr::null());
+    let env_ptrs = env_ptrs(&env_c);
+    let path0 = args_c.first().ok_or(libc::EINVAL)?;
+    // SAFETY: NUL-terminated argv/envp live for the call; owned by `args_c`/`env_c`.
+    let pid = unsafe { host::posix_spawn_host(path0.as_c_str(), &argv_ptrs, &env_ptrs) }?;
+    if pid > 0 {
+        crate::process::child_born();
+    }
+    Ok(pid)
+}
+
+/// `KH_HELPER_SPAWN`: direct nested spawn (path, argv, envp guest VAs).
+///
+/// Returns child pid on success. Avoids guest `fork` of multi-hundred-MiB images.
+pub(crate) fn handle_spawn_helper(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_spawn";
+    if args.x0 == 0 || !registry_check_range(args.x0, 1, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some(path) = bottle::read_c_string(args.x0, 4096) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Some(argv) = read_cstr_array(args.x1, 256) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Some(envp) = read_cstr_array(args.x2, 512) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let Ok(host_path) = bottle::translate_path(&path) else {
+        return SyscallResult::err(name, ENOENT);
+    };
+    if !host_path.is_file() {
+        return SyscallResult::err(name, ENOENT);
+    }
+    tracing::debug!(
+        guest = %path,
+        host = %host_path.display(),
+        argc = argv.len(),
+        "kh_spawn"
+    );
+    if !is_macho(&host_path) {
+        // Non-Mach-O: fall back to host posix_spawn of the path directly
+        // (script / ELF). Nested shell scripts still get HostNative env.
+        return spawn_host_path(&host_path, &argv, &envp, name);
+    }
+    match spawn_kh_macho(&host_path, &argv, &envp) {
+        Ok(pid) => SyscallResult::ok(name, u64::try_from(pid).unwrap_or(0)),
+        Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
+    }
+}
+
+fn spawn_host_path(
+    host_path: &Path,
+    argv: &[String],
+    envp: &[String],
+    name: &'static str,
+) -> SyscallResult {
+    let Ok(path_c) = CString::new(host_path.as_os_str().as_bytes()) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let mut args_c: Vec<CString> = Vec::new();
+    if argv.is_empty() {
+        args_c.push(path_c.clone());
+    } else {
+        for a in argv {
+            match CString::new(a.as_str()) {
+                Ok(c) => args_c.push(c),
+                Err(_) => return SyscallResult::err(name, EINVAL),
+            }
+        }
+    }
+    let env_c = inject_kh_env(envp, ExecEnvKind::HostNative);
+    let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(core::ptr::null());
+    let env_ptrs = env_ptrs(&env_c);
+    match unsafe { host::posix_spawn_host(path_c.as_c_str(), &argv_ptrs, &env_ptrs) } {
+        Ok(pid) => {
+            if pid > 0 {
+                crate::process::child_born();
+            }
+            SyscallResult::ok(name, u64::try_from(pid).unwrap_or(0))
+        }
+        Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
+    }
 }
 
 fn try_exec_script(host_path: &Path, argv: &[String], envp: &[String]) -> Option<i32> {
