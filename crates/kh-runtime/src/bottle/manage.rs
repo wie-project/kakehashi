@@ -12,11 +12,19 @@ use thiserror::Error;
 use super::layout;
 use super::libsystem::{self, LibsystemInstall, LibsystemOrigin};
 use super::registry;
+use super::xcrun_tool::{self, XcrunInstall, XcrunOrigin};
 
 /// Freestanding guest libSystem shipped with this crate (crates.io / cargo install).
 ///
 /// Refresh after rebuilding `kh-libsystem` with `./scripts/stage-libsystem.sh`.
 static EMBEDDED_LIBSYSTEM: &[u8] = include_bytes!("../../resources/libSystem.B.dylib");
+
+/// Clean-room guest `xcrun` shipped with this crate (crates.io / cargo install).
+///
+/// Refresh after rebuilding `kh-xcrun` with `./scripts/stage-xcrun.sh`.
+/// Empty file is treated as "not embedded" so Linux-only checkouts without a
+/// staged Mach-O still compile; `bottle ensure` then skips xcrun install.
+static EMBEDDED_XCRUN: &[u8] = include_bytes!("../../resources/xcrun");
 
 /// Bottle management errors.
 #[derive(Debug, Error)]
@@ -89,6 +97,8 @@ pub struct CreateResult {
     pub path: PathBuf,
     /// libSystem install details when a source was found and copied.
     pub libsystem: Option<LibsystemInstall>,
+    /// Guest `/usr/bin/xcrun` install details when a source was found.
+    pub xcrun: Option<XcrunInstall>,
 }
 
 /// Creates the single bottle at `path` (or the default data path when `None`).
@@ -150,6 +160,14 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
         }
     };
 
+    let xcrun = match install_xcrun_for_create(&target) {
+        Ok(v) => v,
+        Err(err) => {
+            drop(layout::remove_tree(&target));
+            return Err(err);
+        }
+    };
+
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(&target) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");
     }
@@ -158,6 +176,7 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
     Ok(CreateResult {
         path: target,
         libsystem,
+        xcrun,
     })
 }
 
@@ -191,6 +210,20 @@ fn install_libsystem_for_create(
         )?));
     }
 
+    Ok(None)
+}
+
+fn install_xcrun_for_create(target: &Path) -> Result<Option<XcrunInstall>, BottleError> {
+    if let Some((src, origin)) = xcrun_tool::discover(None) {
+        return Ok(Some(xcrun_tool::install(target, &src, origin)?));
+    }
+    if !EMBEDDED_XCRUN.is_empty() {
+        return Ok(Some(xcrun_tool::install_bytes(
+            target,
+            EMBEDDED_XCRUN,
+            XcrunOrigin::Embedded,
+        )?));
+    }
     Ok(None)
 }
 
@@ -295,6 +328,7 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_host_ssh_bridge(path)?;
     layout::ensure_host_bin_bridges(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
+    let xcrun = install_xcrun_for_create(path)?;
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");
@@ -303,6 +337,7 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     Ok(CreateResult {
         path: path.to_path_buf(),
         libsystem,
+        xcrun,
     })
 }
 

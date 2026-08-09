@@ -110,6 +110,48 @@ pub(crate) unsafe extern "C" fn dispatch_queue_create(
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dispatch_release(_object: *mut c_void) {}
 
+/// Soft semaphore counter (process-wide; enough for Rust std / single-thread guests).
+static SEM_TOKEN: AtomicI32 = AtomicI32::new(0x5345_4D00); // "SEM\0"
+static SEM_COUNT: AtomicI32 = AtomicI32::new(0);
+
+/// `dispatch_semaphore_create` → soft token (non-null).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn dispatch_semaphore_create(value: isize) -> *mut c_void {
+    let v = i32::try_from(value).unwrap_or(0);
+    SEM_COUNT.store(v, Ordering::SeqCst);
+    let tok = SEM_TOKEN.fetch_add(1, Ordering::Relaxed);
+    core::ptr::with_exposed_provenance_mut(usize::try_from(tok).unwrap_or(1).max(1))
+}
+
+/// `dispatch_semaphore_signal` → increment; return prior count (soft).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn dispatch_semaphore_signal(_dsema: *mut c_void) -> isize {
+    let prev = SEM_COUNT.fetch_add(1, Ordering::SeqCst);
+    isize::try_from(prev).unwrap_or(0)
+}
+
+/// `dispatch_semaphore_wait` → decrement if positive, else soft-success (no park).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn dispatch_semaphore_wait(
+    _dsema: *mut c_void,
+    _timeout: u64,
+) -> isize {
+    loop {
+        let cur = SEM_COUNT.load(Ordering::SeqCst);
+        if cur > 0 {
+            if SEM_COUNT
+                .compare_exchange(cur, cur.saturating_sub(1), Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return 0;
+            }
+            continue;
+        }
+        // Soft: never block forever under freestanding; succeed.
+        return 0;
+    }
+}
+
 /// `dispatch_sync` — run block immediately.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dispatch_sync(queue: *mut c_void, block: *mut c_void) {

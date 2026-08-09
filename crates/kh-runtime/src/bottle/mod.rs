@@ -21,6 +21,7 @@ mod pkg_extract;
 mod registry;
 mod swscan;
 mod xcode_tools;
+mod xcrun_tool;
 
 pub use ca_bundle::{
     ENV_CA_BUNDLE, GUEST_CA_DIR_REL, GUEST_CA_FILE_REL, MOZILLA_CACERT_URL, active_ca_pem_path,
@@ -58,3 +59,8 @@ pub use registry::{
 };
 pub use swscan::ENV_XCODE_TOOLS_VERSION;
 pub use xcode_tools::{GUEST_CLT_REL, GUEST_GIT_PATH, GUEST_GIT_REL, bottle_has_git, discover_git};
+pub use xcrun_tool::{
+    EMBEDDED_SOURCE_LABEL as XCRUN_EMBEDDED_SOURCE_LABEL, ENV_XCRUN, GUEST_XCRUN_REL, XcrunInstall,
+    XcrunOrigin, discover as discover_xcrun, install as install_xcrun,
+    install_bytes as install_xcrun_bytes,
+};

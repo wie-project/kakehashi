@@ -13,7 +13,7 @@
 //! Publishing `done` from the guest *before* terminate races with join's
 //! `munmap` of the worker stack while hypercall dispatch still runs on it.
 
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::errno;
@@ -1146,6 +1146,60 @@ pub(crate) unsafe extern "C" fn pthread_attr_setdetachstate(
     _attr: *mut c_void,
     _state: c_int,
 ) -> c_int {
+    0
+}
+
+// Soft main-stack region for `pthread_get_stack{addr,size}_np` (Rust std / libstd
+// init under freestanding). Addr is the **top** of stack (Darwin convention).
+const SOFT_STACK_SIZE: usize = 8 * 1024 * 1024;
+#[repr(C, align(16))]
+struct SoftStack([u8; SOFT_STACK_SIZE]);
+static mut SOFT_STACK: SoftStack = SoftStack([0; SOFT_STACK_SIZE]);
+
+/// C `pthread_get_stackaddr_np` → nlist `_pthread_get_stackaddr_np`.
+///
+/// Returns the high address of the soft main stack (grows down).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_get_stackaddr_np(_thread: *mut c_void) -> *mut c_void {
+    // SAFETY: static mut SoftStack; single main-thread soft path for Rust std.
+    let base = unsafe { core::ptr::addr_of_mut!(SOFT_STACK.0).cast::<u8>() };
+    unsafe { base.add(SOFT_STACK_SIZE).cast() }
+}
+
+/// C `pthread_get_stacksize_np` → nlist `_pthread_get_stacksize_np`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_get_stacksize_np(_thread: *mut c_void) -> usize {
+    SOFT_STACK_SIZE
+}
+
+/// Darwin `pthread_setname_np` (current thread only) → nlist `_pthread_setname_np`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_setname_np(_name: *const c_char) -> c_int {
+    0
+}
+
+/// Darwin `pthread_threadid_np` → nlist `_pthread_threadid_np`.
+///
+/// ```c
+/// int pthread_threadid_np(pthread_t thread, uint64_t *thread_id);
+/// ```
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_threadid_np(
+    thread: *mut c_void,
+    thread_id: *mut u64,
+) -> c_int {
+    if thread_id.is_null() {
+        return EINVAL;
+    }
+    let id = if thread.is_null() {
+        1_u64 // main
+    } else {
+        u64::try_from(thread.addr()).unwrap_or(1)
+    };
+    // SAFETY: guest out-param.
+    unsafe {
+        thread_id.write(id);
+    }
     0
 }
 

@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "kh-runtime"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "flate2",
  "libc",
@@ -308,6 +308,10 @@ dependencies = [
  "thiserror",
  "tracing",
 ]
+
+[[package]]
+name = "kh-xcrun"
+version = "0.1.13"
 
 [[package]]
 name = "lazy_static"

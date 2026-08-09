@@ -4,7 +4,9 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use kh_runtime::bottle::{self, BottleError, BottleStatus, CreateOptions, LibsystemOrigin};
+use kh_runtime::bottle::{
+    self, BottleError, BottleStatus, CreateOptions, LibsystemOrigin, XcrunOrigin,
+};
 use serde_json::json;
 
 /// Subcommands for bottle management.
@@ -115,12 +117,20 @@ fn print_create_result(
                 "id_rewritten": ls.id_rewritten,
             })
         });
+        let xcrun = created.xcrun.as_ref().map(|xc| {
+            json!({
+                "source": xc.source.display().to_string(),
+                "dest": xc.dest.display().to_string(),
+                "origin": xcrun_origin_str(xc.origin),
+            })
+        });
         println!(
             "{}",
             json!({
                 "action": action,
                 "path": created.path.display().to_string(),
                 "libsystem": libsystem,
+                "xcrun": xcrun,
             })
         );
         return;
@@ -164,6 +174,22 @@ fn print_create_result(
             env = bottle::ENV_LIBSYSTEM
         );
     }
+    if let Some(xc) = &created.xcrun {
+        println!(
+            "  xcrun:     {} → {}",
+            xc.source.display(),
+            xc.dest.display()
+        );
+        println!("    origin: {}", xcrun_origin_str(xc.origin));
+    } else {
+        println!("  xcrun:     not found (CLT gcc/ar shims need /usr/bin/xcrun)");
+        println!("    rebuild:  cargo build -p kh-xcrun --release --target aarch64-apple-darwin");
+        println!("    stage:    ./scripts/stage-xcrun.sh  # → crates/kh-runtime/resources/xcrun");
+        println!(
+            "    or:       set {env} to a Mach-O xcrun before kh bottle ensure",
+            env = bottle::ENV_XCRUN
+        );
+    }
 }
 
 fn origin_str(o: LibsystemOrigin) -> &'static str {
@@ -173,6 +199,15 @@ fn origin_str(o: LibsystemOrigin) -> &'static str {
         LibsystemOrigin::Adjacent => "adjacent",
         LibsystemOrigin::DevTarget => "dev_target",
         LibsystemOrigin::Embedded => "embedded (crates.io)",
+    }
+}
+
+fn xcrun_origin_str(o: XcrunOrigin) -> &'static str {
+    match o {
+        XcrunOrigin::Explicit => "explicit",
+        XcrunOrigin::Adjacent => "adjacent",
+        XcrunOrigin::DevTarget => "dev_target",
+        XcrunOrigin::Embedded => "embedded (crates.io)",
     }
 }
 
