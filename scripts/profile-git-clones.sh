@@ -14,7 +14,7 @@
 #   ./scripts/profile-git-clones.sh
 #   KAKEHASHI_BOUNDARY_STATS=1 ./scripts/profile-git-clones.sh   # counts only
 #
-# Env: same as docker-git.sh (KH_EXTRA_CARGO_ARGS defaults to --release).
+# Env: same as docker-kh.sh git (KH_EXTRA_CARGO_ARGS defaults to --release).
 
 set -euo pipefail
 

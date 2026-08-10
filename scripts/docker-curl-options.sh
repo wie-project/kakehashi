@@ -25,7 +25,7 @@
 #   9  other protocols (file/ftp/ssh/smtp soft) + upload + manual
 #  10 live micro-proxy + unix HTTP + auth/DNS leftovers + client-cert soft
 #
-# Env: same as docker-curl.sh (KAKEHASHI_SMOKE_IMAGE, KAKEHASHI_CURL, …).
+# Env: same as docker-kh.sh curl (KAKEHASHI_SMOKE_IMAGE, KAKEHASHI_CURL, …).
 #
 # Philosophy: pass = exit 0 (or expected non-zero) + no missing-symbol crash.
 

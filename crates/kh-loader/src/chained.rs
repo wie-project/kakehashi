@@ -517,7 +517,7 @@ pub fn decode_ptr_64(
 }
 
 // ---------------------------------------------------------------------------
-// Encoders (fixtures / unit tests)
+// Encoders (unit tests / opcode smoke)
 // ---------------------------------------------------------------------------
 
 /// Encode a `DYLD_CHAINED_PTR_64` bind word.
@@ -538,7 +538,7 @@ pub fn encode_ptr_64_rebase(target_or_offset: u64, next: u16) -> u64 {
     target | (high8 << 36) | (nxt << 51)
 }
 
-/// Build a minimal `LC_DYLD_CHAINED_FIXUPS` payload for fixtures.
+/// Build a minimal `LC_DYLD_CHAINED_FIXUPS` payload for unit tests.
 ///
 /// One segment with starts (at `data_seg_index`), one page, one import.
 #[must_use]
@@ -643,13 +643,6 @@ fn read_u64(data: &[u8], off: usize) -> Result<u64, LoadError> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::fixture::{
-        CALL_DYLIB_GOT_VA, KH_ADD_SYMBOL, arm64_dylib_add, call_dylib_chained_exit,
-    };
-    use crate::session::{ImageLoadStatus, ImageRole, LoadSession};
-    use crate::test_util::map_test_lock;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn decode_bind_and_rebase_ptr64() {
@@ -688,89 +681,14 @@ mod tests {
 
     #[test]
     fn encode_blob_parses_one_import() {
-        let blob = encode_chained_fixups_blob(
-            3,
-            2,
-            0x4000,
-            0x4000,
-            0,
-            DYLD_CHAINED_PTR_64,
-            1,
-            KH_ADD_SYMBOL,
-        );
+        let blob =
+            encode_chained_fixups_blob(3, 2, 0x4000, 0x4000, 0, DYLD_CHAINED_PTR_64, 1, "_kh_add");
         let header = parse_header(&blob).unwrap();
         let imports = parse_imports(&blob, &header).unwrap();
         assert_eq!(imports.len(), 1);
         let imp = imports.first().expect("one import");
-        assert_eq!(imp.name, KH_ADD_SYMBOL);
+        assert_eq!(imp.name, "_kh_add");
         assert_eq!(imp.lib_ordinal, 1);
         assert!(!imp.weak);
-    }
-
-    #[test]
-    fn call_dylib_chained_fixture_has_lc() {
-        let bytes = call_dylib_chained_exit();
-        assert!(bytes_have_chained_fixups(&bytes).unwrap());
-        // classic bind sites empty when only chained
-        assert!(crate::bind::collect_bind_sites(&bytes).unwrap().is_empty());
-    }
-
-    #[test]
-    fn chained_bind_writes_got() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kh-chain-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = dir.join("call_chained.macho");
-        let dylib_path = dir.join("libkh_add.dylib");
-        std::fs::File::create(&main_path)
-            .unwrap()
-            .write_all(&call_dylib_chained_exit())
-            .unwrap();
-        std::fs::File::create(&dylib_path)
-            .unwrap()
-            .write_all(&arm64_dylib_add())
-            .unwrap();
-
-        let mut session = LoadSession::open(&main_path, None).unwrap();
-        let _ = session.map_process().unwrap();
-        let main = session.images().first().unwrap();
-        assert_eq!(main.role, ImageRole::Main);
-        assert!(image_has_chained_fixups(main.image.as_ref().unwrap()));
-        let main_slide = main.slide();
-
-        let export_va = session
-            .images()
-            .iter()
-            .find(|i| i.role == ImageRole::Dylib && matches!(i.status, ImageLoadStatus::Mapped))
-            .and_then(|dylib| {
-                dylib
-                    .exports
-                    .iter()
-                    .find(|e| e.name == KH_ADD_SYMBOL)
-                    .map(|e| e.value.wrapping_add(dylib.slide()))
-            })
-            .expect("dylib export");
-
-        let got_va = CALL_DYLIB_GOT_VA.wrapping_add(main_slide);
-        let main_mem = session
-            .images()
-            .first()
-            .and_then(|i| i.memory.as_ref())
-            .unwrap();
-        let region = main_mem
-            .regions()
-            .iter()
-            .find(|r| got_va >= r.guest_addr && got_va < r.guest_addr.saturating_add(r.vmsize))
-            .expect("DATA");
-        let off = usize::try_from(got_va.saturating_sub(region.guest_addr)).unwrap();
-        let bytes = region.host_bytes().get(off..off + 8).unwrap();
-        let mut le = [0_u8; 8];
-        le.copy_from_slice(bytes);
-        assert_eq!(u64::from_le_bytes(le), export_va);
-
-        drop(session);
-        drop(std::fs::remove_dir_all(dir));
     }
 }

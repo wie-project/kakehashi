@@ -1,66 +1,29 @@
 //! License-clean **libSystem** surface for the Kakehashi bottle (`no_std`).
 //!
-//! Guest dylib compiled for **aarch64-apple-darwin**, shipped as
-//! `/usr/lib/libSystem.B.dylib` inside the bottle. Not Apple code; no
-//! proprietary blobs. Build product is `libkh_libsystem.dylib`; stage with
-//! `./scripts/stage-libsystem.sh` into
-//! `crates/kh-runtime/resources/libSystem.B.dylib` (crates.io embed for
-//! `cargo install kakehashi` → `kh bottle ensure`).
+//! Guest dylib for **aarch64-apple-darwin**, staged as `/usr/lib/libSystem.B.dylib`.
+//! Not Apple code. Build product: `libkh_libsystem.dylib` → `./scripts/stage-libsystem.sh`.
 //!
-//! ## Architecture
+//! ## Layout
 //!
-//! * All libSystem / libc C ABI lives **here** — not in `kh-runtime` / `kh-loader`.
-//! * Bodies use Darwin `svc #0x80` (`x16` = BSD number) or Kakehashi host helpers
-//!   (`0x4B48_xxxx`) so `kh-runtime` trap translation can run them on Linux aarch64.
-//! * Trace lines go to guest stderr (fd 2) for `kh run` / `kh trace`.
+//! * [`kh_core`] — syscall entry, errno, heap, process, host helpers
+//! * [`dylib`] — surfaces mapped to Darwin dylibs (`libsystem_c`, `libcurl`, `libc++`, …)
+//! * [`frameworks`] — soft CF / Security / CoreServices
 //!
-//! ## Build (not part of default Linux workspace build)
+//! ## Build
 //!
 //! ```bash
-//! rustup target add aarch64-apple-darwin   # when cross-building
 //! cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-//! # → target/aarch64-apple-darwin/release/libkh_libsystem.dylib
 //! ./scripts/stage-libsystem.sh
-//! # → crates/kh-runtime/resources/libSystem.B.dylib  (commit for crates.io)
-//! kh bottle create               # copies + sets LC_ID_DYLIB to /usr/lib/...
 //! ```
-//!
-//! Default `cargo test` / `cargo clippy` use workspace `default-members` and
-//! **exclude** this crate. Explicit Linux builds of this package are unsupported
-//! for the product dylib.
 
 #![no_std]
-#![allow(unsafe_code)] // guest C ABI + raw Darwin SVC
+#![allow(unsafe_code)]
 #![allow(clippy::missing_safety_doc)]
 
-mod apple_stubs;
-mod curl;
-mod cxxabi;
-mod errno;
-mod extra_stubs;
-mod heap;
-mod iconv;
-mod ld_surface;
-mod libcxx_algo;
-mod libcxx_error;
-mod libcxx_fs;
-mod libcxx_iostream;
-mod libcxx_shared;
-mod libcxx_string;
-mod libcxx_sync;
-mod locale;
-mod net;
-mod objc_surface;
-mod posix;
-mod process;
-mod pthread;
-mod regex_posix;
-mod rtti;
-mod stdio;
-mod string;
-mod sys;
-mod trace;
-mod zlib;
+#[path = "core/mod.rs"]
+mod kh_core;
+mod dylib;
+mod frameworks;
 
 /// Route Rust `alloc` (miniz_oxide) through freestanding `malloc`/`free`.
 struct KhGlobalAlloc;
@@ -68,13 +31,13 @@ struct KhGlobalAlloc;
 // SAFETY: forwards to our freestanding heap; layout size is respected.
 unsafe impl core::alloc::GlobalAlloc for KhGlobalAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        let p = unsafe { heap::malloc(layout.size().max(layout.align()).max(1)) };
+        let p = unsafe { crate::kh_core::heap::malloc(layout.size().max(layout.align()).max(1)) };
         p.cast::<u8>()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: core::alloc::Layout) {
         unsafe {
-            heap::free(ptr.cast());
+            crate::kh_core::heap::free(ptr.cast());
         }
     }
 
@@ -84,7 +47,7 @@ unsafe impl core::alloc::GlobalAlloc for KhGlobalAlloc {
         _layout: core::alloc::Layout,
         new_size: usize,
     ) -> *mut u8 {
-        let p = unsafe { heap::realloc(ptr.cast(), new_size.max(1)) };
+        let p = unsafe { crate::kh_core::heap::realloc(ptr.cast(), new_size.max(1)) };
         p.cast::<u8>()
     }
 }
@@ -92,64 +55,21 @@ unsafe impl core::alloc::GlobalAlloc for KhGlobalAlloc {
 #[global_allocator]
 static KH_ALLOC: KhGlobalAlloc = KhGlobalAlloc;
 
-pub use errno::__error;
-pub use heap::{calloc, free, kh_heap_stats_dump, kh_heap_stats_enable, malloc, realloc};
-pub use process::{exit, exit_now, kh_bottle_mark};
-pub use stdio::{bzero, memcpy, memmove, memset, puts, strlen, write};
+pub use crate::kh_core::errno::__error;
+pub use crate::kh_core::heap::{calloc, free, kh_heap_stats_dump, kh_heap_stats_enable, malloc, realloc};
+pub use crate::kh_core::helpers::*;
+pub use crate::kh_core::process::{exit, exit_now, kh_bottle_mark};
+pub use crate::dylib::libsystem_c::stdio::{bzero, memcpy, memmove, memset, puts, strlen, write};
 
 /// Return value of [`kh_bottle_mark`] (fixture / smoke probe).
 pub const KH_BOTTLE_MARK_VALUE: i32 = 77;
 
-/// Host-helper id for `_puts` (must match `kh_runtime` helpers).
-pub const KH_HELPER_PUTS: u32 = 0x4B48_0001;
-/// Host-helper id for minimal `_printf` (literal format only).
-pub const KH_HELPER_PRINTF: u32 = 0x4B48_0002;
-/// Host-helper id for `readdir` next entry.
-pub const KH_HELPER_READDIR: u32 = 0x4B48_0003;
-/// Host-helper id for `sched_yield` / pthread backoff.
-pub const KH_HELPER_YIELD: u32 = 0x4B48_0004;
-/// Host-helper id for online CPU count (`sysconf(_SC_NPROCESSORS_ONLN)`).
-pub const KH_HELPER_NCPU: u32 = 0x4B48_0005;
-/// Host-helper id: park while `*u32 == expected` (futex wait).
-pub const KH_HELPER_PARK: u32 = 0x4B48_0006;
-/// Host-helper id: wake park waiters on a `u32` address.
-pub const KH_HELPER_WAKE: u32 = 0x4B48_0007;
-/// Host-helper id: `getaddrinfo` → packed sockaddr list in guest buffer.
-pub const KH_HELPER_GETADDRINFO: u32 = 0x4B48_0008;
-/// Host-helper id: TLS cert chain verify against bottle CA bundle.
-pub const KH_HELPER_VERIFY_CERT: u32 = 0x4B48_0009;
-/// Host-helper id: guest HOME path (`/Volumes/linux…` or `/var/root`) into buffer.
-pub const KH_HELPER_GUEST_HOME: u32 = 0x4B48_000A;
-/// Host-helper id: non-zero when host wants freestanding heap stats dump.
-pub const KH_HELPER_HEAP_STATS_ON: u32 = 0x4B48_000B;
-/// Host-helper id: HTTP(S) perform for freestanding libcurl (`KhHttpReq` in guest).
-pub const KH_HELPER_HTTP: u32 = 0x4B48_000C;
-/// Host-helper id: host `getenv` into guest buffer (seed `GIT_*` after re-exec).
-pub const KH_HELPER_GETENV: u32 = 0x4B48_000D;
-/// Host-helper id: POSIX `regcomp` (pattern VA, Darwin cflags, out `[handle,nsub]`).
-pub const KH_HELPER_REGCOMP: u32 = 0x4B48_000E;
-/// Host-helper id: POSIX `regexec` (guest VA of packed request).
-pub const KH_HELPER_REGEXEC: u32 = 0x4B48_000F;
-/// Host-helper id: POSIX `regfree` (handle).
-pub const KH_HELPER_REGFREE: u32 = 0x4B48_0010;
-/// Host-helper id: TCP (+ rustls) connect → guest FD for freestanding libcurl.
-/// Flags: bit0 verify peer; bit1 plain TCP only (`http://`).
-pub const KH_HELPER_TLS_CONNECT: u32 = 0x4B48_0011;
-/// Host-helper id: guest main executable path for `_NSGetExecutablePath`.
-pub const KH_HELPER_EXECUTABLE_PATH: u32 = 0x4B48_0012;
-/// Host-helper id: `dlopen` → handle into the runtime mapped-image table.
-pub const KH_HELPER_DLOPEN: u32 = 0x4B48_0013;
-/// Host-helper id: `dlsym` → guest VA from a `dlopen` handle / `RTLD_DEFAULT`.
-pub const KH_HELPER_DLSYM: u32 = 0x4B48_0014;
-/// Host-helper id: `posix_spawn` without forking the guest address space.
-pub const KH_HELPER_SPAWN: u32 = 0x4B48_0015;
-
 #[panic_handler]
 fn panic_handler(_info: &core::panic::PanicInfo<'_>) -> ! {
-    trace::note(b"panic in kh-libsystem\n");
+    crate::kh_core::trace::note(b"panic in kh-libsystem\n");
     // SAFETY: never returns.
     unsafe {
-        process::exit_now(127);
+        crate::kh_core::process::exit_now(127);
     }
 }
 

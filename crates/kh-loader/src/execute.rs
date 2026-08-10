@@ -203,7 +203,7 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     });
 
     // Wire freestanding libSystem → `kh_hypercall_entry` (sole production BSD path).
-    // Residual Darwin `svc` in fixtures/apps is always rewritten to `brk` below;
+    // Residual Darwin `svc` is always rewritten to `brk` below;
     // that is *not* a second production path (see invariants 7, 12).
     warn_if_hypercall_env_opt_out();
     let hypercall_wired =

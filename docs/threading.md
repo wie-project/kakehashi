@@ -11,7 +11,7 @@ frames.
 
 | Side | Files |
 | --- | --- |
-| Guest | `crates/kh-libsystem/src/pthread.rs` |
+| Guest | `crates/kh-libsystem/src/dylib/libsystem_pthread/` |
 | Host | `crates/kh-runtime/src/thread.rs` |
 | Syscalls | `crates/kh-runtime/src/syscall/thread_sys.rs` |
 | Boundary | `crates/kh-runtime/src/trap.rs`, `tls.rs`, `host_slot.rs` |

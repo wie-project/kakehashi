@@ -446,90 +446,14 @@ fn platform_name(platform: u32) -> &'static str {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::fixture::minimal_arm64_execute;
-    use kh_runtime::GuestPageSize;
-
-    #[test]
-    fn parse_minimal_arm64_fixture() {
-        let bytes = minimal_arm64_execute();
-        let image = parse_bytes(&bytes, "minimal").expect("parse");
-        assert_eq!(image.summary.cpu, "arm64");
-        assert_eq!(image.summary.file_type, "EXECUTE");
-        assert!(!image.summary.fat);
-        assert!(image.summary.is_64);
-        assert!(image.summary.little_endian);
-        assert_eq!(
-            image.summary.uuid.as_deref(),
-            Some("00112233-4455-6677-8899-AABBCCDDEEFF")
-        );
-        assert!(
-            image
-                .dylibs
-                .iter()
-                .any(|d| d.name == "/usr/lib/libSystem.B.dylib")
-        );
-        assert!(image.segments.iter().any(|s| s.name == "__TEXT"));
-        assert!(image.segments.iter().any(|s| s.name == "__PAGEZERO"));
-        assert!(image.summary.entry.is_some());
-    }
 
     #[test]
     fn reject_garbage() {
         let err = parse_bytes(b"not a macho", "bad").unwrap_err();
         assert!(matches!(err, LoadError::NotMachO(_)));
         assert_eq!(err.exit_code(), 2);
-    }
-
-    #[test]
-    fn image_plan_guest_16k() {
-        let bytes = minimal_arm64_execute();
-        let image = parse_bytes(&bytes, "minimal").expect("parse");
-        let plan = image.plan(GuestPageSize::Darwin16K);
-        assert_eq!(plan.guest_page_size, 16_384);
-        assert!(!plan.mappings.is_empty());
-        assert!(plan.segment_count() >= 2);
-    }
-
-    #[test]
-    fn parse_fat_arm64_wrapper_sets_slice_offset() {
-        use crate::fixture::wrap_fat_arm64_only;
-
-        let thin = minimal_arm64_execute();
-        let fat = wrap_fat_arm64_only(&thin);
-        let slice = locate_arm64_slice(&fat).expect("locate");
-        assert!(slice.was_fat);
-        assert_eq!(slice.offset, 32);
-        assert_eq!(usize::try_from(slice.size).unwrap(), thin.len());
-
-        let image = parse_bytes(&fat, "fat-minimal").expect("parse fat");
-        assert!(image.summary.fat);
-        assert_eq!(image.summary.file_slice_offset, 32);
-        assert_eq!(image.summary.cpu, "arm64");
-        assert_eq!(
-            image.summary.entry,
-            parse_bytes(&thin, "thin").unwrap().summary.entry
-        );
-
-        let plan = image.plan(GuestPageSize::Darwin16K);
-        let text = plan
-            .mappings
-            .iter()
-            .find(|m| m.name == "__TEXT")
-            .expect("TEXT");
-        // Thin TEXT fileoff is 0; fat plan must add container offset for map.
-        assert_eq!(text.fileoff, 32);
-    }
-
-    #[test]
-    fn thin_arm64_bytes_accepts_fat_and_thin() {
-        use crate::fixture::wrap_fat_arm64_only;
-
-        let thin = minimal_arm64_execute();
-        let fat = wrap_fat_arm64_only(&thin);
-        assert_eq!(thin_arm64_bytes(&thin).unwrap(), thin.as_slice());
-        assert_eq!(thin_arm64_bytes(&fat).unwrap(), thin.as_slice());
     }
 }

@@ -1,36 +1,32 @@
-//! Apple-only linker flags + freestanding C `*printf` for the bottle dylib.
+//! Apple-only linker flags + freestanding C varargs for the bottle dylib.
 //!
 //! * `install_name` stays `@rpath/libkh_libsystem.dylib` so `ld` can still
-//!   link `-lSystem` (setting id to `/usr/lib/libSystem.B.dylib` makes the
-//!   linker refuse “dylib with itself”).
-//! * Packaging (`kh bottle create` / CI) renames the file and runs
-//!   `install_name_tool -id /usr/lib/libSystem.B.dylib`.
-//! * `-lSystem` is only for host `dyld_stub_binder`; exported C symbols are
-//!   defined in this crate and do not call into the real libSystem body.
-//! * `printf_fmt.c` is freestanding (`-ffreestanding`) and only calls our
-//!   Rust `write` / `fileno` / `_exit` exports.
+//!   link `-lSystem`.
+//! * Packaging renames the file and sets LC_ID to `/usr/lib/libSystem.B.dylib`.
+//! * Freestanding C sources live under `src/dylib/**/c/`.
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     if !target.contains("apple-darwin") {
-        // Not a supported product target — keep the crate type-checking only.
         println!("cargo:warning=kh-libsystem product builds require aarch64-apple-darwin");
         return;
     }
 
-    // Freestanding C for variadic ABIs (stable Rust has no c_variadic):
-    // *printf + curl_easy_setopt/getinfo + fcntl (Apple arm64 stacks varargs).
-    // `-force_load` is required: cdylib + dead_strip drops archive members that
-    // nothing in Rust references by name.
-    println!("cargo:rerun-if-changed=src/printf_fmt.c");
-    println!("cargo:rerun-if-changed=src/curl_varargs.c");
-    println!("cargo:rerun-if-changed=src/fcntl_varargs.c");
-    println!("cargo:rerun-if-changed=src/open_varargs.c");
-    cc::Build::new()
-        .file("src/printf_fmt.c")
-        .file("src/curl_varargs.c")
-        .file("src/fcntl_varargs.c")
-        .file("src/open_varargs.c")
+    let c_files = [
+        "src/dylib/libsystem_c/c/printf_fmt.c",
+        "src/dylib/libsystem_c/c/fcntl_varargs.c",
+        "src/dylib/libsystem_c/c/open_varargs.c",
+        "src/dylib/libcurl/c/curl_varargs.c",
+    ];
+    for f in c_files {
+        println!("cargo:rerun-if-changed={f}");
+    }
+
+    let mut build = cc::Build::new();
+    for f in c_files {
+        build.file(f);
+    }
+    build
         .flag("-ffreestanding")
         .flag("-fno-builtin")
         .flag("-fno-builtin-printf")
@@ -47,10 +43,7 @@ fn main() {
         return;
     };
     let archive = format!("{out}/libkh_printf_fmt.a");
-    // Through the `cc` linker driver (not raw ld): one -Wl token.
     println!("cargo:rustc-cdylib-link-arg=-Wl,-force_load,{archive}");
-    // rustc cdylib uses -exported_symbols_list (Rust-only). Explicitly export
-    // freestanding C *printf + curl vararg symbols pulled from the archive.
     for sym in [
         "_printf",
         "_vprintf",
@@ -70,7 +63,6 @@ fn main() {
         "___sprintf_chk",
         "___vsprintf_chk",
         "___assert_rtn",
-        // BSD err(3) — CLT ar/ranlib
         "_warn",
         "_warnx",
         "_vwarn",
@@ -79,13 +71,10 @@ fn main() {
         "_errx",
         "_verr",
         "_verrx",
-        // modern `ld` mach_o::Error message path (printf_fmt.c).
-        // C identifier is `_simple_vsprintf` → Darwin Mach-O `__simple_vsprintf`.
         "__simple_vsprintf",
         "_curl_easy_setopt",
         "_curl_easy_getinfo",
         "_fcntl",
-        // open/openat varargs (mode on stack) — must export C wrappers, not only impl.
         "_open",
         "_openat",
     ] {

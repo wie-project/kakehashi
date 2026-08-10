@@ -80,7 +80,7 @@ Method and commands: [curl.md](curl.md). User-facing recipes:
 | --- | --- |
 | `kh install curl` (+ optional `KAKEHASHI_CURL`) | done |
 | Guest `/usr/local/bin/curl` + bottle CA seed | done |
-| `scripts/docker-curl.sh` (+ probe) | done |
+| `scripts/docker-kh.sh curl` (+ probe) | done |
 | G1 `--version` | **pass** |
 | G3 HTTP GET body + exit 0 | **pass** (Docker + UTM) |
 | G4 HTTPS GET (OpenSSL + CA) | **pass** (Docker) |
@@ -122,7 +122,7 @@ Method and gates: [clang.md](clang.md). Binary from the same CLT install as git
 | G1 `clang --version` | **pass** (Docker Colima: Apple clang 21.0.0 banner + exit 0) |
 | G2 missing-surface list | open |
 | G3 trivial compile | open |
-| Docker helper | `scripts/docker-clang.sh` |
+| Docker helper | `scripts/docker-kh.sh clang` |
 
 Process notes: internet for install only; clippy `-D warnings`; keep
 `7zz -mmt=4` + curl/git green when shared paths change; clean-room —
@@ -132,7 +132,7 @@ Process notes: internet for install only; clippy `-D warnings`; keep
 
 ### MAY
 
-1. One logical change per PR with `docker-7zz` / bare-metal `mmt=4` in the description.
+1. One logical change per PR with `docker-kh 7zz` / bare-metal `mmt=4` in the description.
 2. Default-off counters/flags for risky paths (`KAKEHASHI_FUTEX_STATS`).
 3. Optimize freely **while host TPIDR is live**.
 4. Stage freestanding ABI changes into `resources/libSystem.B.dylib`.

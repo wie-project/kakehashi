@@ -1,44 +1,40 @@
 # Kakehashi documentation
 
-Normative design reference for maintainers. Prefer these pages over chat
-history when changing runtime, threading, or the guest/host boundary.
+Normative design reference for maintainers.
 
 | Document | Subject |
 | --- | --- |
-| [Architecture](architecture.md) | Crates, pipeline, bottle, memory |
+| [Architecture](architecture.md) | Crates, pipeline, bottle, `kh-libsystem` tree |
 | [Threading](threading.md) | 1:1 threads, join protocol, worker teardown |
 | [Guest–host boundary](guest-host-boundary.md) | TPIDR, hypercall, alt stack, NEON |
 | [Invariants](invariants.md) | Binding MUST / MUST NOT |
-| [Clean-room / legal method](legal-method.md) | No Darling; no proprietary paste; trace-first ABI work |
-| [Roadmap](roadmap.md) | Perf status, next work, process |
-| [Optimization process](roadmap2.md) | Strict measure-first perf process, plates, hard cost rules |
-| [Curl milestone](curl.md) | Network surface, install, HTTP/HTTPS gates (milestone met) |
-| [Git / CLT milestone](git.md) | Apple `git` via `kh install xcode-tools` (milestone met; Wine full, llvm shallow, …) |
-| [Apple clang milestone](clang.md) | CLT `clang` under `kh` (G1 `--version` active) |
+| [Clean-room / legal](legal-method.md) | No Darling; trace-first ABI |
+| [Roadmap](roadmap.md) | Status, next work |
+| [Optimization process](roadmap2.md) | Measure-first perf rules |
+| [Curl](curl.md) | Network surface (milestone met) |
+| [Git / CLT](git.md) | Apple `git` (milestone met) |
+| [Apple clang](clang.md) | CLT `clang` under `kh` |
+| [Syscall coverage](syscall-coverage.md) | BSD numbers + helpers (done / gaps) |
 
-User-facing install, **what works** (7zz + curl + git recipes), and CI economics:
-root [`README.md`](../README.md).
+User recipes and install: root [`README.md`](../README.md).
 
-## Sources of truth (code)
+## Code map
 
 | Location | Role |
 | --- | --- |
-| `crates/kh-runtime/src/thread.rs` | Host worker spawn / exit |
-| `crates/kh-runtime/src/trap.rs` | `kh_hypercall_entry`, residual `svc`→`brk` |
-| `crates/kh-runtime/src/tls.rs`, `host_slot.rs` | TLS boundary; A1 mirrors + gettid fallback |
-| `crates/kh-libsystem/src/pthread.rs`, `sys.rs` | Guest pthread + hypercall thin |
+| `crates/kh-runtime/src/thread/` | Host worker spawn / exit |
+| `crates/kh-runtime/src/cpu/trap.rs` | Hypercall entry, residual `svc`→`brk` |
+| `crates/kh-runtime/src/thread/tls.rs`, `cpu/host_slot.rs` | TLS boundary |
+| `crates/kh-libsystem/src/core/sys.rs` | Guest hypercall thin + `SYS_*` |
+| `crates/kh-libsystem/src/dylib/libsystem_pthread/` | Guest pthread |
 | `crates/kh-loader/src/execute.rs` | Wire hypercall into freestanding dylib |
 
 ## Multi-thread gate
 
-Linux aarch64 (Docker or bare-metal):
-
 ```bash
-./scripts/docker-7zz.sh a -t7z -m0=lzma2 -mx=5 -mmt=4 \
+./scripts/docker-kh.sh 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 \
   /Volumes/linux/out/mt.7z /Volumes/linux/src/README.md
-./scripts/docker-7zz.sh t /Volumes/linux/out/mt.7z
+./scripts/docker-kh.sh 7zz -- t /Volumes/linux/out/mt.7z
 ```
 
-Expect `Everything is Ok` and exit 0. SEGV with PC in host `libgcc_s.so.1`
-during worker exit historically means a broken teardown path (see
-[Threading — Worker teardown](threading.md#worker-teardown)).
+Expect `Everything is Ok`, exit 0.

@@ -1,5 +1,5 @@
 # Dev image: Rust toolchain only. Repo is bind-mounted at /src at runtime.
-# Used by scripts/docker-7zz.sh and scripts/bench-fair-local.sh.
+# Used by scripts/docker-kh.sh 7zz and scripts/bench-fair-local.sh.
 FROM rust:1.88-bookworm
 
 RUN apt-get update \

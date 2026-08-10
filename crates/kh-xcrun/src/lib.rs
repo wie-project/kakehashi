@@ -143,11 +143,11 @@ pub fn parse_args(progname: &str, args: &[&str]) -> ParsedArgs {
                     out.toolchain = Some(String::from(v));
                 }
             }
-            s if let Some(rest) = s.strip_prefix("--sdk=") => {
-                out.sdk = Some(String::from(rest));
+            s if s.starts_with("--sdk=") => {
+                out.sdk = Some(String::from(s.trim_start_matches("--sdk=")));
             }
-            s if let Some(rest) = s.strip_prefix("--toolchain=") => {
-                out.toolchain = Some(String::from(rest));
+            s if s.starts_with("--toolchain=") => {
+                out.toolchain = Some(String::from(s.trim_start_matches("--toolchain=")));
             }
             "--" => {
                 i = i.saturating_add(1);

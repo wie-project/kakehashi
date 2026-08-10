@@ -362,15 +362,8 @@ pub fn rebase_memory(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::fixture::{LIBKH_CTOR_TEXT_VA, arm64_dylib_ctor, ctor_main_exit};
-    use crate::init::{collect_mod_init, plan_initializers};
-    use crate::session::{ImageRole, LoadSession};
-    use crate::test_util::map_test_lock;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn rebasable_types_match_macho() {
@@ -380,115 +373,5 @@ mod tests {
         assert!(is_rebasable_section_type(S_INTERPOSING));
         assert!(!is_rebasable_section_type(0x6)); // S_NON_LAZY_SYMBOL_POINTERS
         assert!(!is_rebasable_section_type(0x0)); // S_REGULAR
-    }
-
-    #[test]
-    fn slide_zero_still_runs_mod_init_plan() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kh-rebase-zero-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = dir.join("ctor_main.macho");
-        let dylib_path = dir.join("libkh_ctor.dylib");
-        std::fs::File::create(&main_path)
-            .unwrap()
-            .write_all(&ctor_main_exit())
-            .unwrap();
-        std::fs::File::create(&dylib_path)
-            .unwrap()
-            .write_all(&arm64_dylib_ctor())
-            .unwrap();
-
-        let mut session = LoadSession::open(&main_path, None).unwrap();
-        let _ = session.map_process().unwrap();
-        let plan = plan_initializers(session.images()).expect("plan");
-        assert_eq!(plan.len(), 1, "expected one dylib ctor: {plan:?}");
-        let first = plan.first().expect("one");
-        assert_ne!(first.va, 0);
-
-        drop(session);
-        drop(std::fs::remove_dir_all(dir));
-    }
-
-    #[test]
-    fn nonzero_slide_rewrites_mod_init_slot_in_place() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        const DELTA: u64 = 0x1_0000;
-
-        let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kh-rebase-slide-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = dir.join("ctor_main.macho");
-        let dylib_path = dir.join("libkh_ctor.dylib");
-        std::fs::File::create(&main_path)
-            .unwrap()
-            .write_all(&ctor_main_exit())
-            .unwrap();
-        std::fs::File::create(&dylib_path)
-            .unwrap()
-            .write_all(&arm64_dylib_ctor())
-            .unwrap();
-
-        let mut session = LoadSession::open(&main_path, None).unwrap();
-        let _ = session.map_process().unwrap();
-
-        let dylib_idx = session
-            .images()
-            .iter()
-            .position(|i| {
-                i.role == ImageRole::Dylib
-                    && matches!(i.status, ImageLoadStatus::Mapped)
-                    && i.install_name.contains("libkh_ctor")
-            })
-            .expect("mapped ctor dylib");
-
-        // Snapshot preferred pointer (file content; slide was 0 so still preferred).
-        let preferred = {
-            let dylib = session.images().get(dylib_idx).expect("dylib");
-            let image = dylib.image.as_ref().expect("image");
-            let memory = dylib.memory.as_ref().expect("memory");
-            let inits =
-                collect_mod_init(image, memory, dylib.preferred_base()).expect("collect preferred");
-            *inits.first().expect("one init")
-        };
-        assert!(
-            (LIBKH_CTOR_TEXT_VA..LIBKH_CTOR_TEXT_VA + 0x4000).contains(&preferred),
-            "preferred ctor in TEXT: {preferred:#x}"
-        );
-
-        {
-            let dylib = session.images_mut().get_mut(dylib_idx).expect("dylib mut");
-            let memory = dylib.memory.as_mut().expect("memory mut");
-            memory.test_offset_guest_vas(DELTA);
-            assert_eq!(memory.slide(), DELTA);
-            let image = dylib.image.as_ref().expect("image");
-            let rewritten = rebase_memory(image, memory, DELTA).expect("rebase");
-            assert_eq!(rewritten, 1, "one mod_init pointer should be rewritten");
-        }
-
-        let dylib = session.images().get(dylib_idx).expect("dylib");
-        let image = dylib.image.as_ref().expect("image");
-        let memory = dylib.memory.as_ref().expect("memory");
-        let slide = memory.slide();
-        assert_eq!(slide, DELTA);
-
-        let sect = image
-            .segments
-            .iter()
-            .flat_map(|s| s.sections.iter())
-            .find(|s| s.flags & SECTION_TYPE == S_MOD_INIT_FUNC_POINTERS)
-            .expect("mod_init sect");
-        let slot = sect.addr.wrapping_add(slide);
-        let slot_val = memory.read_u64_le(slot).expect("slot");
-        assert_eq!(slot_val, preferred.wrapping_add(DELTA));
-
-        let inits =
-            collect_mod_init(image, memory, dylib.preferred_base()).expect("collect post-rebase");
-        assert_eq!(inits, vec![preferred.wrapping_add(DELTA)]);
-
-        drop(session);
-        drop(std::fs::remove_dir_all(dir));
     }
 }

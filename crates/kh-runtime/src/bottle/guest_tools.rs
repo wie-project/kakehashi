@@ -159,12 +159,7 @@ pub fn discover_7zz(explicit: Option<&Path>) -> Option<PathBuf> {
         return Some(default.to_path_buf());
     }
 
-    for rel in [
-        "tests/clang-probe/7zz.bin",
-        "tests/fixtures/7zz",
-        "tests/fixtures/bin/7zz",
-        "tests/clang-probe/7zz",
-    ] {
+    for rel in ["tests/clang-probe/7zz.bin", "tests/clang-probe/7zz"] {
         let p = PathBuf::from(rel);
         if p.is_file() {
             return Some(p);

@@ -131,13 +131,13 @@ Relative `-o` paths use the **host CWD** of `kh`. Missing parents for
 ### Docker (Colima)
 
 ```bash
-./scripts/docker-curl.sh --version
-./scripts/docker-curl.sh -sS -o /Volumes/linux/out/body http://example.com/
-./scripts/docker-curl.sh -sS -o /Volumes/linux/out/https-body https://example.com/
+./scripts/docker-kh.sh curl -- --version
+./scripts/docker-kh.sh curl -- -sS -o /Volumes/linux/out/body http://example.com/
+./scripts/docker-kh.sh curl -- -sS -o /Volumes/linux/out/https-body https://example.com/
 # host: .tmp/kh-out/body , .tmp/kh-out/https-body
 
 # Trace-first expansion
-./scripts/docker-curl-probe.sh --version
+./scripts/docker-kh.sh curl --probe -- --version
 # → .tmp/kh-curl-probe/
 
 # CLI option matrix (tier1 HTTP polish; tier2 cookies/http2/…)

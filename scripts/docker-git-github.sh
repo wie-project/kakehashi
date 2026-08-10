@@ -21,7 +21,7 @@
 #   KH_GITHUB_OWNER     default: gh api user -q .login
 #   KH_GITHUB_REPO      default: kh-kakehashi-smoke (reused; force-push)
 #   KH_DELETE_REPO=1    try to delete private repo after smoke (needs delete_repo)
-#   (+ same as docker-git.sh: KAKEHASHI_*, KH_EXTRA_CARGO_ARGS, image)
+#   (+ same as docker-kh.sh git: KAKEHASHI_*, KH_EXTRA_CARGO_ARGS, image)
 
 set -euo pipefail
 

@@ -2,27 +2,38 @@
 //!
 //! Dependency rule: this crate must not depend on `kh-loader` or `kh-cli`.
 //!
+//! Layout:
+//! - [`bottle`] — guest root FS / tools install
+//! - [`mem`] — page geometry, mapping, address-space registry
+//! - [`syscall`] — BSD / helper dispatch
+//! - [`cpu`] — registers, trap backend, entry, host-thread slots
+//! - [`thread`] — guest threads + TLS
+//! - [`process`] — process-wide run state, stack, dyld table
+//! - [`host`] — host OS primitives + fat Mach-O open
+//!
 //! `unsafe` is denied by workspace lints and only allowed in tightly scoped
-//! modules (`cpu`, `host`, `host_slot`, `mem/*`, `trap`, `entry`, `thread`,
-//! `tls`, `fat_thin`, and `bottle::read_c_string`).
+//! modules (`cpu/*`, `host/*`, `mem/*`, `thread/*`, `syscall` handlers, and
+//! `bottle::read_c_string`).
 
 pub mod bottle;
 pub mod cpu;
-pub mod dyld_table;
-pub mod entry;
-pub mod fat_thin;
 pub mod host;
-pub mod host_slot;
 pub mod mem;
 pub mod process;
-pub mod regs;
-pub mod stack;
 pub mod syscall;
 pub mod thread;
-pub mod tls;
-pub mod tls_fd;
-pub mod tls_verify;
-pub mod trap;
+
+// Stable paths for modules that used to sit at the crate root.
+pub use cpu::entry;
+pub use cpu::host_slot;
+pub use cpu::regs;
+pub use cpu::trap;
+pub use host::fat_thin;
+pub use process::dyld_table;
+pub use process::stack;
+pub use thread::tls;
+pub use thread::tls_fd;
+pub use thread::tls_verify;
 
 pub use bottle::{
     BottleError, BottleStatus, CreateOptions, CreateResult, DARWIN_7ZZ_URL, DARWIN_CURL_URL,

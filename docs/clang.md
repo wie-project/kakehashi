@@ -159,7 +159,7 @@ no soft-ENOENT) is green for non-bitcode **and** `-flto` multi-file links.
 ## Method (trace-first)
 
 1. Smallest failing scenario: `clang --version` (G1).
-2. Run under Docker Colima (`scripts/docker-clang.sh`) and capture WARN / missing
+2. Run under Docker Colima (`scripts/docker-kh.sh clang`) and capture WARN / missing
    symbol / fault PC.
 3. Record **symbol → observed need → stub vs real → plan**.
 4. Implement from scratch:
@@ -190,19 +190,19 @@ working `xcrun`.
 
 ```bash
 # G1 smoke (build kh, ensure bottle, install CLT if needed, run clang --version)
-./scripts/docker-clang.sh --version
+./scripts/docker-kh.sh clang -- --version
 
 # Guest args are passed through (do **not** add an extra leading `--` — it
 # becomes a clang argv that ends option parsing).
-./scripts/docker-clang.sh -cc1 -help
+./scripts/docker-kh.sh clang -- -cc1 -help
 
 # G3 object compile
-./scripts/docker-clang.sh -x c -c \
+./scripts/docker-kh.sh clang -- -x c -c \
   /Volumes/linux/src/tests/clang-probe/return_zero.c \
   -o /Volumes/linux/out/return_zero.o
 
 # G4 multi-file link + product under guest (ld-classic + SDK TBDs)
-./scripts/docker-clang.sh \
+./scripts/docker-kh.sh clang -- \
   -O0 -std=c11 -arch arm64 \
   --ld-path=/Library/Developer/CommandLineTools/usr/bin/ld-classic \
   -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
@@ -214,7 +214,7 @@ working `xcrun`.
 # then:  kh run /Volumes/linux/out/g4-mini   →  g4-mini PASS
 
 # G5 clang-driver multi-file (modern ld, no --ld-path, no absolute TBD)
-./scripts/docker-clang.sh \
+./scripts/docker-kh.sh clang -- \
   -O0 -std=c11 -arch arm64 \
   -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
   /Volumes/linux/src/tests/clang-probe/g4-mini/src/calc.c \
@@ -225,7 +225,7 @@ working `xcrun`.
 # then:  kh run /Volumes/linux/out/g4-mini-driver   →  g4-mini PASS
 
 # G5+LTO full-bitcode multi-file (live libLTO; same sources)
-./scripts/docker-clang.sh \
+./scripts/docker-kh.sh clang -- \
   -flto -O0 -std=c11 -arch arm64 \
   -I /Volumes/linux/src/tests/clang-probe/g4-mini/include \
   /Volumes/linux/src/tests/clang-probe/g4-mini/src/calc.c \

@@ -41,11 +41,11 @@ streaming path.
 
 ```text
 # Large shallow monorepo over SSH (host keys + known_hosts)
-./scripts/docker-git.sh clone --depth 1 git@github.com:llvm/llvm-project.git
+./scripts/docker-kh.sh git -- clone --depth 1 git@github.com:llvm/llvm-project.git
 
 # Wine full history (HTTPS or SSH; GitHub or GitLab URL)
-# ./scripts/docker-git.sh clone https://github.com/wine-mirror/wine.git
-# ./scripts/docker-git.sh clone https://gitlab.winehq.org/wine/wine.git
+# ./scripts/docker-kh.sh git -- clone https://github.com/wine-mirror/wine.git
+# ./scripts/docker-kh.sh git -- clone https://gitlab.winehq.org/wine/wine.git
 ```
 
 ### G5 notes (SSH / host OpenSSH bridge)
@@ -70,11 +70,11 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 # → ls-remote + clone over ssh://127.0.0.1:2222/… ; README in .tmp/kh-out/ssh-smoke
 
 # Against GitHub — host OpenSSH needs a **file** key under ~/.ssh (agent-only
-# keys on macOS launchd do not reach Colima). docker-git.sh bind-mounts
+# keys on macOS launchd do not reach Colima). docker-kh git bind-mounts
 # ~/.ssh → /root/.ssh. Generate + register once if missing:
 #   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 #   # add ~/.ssh/id_ed25519.pub at https://github.com/settings/keys
-./scripts/docker-git.sh clone git@github.com:octocat/Hello-World.git
+./scripts/docker-kh.sh git -- clone git@github.com:octocat/Hello-World.git
 # Public repos without a key still fail: Permission denied (publickey).
 ```
 
@@ -86,7 +86,7 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 
 | Piece | Location |
 | --- | --- |
-| `curl_*` C ABI | freestanding `kh-libsystem` (`src/curl.rs`) — clean-room, not upstream libcurl |
+| `curl_*` C ABI | freestanding `kh-libsystem` (`src/dylib/libcurl/`) — clean-room, not upstream libcurl |
 | Bottle alias | `usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` ([`layout::ensure_libcurl_symlink`](../crates/kh-runtime/src/bottle/layout.rs)) |
 | HTTPS I/O (path B) | `KH_HELPER_TLS_CONNECT` → host TCP + **rustls**; guest `read`/`write` on TLS-wrapped FD are **plaintext**; freestanding builds HTTP/1.1 and streams body into `write_fn` (no multi‑GiB guest buffer) |
 | Plain HTTP (path B) | same helper + **`TLS_FLAG_PLAIN`** (bit1): TCP only, no rustls; same HTTP/1.1 streamer — **G7** |
@@ -99,7 +99,7 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 | --- | --- |
 | `capabilities` | **pass** |
 | Helper `list` (protocol v0/v1) | **pass** — refs from GitHub |
-| Protocol **v2** (`ls-refs` / fetch) | **pass** — default in `docker-git.sh` |
+| Protocol **v2** (`ls-refs` / fetch) | **pass** — default in `docker-kh.sh git` |
 | Host HTTP helper + body + `Content-Type` | **pass** |
 | `git ls-remote https://…` (spawned helper) | **pass** (Docker; v1 and v2) |
 | `git clone --depth 1 https://…` | **pass** (Docker; working tree + objects) |
@@ -214,7 +214,7 @@ kh run git -- clone https://github.com/octocat/Hello-World.git hw-full
     `fetch` (via Apple `git-remote-http` `stateless-connect`) works over path B
     TLS FDs. Verified Docker: `ls-remote`, Hello-World full clone, this repo
     shallow clone, **facebook/folly** full clone (~75 s, 3075 files); default in
-    `scripts/docker-git.sh` is now `protocol.version=2` (v1 remains if set).
+    `scripts/docker-kh.sh git` is now `protocol.version=2` (v1 remains if set).
 16. **`qsort` heapsort** — freestanding `_qsort` was insertion sort O(n²). After
     `Resolving deltas: 100%`, `index-pack` sorts the object table; wine
     (~1.37M objects) hung for hours in pure CPU with no `.idx`. Replaced with
@@ -429,7 +429,7 @@ kh run git -- --version
 ## Docker helper
 
 ```bash
-./scripts/docker-git.sh --version
+./scripts/docker-kh.sh git -- --version
 ```
 
 Host image needs `p7zip-full` / `7z` for pkg peel (`Dockerfile.dev`).

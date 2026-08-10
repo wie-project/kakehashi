@@ -509,13 +509,17 @@ mod tests {
         let _lock = test_env_lock();
         let _g = EnvGuard::new();
 
-        // Synthetic bottle fixture (checked in) is a valid thin arm64 dylib.
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let fixture = repo.join("tests/fixtures/bottle/usr/lib/libSystem.B.dylib");
-        assert!(fixture.is_file(), "missing fixture {}", fixture.display());
+        // Staged freestanding guest dylib (crate resources/).
+        let libsystem = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/libSystem.B.dylib");
+        assert!(
+            libsystem.is_file(),
+            "missing {}",
+            libsystem.display()
+        );
 
         let created = create_with(&CreateOptions {
-            libsystem: Some(&fixture),
+            libsystem: Some(&libsystem),
             ..CreateOptions::default()
         })
         .expect("create with libsystem");
@@ -537,12 +541,12 @@ mod tests {
         let _lock = test_env_lock();
         let _g = EnvGuard::new();
 
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let fixture = repo.join("tests/fixtures/bottle/usr/lib/libSystem.B.dylib");
-        assert!(fixture.is_file());
+        let libsystem = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/libSystem.B.dylib");
+        assert!(libsystem.is_file());
 
         let first = ensure(&CreateOptions {
-            libsystem: Some(&fixture),
+            libsystem: Some(&libsystem),
             ..CreateOptions::default()
         })
         .expect("ensure create");
@@ -552,7 +556,7 @@ mod tests {
 
         // Second ensure reuses the same bottle and reinstalls the dylib.
         let second = ensure(&CreateOptions {
-            libsystem: Some(&fixture),
+            libsystem: Some(&libsystem),
             ..CreateOptions::default()
         })
         .expect("ensure refresh");

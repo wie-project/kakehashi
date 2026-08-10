@@ -17,7 +17,7 @@
 #   KH_CHECKOUT_FORCE_FETCH=1 ./scripts/profile-git-checkout.sh  # re-fetch packs
 #   KAKEHASHI_BOUNDARY_STATS=1 ./scripts/profile-git-checkout.sh  # counts only
 #
-# Env: same as docker-git.sh (KH_EXTRA_CARGO_ARGS defaults to --release).
+# Env: same as docker-kh.sh git (KH_EXTRA_CARGO_ARGS defaults to --release).
 
 set -euo pipefail
 

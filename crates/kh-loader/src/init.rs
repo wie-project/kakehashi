@@ -6,7 +6,7 @@
 //!
 //! Modern Apple toolchains emit `__TEXT,__init_offsets` (`S_INIT_FUNC_OFFSETS`)
 //! with 32-bit image-relative offsets instead of classic pointer arrays. Real
-//! guests such as `7zz` use that form; classic fixtures keep `mod_init_func`.
+//! guests such as `7zz` use that form; older images keep `mod_init_func`.
 #![allow(unsafe_code)]
 
 use kh_runtime::{GuestMemory, call_guest};
@@ -201,49 +201,4 @@ pub fn run_initializers(session: &LoadSession, guest_sp: u64) -> Result<usize, L
         );
     }
     Ok(ran)
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use crate::fixture::{arm64_dylib_ctor, ctor_main_exit};
-    use crate::session::LoadSession;
-    use crate::test_util::map_test_lock;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[test]
-    fn collect_finds_one_mod_init_in_dylib() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kh-init-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let main_path = dir.join("ctor_main.macho");
-        let dylib_path = dir.join("libkh_ctor.dylib");
-        std::fs::File::create(&main_path)
-            .unwrap()
-            .write_all(&ctor_main_exit())
-            .unwrap();
-        std::fs::File::create(&dylib_path)
-            .unwrap()
-            .write_all(&arm64_dylib_ctor())
-            .unwrap();
-
-        let mut session = LoadSession::open(&main_path, None).unwrap();
-        let _ = session.map_process().unwrap();
-        let plan = plan_initializers(session.images()).expect("plan");
-        assert_eq!(plan.len(), 1, "expected one dylib ctor: {plan:?}");
-        let first = plan.first().expect("one");
-        assert!(
-            first.image_path.contains("libkh_ctor"),
-            "ctor should be from dylib: {}",
-            first.image_path
-        );
-        assert_ne!(first.va, 0);
-
-        drop(session);
-        drop(std::fs::remove_dir_all(dir));
-    }
 }

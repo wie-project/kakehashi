@@ -1,6 +1,6 @@
 [package]
 name = "kh-loader"
-version = "0.1.13"
+version = "0.1.14"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,9 +21,6 @@ goblin.workspace = true
 scroll = "0.13"
 libc.workspace = true
 kh-runtime = { version = "0.1.0", path = "../kh-runtime" }
-
-[dev-dependencies]
-# Fixture round-trip uses goblin directly in fixture tests (already a dep).
 
 [lints]
 workspace = true

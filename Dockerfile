@@ -30,10 +30,12 @@ WORKDIR /app
 
 COPY --from=builder /src/kh /usr/local/bin/kh
 
-COPY --from=builder /src/tests/fixtures /app/tests/fixtures
+# Freestanding guest libSystem (for bottle ensure / probe --root).
+COPY --from=builder /src/crates/kh-runtime/resources/libSystem.B.dylib \
+    /app/crates/kh-runtime/resources/libSystem.B.dylib
 COPY --from=builder /src/tests/clang-probe /app/tests/clang-probe
 
 RUN kh --help
 
 ENTRYPOINT ["kh"]
-CMD ["run", "--dry-load", "tests/fixtures/minimal_arm64_execute.macho"]
+CMD ["run", "--dry-load", "tests/clang-probe/write_exit"]

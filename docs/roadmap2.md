@@ -211,7 +211,7 @@ previous step’s acceptance is met.
 **P1 how to run**
 
 ```bash
-# Preferred: Linux aarch64 Docker (same image path as docker-7zz)
+# Preferred: Linux aarch64 Docker (same image path as docker-kh 7zz)
 ./scripts/bench-boundary-classes.sh
 RELEASE=1 KAKEHASHI_BOUNDARY_BENCH_ITERS=200000 ./scripts/bench-boundary-classes.sh
 # Phase A = dispatch ranking; Phase B = real guest + KAKEHASHI_BOUNDARY_STATS dump
@@ -352,7 +352,8 @@ unless a specific job is boundary-bound.
 - [`invariants.md`](invariants.md) — MUST / MUST NOT  
 - [`threading.md`](threading.md) — join and worker teardown  
 - Root [`README.md`](../README.md#performance-honest) — measured gap, CI framing  
-- Code: `crates/kh-runtime/src/trap.rs`, `syscall/*`, `mem/registry.rs`,
-  `bottle/path.rs`, `crates/kh-libsystem/src/{sys,posix,heap,pthread}.rs`  
+- Code: `crates/kh-runtime` trap/syscall/mem/bottle; freestanding
+  `kh-libsystem` `core/{sys,heap}` + `dylib/libsystem_c/posix` +
+  `dylib/libsystem_pthread`  
 - Bench helpers: `scripts/bench-fair-local.sh`, `scripts/bench-boundary-classes.sh` (Docker-first P1)  
 - Existing opt-in: `KAKEHASHI_FUTEX_STATS`

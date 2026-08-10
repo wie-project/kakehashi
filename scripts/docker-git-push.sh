@@ -10,7 +10,7 @@
 # Usage:
 #   ./scripts/docker-git-push.sh
 #
-# Env: same as docker-git.sh (KAKEHASHI_*, KH_EXTRA_CARGO_ARGS, image name).
+# Env: same as docker-kh.sh git (KAKEHASHI_*, KH_EXTRA_CARGO_ARGS, image name).
 
 set -euo pipefail
 

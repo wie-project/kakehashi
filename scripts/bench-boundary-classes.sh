@@ -5,7 +5,7 @@
 # Why Docker?
 #   Live `kh run` / hypercall is Linux aarch64 only. Host-side `cargo test` on
 #   macOS still works for a quick ranking, but production numbers and M0 guest
-#   dumps must come from the same image path as docker-7zz / docker-smoke.
+#   dumps must come from the same image path as docker-kh 7zz / docker-smoke.
 #
 # What is measured
 # ----------------
@@ -100,18 +100,20 @@ run_phase_b() {
   "$KH" bottle ensure
 
   # Minimal guest: few crossings (write + exit). Stats dump exercises M0.
-  echo "--- fixture: minimal_arm64_execute.macho ---"
-  if ! "$KH" run --expect-code 0 tests/fixtures/minimal_arm64_execute.macho; then
-    echo "warn: fixture run failed (live guest needs Linux aarch64)" >&2
+  if [[ -x tests/clang-probe/write_exit ]]; then
+    echo "--- clang probe: write_exit ---"
+    if ! "$KH" run --expect-code 0 tests/clang-probe/write_exit; then
+      echo "warn: write_exit run failed (live guest needs Linux aarch64 + bottle)" >&2
+    fi
   fi
 
-  # Short guest with more crossings than the fixture. Prefer bottle 7zz.
+  # Short guest with more crossings. Prefer bottle 7zz.
   # Do **not** redirect stderr — M0 boundary stats are printed there at exit.
   # Quiet guest stdout only (`7zz i` is a multi-page format dump).
   echo
   echo "--- guest: 7zz (version; stdout→file, stderr=stats on this terminal) ---"
   if ! "$KH" install 7zip; then
-    echo "note: 7zip install failed; trying tree fixture binary" >&2
+    echo "note: 7zip install failed; trying tree clang-probe binary" >&2
   fi
   local out_tmp
   out_tmp="$(mktemp)"
@@ -121,7 +123,7 @@ run_phase_b() {
     head -n 1 "$out_tmp" || true
   elif [[ -x tests/clang-probe/7zz.bin ]] && \
        "$KH" run tests/clang-probe/7zz.bin -- >"$out_tmp"; then
-    echo "7zz (fixture path) ok (stdout $(wc -l <"$out_tmp" | tr -d ' ') lines)"
+    echo "7zz (clang-probe path) ok (stdout $(wc -l <"$out_tmp" | tr -d ' ') lines)"
     head -n 1 "$out_tmp" || true
   else
     echo "note: 7zz guest sample skipped (install/run failed)" >&2

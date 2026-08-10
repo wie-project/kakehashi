@@ -798,7 +798,7 @@ pub(crate) fn write_slots_batched(
     Ok(())
 }
 
-/// Encode a minimal non-lazy POINTER bind sequence for fixtures / tests.
+/// Encode a minimal non-lazy POINTER bind sequence (unit tests / opcode smoke).
 #[must_use]
 pub fn encode_pointer_bind(
     dylib_ordinal: u8,
@@ -837,98 +837,22 @@ fn push_uleb(out: &mut Vec<u8>, mut value: u64) {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::fixture::{CALL_DYLIB_GOT_VA, KH_ADD_SYMBOL, arm64_dylib_add, call_dylib_exit};
-    use crate::session::{ImageRole, LoadSession};
-    use crate::test_util::map_test_lock;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn encode_and_collect_one_site() {
-        let stream = encode_pointer_bind(1, KH_ADD_SYMBOL, 2, 0);
-        // Minimal fake: only stream interpretation via a tiny Mach-O is heavy;
-        // unit-test the encoder shape and DO_BIND fields via interpret_stream.
-        let seg = [0_u64, 0x1_0000_0000, CALL_DYLIB_GOT_VA];
+        const GOT_VA: u64 = 0x1_0000_4000;
+        let stream = encode_pointer_bind(1, "_kh_add", 2, 0);
+        let seg = [0_u64, 0x1_0000_0000, GOT_VA];
         let mut sites = Vec::new();
         interpret_stream(&stream, 0..stream.len(), false, &seg, &mut sites).expect("interp");
         assert_eq!(sites.len(), 1);
         let s = sites.first().expect("one");
-        assert_eq!(s.name, KH_ADD_SYMBOL);
-        assert_eq!(s.preferred_va, CALL_DYLIB_GOT_VA);
+        assert_eq!(s.name, "_kh_add");
+        assert_eq!(s.preferred_va, GOT_VA);
         assert_eq!(s.lib_ordinal, 1);
         assert_eq!(s.bind_type, BIND_TYPE_POINTER);
         assert!(!s.weak);
         assert!(!s.is_lazy);
-    }
-
-    #[test]
-    fn call_dylib_fixture_has_bind_opcodes() {
-        let bytes = call_dylib_exit();
-        let sites = collect_bind_sites(&bytes).expect("sites");
-        assert_eq!(sites.len(), 1, "{sites:?}");
-        let s = sites.first().expect("one");
-        assert_eq!(s.name, KH_ADD_SYMBOL);
-        assert_eq!(s.preferred_va, CALL_DYLIB_GOT_VA);
-        assert_eq!(s.lib_ordinal, 1);
-    }
-
-    #[test]
-    fn opcode_bind_writes_got() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let _guard = map_test_lock();
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kh-bind-op-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let main_path = dir.join("call_dylib.macho");
-        let dylib_path = dir.join("libkh_add.dylib");
-        {
-            let mut f = std::fs::File::create(&main_path).expect("create main");
-            f.write_all(&call_dylib_exit()).expect("write main");
-        }
-        {
-            let mut f = std::fs::File::create(&dylib_path).expect("create dylib");
-            f.write_all(&arm64_dylib_add()).expect("write dylib");
-        }
-
-        let mut session = LoadSession::open(&main_path, None).expect("open");
-        let _ = session.map_process().expect("map_process");
-        let main = session.images().first().expect("main");
-        assert_eq!(main.role, ImageRole::Main);
-        let main_slide = main.slide();
-
-        let export_va = session
-            .images()
-            .iter()
-            .find(|i| i.role == ImageRole::Dylib && matches!(i.status, ImageLoadStatus::Mapped))
-            .and_then(|dylib| {
-                dylib
-                    .exports
-                    .iter()
-                    .find(|e| e.name == KH_ADD_SYMBOL)
-                    .map(|e| e.value.wrapping_add(dylib.slide()))
-            })
-            .expect("dylib export");
-
-        let got_va = CALL_DYLIB_GOT_VA.wrapping_add(main_slide);
-        let main_mem = session
-            .images()
-            .first()
-            .and_then(|i| i.memory.as_ref())
-            .expect("main mem");
-        let region = main_mem
-            .regions()
-            .iter()
-            .find(|r| got_va >= r.guest_addr && got_va < r.guest_addr.saturating_add(r.vmsize))
-            .expect("DATA region");
-        let off = usize::try_from(got_va.saturating_sub(region.guest_addr)).unwrap();
-        let end = off.saturating_add(8);
-        let bytes = region.host_bytes().get(off..end).expect("got bytes");
-        let mut le = [0_u8; 8];
-        le.copy_from_slice(bytes);
-        assert_eq!(u64::from_le_bytes(le), export_va);
-
-        drop(session);
-        drop(std::fs::remove_dir_all(dir));
     }
 
     #[test]

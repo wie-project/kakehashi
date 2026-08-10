@@ -96,6 +96,29 @@ copies from embed / resources / optional override.
 When hypercall is wired, freestanding `syscall7` calls `kh_bsd_hypercall`
 (thin AAPCS call into host entry), not `svc #0x80`.
 
+### Source layout
+
+Single product dylib; tree mirrors Darwin dylib/framework names for
+contributors (not multi-dylib link):
+
+```text
+crates/kh-libsystem/src/
+  core/                 # kh_core: sys, errno, heap, process, helpers, trace
+  dylib/
+    libsystem_c/        # POSIX C, stdio, string, net, dl, regex, …
+    libsystem_pthread/
+    libsystem_kernel/   # docs slot; numbers live in core/sys
+    libsystem_malloc/   # docs slot; heap lives in core/heap
+    libcurl/  libz/  libiconv/
+    libcxx/   libcxxabi/
+    libobjc/  libdispatch/  libdyld/  …
+  frameworks/
+    corefoundation.rs  security.rs  coreservices.rs
+```
+
+Add new freestanding symbols under the matching `dylib/` or `frameworks/`
+folder; substrate (helpers, hypercall) under `core/`.
+
 ## Syscall path
 
 | Mode | Mechanism | Use |
@@ -131,7 +154,7 @@ Register and stack discipline: [Invariants](invariants.md).
 | Unit + clippy | `cargo test/clippy --workspace --exclude kh-libsystem` |
 | libSystem ABI change | Rebuild + `stage-libsystem.sh` |
 | Docker smoke | `./scripts/docker-smoke.sh` |
-| Multi-thread | `./scripts/docker-7zz.sh` with `-mmt=4 -mx=5` (see [Threading](threading.md)) |
+| Multi-thread | `./scripts/docker-kh.sh 7zz --` with `-mmt=4 -mx=5` (see [Threading](threading.md)) |
 
 Durable guest output: host `.tmp/` or `KH_OUT` → guest `/Volumes/linux/out`,
 not ephemeral container `/tmp`.
