@@ -1,10 +1,8 @@
-//! Freestanding `std::__1::__sort` instantiations for Apple clang.
+//! Freestanding `std::__1::__sort` instantiations for Apple clang / modern `ld`.
 //!
-//! Observed imports (clang driver / -cc1):
-//! `__sort<__less<T>&, T*>` for `char`, `int`, `unsigned`, `unsigned short`.
-//! Comparator is unused (always `__less`); we sort ascending in-place.
-//!
-//! Clean-room heapsort — not a paste of libc++.
+//! Observed imports: `__sort<__less<T>&, T*>` for `char`, `int`, `unsigned`,
+//! `unsigned short`, and `unsigned long long` (`yy`). Comparator unused
+//! (always `__less`); ascending in-place heapsort (clean-room).
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -104,6 +102,18 @@ pub(crate) unsafe extern "C" fn sort_uint(first: *mut u32, last: *mut u32, _comp
 /// `void std::__sort<__less<char>&, char*>(…)`
 #[unsafe(export_name = "_ZNSt3__16__sortIRNS_6__lessIccEEPcEEvT0_S5_T_")]
 pub(crate) unsafe extern "C" fn sort_char(first: *mut i8, last: *mut i8, _comp: *mut c_void) {
+    unsafe {
+        heapsort(first, last);
+    }
+}
+
+/// `void std::__sort<__less<unsigned long long>&, unsigned long long*>(…)`
+///
+/// Itanium: `yy` = `unsigned long long`. Observed: modern Apple `ld` binds this
+/// strongly; without it the miss trampoline is never *called* on the undef
+/// print path, but other tables may invoke it.
+#[unsafe(export_name = "_ZNSt3__16__sortIRNS_6__lessIyyEEPyEEvT0_S5_T_")]
+pub(crate) unsafe extern "C" fn sort_ull(first: *mut u64, last: *mut u64, _comp: *mut c_void) {
     unsafe {
         heapsort(first, last);
     }

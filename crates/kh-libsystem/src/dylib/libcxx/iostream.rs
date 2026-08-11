@@ -1191,29 +1191,39 @@ pub(crate) unsafe extern "C" fn get_collation_name(name: *const c_char) -> *cons
 
 /// `ios_base::init(void* sb)`.
 ///
-/// Soft: zero a large ios_base/basic_ios region and store streambuf pointer at
-/// a common `basic_ios` offset. Observed post-init stores at +0x88/+0x90 on the
-/// virtual-base `this`.
+/// Soft: install the streambuf and clear a few known `ios_base` / `basic_ios`
+/// fields. **Do not bulk-zero a large region** — modern Apple `ld`
+/// `checkUndefines` builds a stack `stringstream` whose virtual-base `this`
+/// can sit near (or at) a local `vector` of undefined symbols. A `memset` of
+/// 0x100 (or even 0x90) from that `this` stomps the vector begin/end and yields
+/// empty undef diagnostics:
+/// ```text
+/// Undefined symbols for architecture arm64:
+/// ld: symbol(s) not found for architecture
+/// ```
+/// Field offsets are ABI-observed for Apple arm64 libc++ (not a paste of headers).
 #[unsafe(export_name = "_ZNSt3__18ios_base4initEPv")]
 pub(crate) unsafe extern "C" fn ios_base_init(this: *mut c_void, sb: *mut c_void) {
     ensure_iostream_vtables();
     if this.is_null() {
         return;
     }
-    // Cover ios_base + basic_ios tail used by libc++ arm64.
-    const N: usize = 0x100;
     unsafe {
-        core::ptr::write_bytes(this.cast::<u8>(), 0, N);
-        // Store rdbuf at +0x20 (common basic_ios layout variant) and +0x0.
-        this.cast::<usize>().write(sb as usize);
-        if N > 0x28 {
-            this.cast::<usize>().add(4).write(sb as usize);
-        }
-        // goodbit / default precision-ish
-        if N > 0x90 {
-            this.cast::<u8>().add(0x88).write_bytes(0, 8);
-            // width -1 was written by ld after init; leave zero
-        }
+        let base = this.cast::<u8>();
+        // rdbuf: common placements at +0x00 (some subobjects) and +0x20 (basic_ios).
+        base.cast::<*mut c_void>().write(sb);
+        base.add(0x20).cast::<*mut c_void>().write(sb);
+        // iostate at +0x20.. also used as flags word in some layouts — set goodbit=0
+        // only if not the same slot we just used for rdbuf; use +0x28 for state.
+        base.add(0x28).cast::<u32>().write(0); // rdstate goodbit
+        base.add(0x2c).cast::<u32>().write(0); // exceptions
+        // precision / width (isize pair around +0x30)
+        base.add(0x30).cast::<usize>().write(6); // precision default
+        base.add(0x38).cast::<isize>().write(0); // width
+        // fmtflags at +0x40-ish
+        base.add(0x40).cast::<u32>().write(0x1000); // skipws|dec-ish soft default
+        // clear small tail used by post-init stores (+0x88..+0x90) without a bulk wipe.
+        base.add(0x88).cast::<u64>().write(0);
     }
 }
 

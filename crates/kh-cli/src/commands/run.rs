@@ -1,7 +1,12 @@
 //! Runtime execution commands.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 use anyhow::{Context, Result};
 use kh_loader::{LoadSession, RunOptions, run_micro};
@@ -58,6 +63,13 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         );
     }
 
+    // Bottle host bridges (`/bin/rm`, `/bin/sh`, …) are native Linux ELF, not
+    // Mach-O. Nested guest `execve` already re-execs them on the host; top-level
+    // `kh run rm` should do the same instead of failing with "Invalid magic".
+    if !is_macho_file(&host_open) {
+        return run_host_native(&host_open, &program, args);
+    }
+
     kh_runtime::clear_trace_on_exit();
     kh_runtime::set_expect_code(args.expect_code);
 
@@ -90,6 +102,72 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         }
         Err(err) => Err(map_live_exec_error(err)).context("micro run failed"),
     }
+}
+
+/// Thin/fat Mach-O magic (same set as nested `execve` classification).
+fn is_macho_file(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    matches!(
+        magic,
+        [0xfe, 0xed, 0xfa, 0xcf | 0xce]
+            | [0xcf | 0xce, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+    )
+}
+
+/// Run a bottle host-bridge (ELF / script) without the Mach-O translator.
+///
+/// Mirrors nested `reexec_direct`: the process is native Linux. Exit code is
+/// checked against `--expect-code` like a guest run.
+fn run_host_native(host_open: &Path, program: &Path, args: &RunArgs<'_>) -> Result<()> {
+    // Prefer the real host path after symlink resolution so argv0 is a path
+    // the kernel can exec (bottle `bin/rm` → `…/Volumes/linux/bin/rm` → `/bin/rm`).
+    let exec_path = std::fs::canonicalize(host_open).unwrap_or_else(|_| host_open.to_path_buf());
+
+    let mut cmd = Command::new(&exec_path);
+    cmd.args(args.guest_args);
+    // argv0: guest-facing name when available (e.g. `rm`), else basename.
+    let argv0 = program
+        .file_name()
+        .and_then(|s| s.to_str())
+        .or_else(|| exec_path.file_name().and_then(|s| s.to_str()))
+        .unwrap_or("kh-host");
+    #[cfg(unix)]
+    {
+        cmd.arg0(argv0);
+    }
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to exec host binary {}", exec_path.display()))?;
+
+    let code = status.code().unwrap_or_else(|| {
+        // Signal death on Unix: map to 128+sig like shells (best-effort).
+        #[cfg(unix)]
+        {
+            status.signal().map_or(1, |s| 128_i32.saturating_add(s))
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+
+    if code != args.expect_code {
+        anyhow::bail!(
+            "host exit code {code} != expected {} ({})",
+            args.expect_code,
+            program.display()
+        );
+    }
+    std::process::exit(code);
 }
 
 /// Host filesystem path used to open/map the Mach-O.

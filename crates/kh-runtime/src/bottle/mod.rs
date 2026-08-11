@@ -35,9 +35,9 @@ pub use guest_tools::{
 };
 pub use layout::{
     GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_SSH_REL,
-    MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX, ensure_dev_nodes, ensure_host_bin_bridges,
-    ensure_host_ssh_bridge, ensure_libcurl_symlink, ensure_libcxx_symlink, has_host_ssh_bridge,
-    has_libcurl_symlink, has_libcxx_symlink, is_bottle_root, materialize,
+    MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX, ensure_developer_shims, ensure_dev_nodes,
+    ensure_host_bin_bridges, ensure_host_ssh_bridge, ensure_libcurl_symlink, ensure_libcxx_symlink,
+    has_host_ssh_bridge, has_libcurl_symlink, has_libcxx_symlink, is_bottle_root, materialize,
 };
 pub use libsystem::{
     EMBEDDED_SOURCE_LABEL, ENV_LIBSYSTEM, GUEST_LIBSYSTEM_ID, GUEST_LIBSYSTEM_REL,

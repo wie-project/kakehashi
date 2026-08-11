@@ -168,6 +168,11 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
         }
     };
 
+    // After xcrun is on disk: Apple-style `/usr/bin/clang` → `xcrun` shims.
+    if let Err(e) = layout::ensure_developer_shims(&target) {
+        tracing::warn!(error = %e, "failed to install developer shims");
+    }
+
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(&target) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");
     }
@@ -329,6 +334,10 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_host_bin_bridges(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
     let xcrun = install_xcrun_for_create(path)?;
+    // CLT-style `/usr/bin` shims need guest xcrun present first.
+    if let Err(e) = layout::ensure_developer_shims(path) {
+        tracing::warn!(error = %e, "failed to install developer shims");
+    }
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");

@@ -13,6 +13,9 @@ use crate::kh_core::heap::{allocate_aligned, free, malloc};
 use crate::kh_core::process::exit_now;
 use crate::kh_core::trace;
 
+/// Soft `std::exception::what()` function pointer type (Itanium vtable slot).
+type ExceptionWhatFn = unsafe extern "C" fn(*mut c_void) -> *const u8;
+
 /// `std::nothrow` → nlist `__ZSt7nothrow` (empty tag object).
 ///
 /// Observed: Apple `libtapi` / `ld-classic` (G4).
@@ -496,7 +499,8 @@ pub(crate) unsafe extern "C" fn this_thread_sleep_for_ns(dur: *const i64) {
     ts[1] = nsec;
     // SAFETY: stack timespec for freestanding nanosleep.
     unsafe {
-        let _ = crate::dylib::libsystem_c::posix::nanosleep(ts.as_ptr().cast(), core::ptr::null_mut());
+        let _ =
+            crate::dylib::libsystem_c::posix::nanosleep(ts.as_ptr().cast(), core::ptr::null_mut());
     }
 }
 
@@ -549,12 +553,20 @@ pub(crate) unsafe extern "C" fn cxa_free_exception(ptr: *mut c_void) {
 /// Dumps typeinfo name + a best-effort message so G4 (ld-classic/libtapi) can
 /// show *why* a throw happened (TBD parse, string, etc.). Real catch/unwind is
 /// still out of scope — freestanding aborts after the note.
+///
+/// Message sources (first hit wins):
+/// 1. `throw "literal"` / pointer-to-C-string object
+/// 2. Inline C-string object bytes
+/// 3. Virtual `what()` for `std::exception` hierarchy (vtable slot after dtor)
 #[unsafe(export_name = "__cxa_throw")]
 pub(crate) unsafe extern "C" fn cxa_throw(
     exception: *mut c_void,
     tinfo: *mut c_void,
     _dest: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> ! {
+    // Prefer a host-visible line on stderr so nested `kh run` / clang drivers
+    // surface the throw even when the guest already printed a partial report.
+    // Keep the [kh-libsystem] prefix for log grepping.
     trace::force_note(b"[kh-libsystem] ___cxa_throw (stub abort)");
     // Itanium `std::type_info`: vptr @0, `const char* __type_name` @8.
     if !tinfo.is_null() {
@@ -566,17 +578,31 @@ pub(crate) unsafe extern "C" fn cxa_throw(
         }
     }
     if !exception.is_null() {
-        // `throw "literal"` / `throwf`: object is often a `char const*` value,
-        // or a small struct whose first word is a C string.
+        let mut printed = false;
+        // `throw "literal"` / `throwf`: object is often a `char const*` value.
         // SAFETY: exception blob written by throw site after allocate_exception.
         let as_ptr = unsafe { exception.cast::<*const u8>().read() };
         if cstr_looks_printable(as_ptr, 200) {
             trace::force_note(b" msg=");
             force_note_cstr(as_ptr, 200);
+            printed = true;
         } else if cstr_looks_printable(exception.cast::<u8>(), 200) {
-            // Object itself is inline C string bytes (rare).
             trace::force_note(b" msg=");
             force_note_cstr(exception.cast::<u8>(), 200);
+            printed = true;
+        }
+        if !printed {
+            // Best-effort `std::exception::what()`: Apple arm64 libc++ places
+            // complete-object vptr at [exception+0]; after primary dtor the next
+            // slot is typically `what() const` → `char const*`.
+            // SAFETY: only call if the vtable pointer looks like a guest code/data
+            // address (non-null, 8-byte aligned).
+            if let Some(p) = unsafe { try_exception_what(exception) }
+                && cstr_looks_printable(p, 200)
+            {
+                trace::force_note(b" what=");
+                force_note_cstr(p, 200);
+            }
         }
     }
     // Return address helps map to libtapi / ld-classic text.
@@ -589,6 +615,146 @@ pub(crate) unsafe extern "C" fn cxa_throw(
     unsafe {
         exit_now(1);
     }
+}
+
+/// Try `exception->vtable[1]()` as `const char* what() const` (Itanium-ish).
+///
+/// Returns `None` if the layout does not look like a vtable-bearing object.
+unsafe fn try_exception_what(exception: *mut c_void) -> Option<*const u8> {
+    if exception.is_null() {
+        return None;
+    }
+    // SAFETY: guest exception object; first word is usually the vptr.
+    let vptr = unsafe { exception.cast::<*const usize>().read() };
+    if vptr.is_null() || (vptr.addr() & 7) != 0 {
+        return None;
+    }
+    // Slot 0 = dtor, slot 1 = what() on std::exception / runtime_error.
+    // SAFETY: vtable lives in the throwing image's r/o data.
+    let what_fn = unsafe { vptr.add(1).read() };
+    if what_fn == 0 || (what_fn & 3) != 0 {
+        return None;
+    }
+    // SAFETY: soft call into guest vtable; may SEGV if wrong — only used on
+    // the throw-abort diagnostic path after other probes failed.
+    let f: ExceptionWhatFn = unsafe { core::mem::transmute(what_fn) };
+    let p = unsafe { f(exception) };
+    if p.is_null() { None } else { Some(p) }
+}
+
+/// `___cxa_demangle` → nlist `___cxa_demangle` (Itanium ABI / libc++abi).
+///
+/// Soft demangler for freestanding guests (modern `ld` binds this from the
+/// libc++ install name, which the bottle aliases to this dylib).
+///
+/// * Invalid / non-`_Z…` → status `-2`, return null (caller keeps original).
+/// * `_Z…` → status `0` and a **malloc'd copy of the mangled name** so
+///   diagnostics never drop the symbol text. Not a full Itanium demangler;
+///   `ld`/`clang` only need a non-null result for C++ names.
+/// * OOM → status `-1`, return null.
+#[unsafe(export_name = "__cxa_demangle")]
+pub(crate) unsafe extern "C" fn cxa_demangle(
+    mangled_name: *const c_char,
+    output_buffer: *mut c_char,
+    length: *mut usize,
+    status: *mut c_int,
+) -> *mut c_char {
+    let set_status = |code: c_int| {
+        if !status.is_null() {
+            // SAFETY: caller-provided status out-param.
+            unsafe {
+                status.write(code);
+            }
+        }
+    };
+    if mangled_name.is_null() {
+        set_status(-2);
+        return core::ptr::null_mut();
+    }
+    // SAFETY: NUL-terminated mangled name from the guest.
+    let n = unsafe { cstr_len_capped(mangled_name, 4096) };
+    if n == 0 {
+        set_status(-2);
+        return core::ptr::null_mut();
+    }
+    // Itanium: `_Z…` (caller usually stripped one Darwin leading `_` already).
+    let b0 = unsafe { mangled_name.cast::<u8>().read() };
+    let b1 = if n >= 2 {
+        unsafe { mangled_name.cast::<u8>().add(1).read() }
+    } else {
+        0
+    };
+    if b0 != b'_' || b1 != b'Z' {
+        set_status(-2);
+        return core::ptr::null_mut();
+    }
+
+    let out_len = n.saturating_add(1); // +NUL
+    let buf: *mut u8 = if output_buffer.is_null() {
+        let nbuf = unsafe { malloc(out_len) }.cast::<u8>();
+        if nbuf.is_null() {
+            set_status(-1);
+            return core::ptr::null_mut();
+        }
+        if !length.is_null() {
+            unsafe {
+                length.write(out_len);
+            }
+        }
+        nbuf
+    } else {
+        let have = if length.is_null() {
+            0
+        } else {
+            // SAFETY: optional length in/out.
+            unsafe { length.read() }
+        };
+        if have >= out_len {
+            output_buffer.cast()
+        } else {
+            let nbuf = unsafe { malloc(out_len) }.cast::<u8>();
+            if nbuf.is_null() {
+                set_status(-1);
+                return core::ptr::null_mut();
+            }
+            if !length.is_null() {
+                unsafe {
+                    length.write(out_len);
+                }
+            }
+            // ABI: previous buffer was malloc-family; free it after realloc.
+            unsafe {
+                free(output_buffer.cast());
+            }
+            nbuf
+        }
+    };
+
+    // SAFETY: buf has out_len bytes; mangled_name has n bytes + NUL.
+    unsafe {
+        core::ptr::copy_nonoverlapping(mangled_name.cast::<u8>(), buf, n);
+        buf.add(n).write(0);
+    }
+    set_status(0);
+    buf.cast()
+}
+
+/// Length of a C string, capped at `max` (does not include the NUL).
+unsafe fn cstr_len_capped(p: *const c_char, max: usize) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let mut n = 0_usize;
+    // SAFETY: bounded scan of guest C string.
+    unsafe {
+        while n < max {
+            if p.add(n).read() == 0 {
+                break;
+            }
+            n = n.saturating_add(1);
+        }
+    }
+    n
 }
 
 /// Best-effort return address of the throw site (LR at entry to this stub).

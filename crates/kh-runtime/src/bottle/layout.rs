@@ -228,34 +228,266 @@ pub fn has_host_ssh_bridge(root: &Path) -> bool {
     }
 }
 
-/// Host ELF bridges under guest `/bin` (shell for `GIT_SSH_COMMAND`, etc.).
-const HOST_BIN_BRIDGES: &[(&str, &str)] = &[
-    // `git` runs `GIT_SSH_COMMAND` as `sh -c '…' "$@"` — needs a real shell.
-    ("bin/sh", "../Volumes/linux/bin/sh"),
-    ("bin/bash", "../Volumes/linux/bin/bash"),
+/// Host directories mirrored into the bottle via `Volumes/linux`.
+///
+/// Each entry is `(guest_rel_dir, host_abs_dir)`. On merged-/usr distros
+/// `/bin` and `/usr/bin` list the same names; we still create both guest
+/// locations so macOS-style PATH (`/usr/bin` then `/bin`) resolves.
+const HOST_UTIL_DIRS: &[(&str, &str)] = &[
+    ("bin", "/bin"),
+    ("sbin", "/sbin"),
+    ("usr/bin", "/usr/bin"),
+    ("usr/sbin", "/usr/sbin"),
 ];
 
-/// Ensure guest `/bin/sh` (and friends) → host shells via the Linux bridge.
+/// Tool basenames that must **not** become host-ELF bridges.
+///
+/// These are Darwin toolchain / CLT names. Bridging the host copy would let a
+/// Linux `clang`/`ld`/`make` shadow Apple tools when guests use absolute
+/// `/usr/bin/…` paths, or when CLT is not installed yet. Prefer CLT binaries
+/// or [`ensure_developer_shims`] (`/usr/bin/clang` → `xcrun`).
+const HOST_BRIDGE_DENY: &[&str] = &[
+    // Compilers / drivers
+    "clang",
+    "clang++",
+    "clang-cl",
+    "clang-cpp",
+    "clangd",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "cpp",
+    "gcc-ar",
+    "gcc-nm",
+    "gcc-ranlib",
+    // Linkers / assemblers / binutils used by Apple toolchains
+    "ld",
+    "ld-classic",
+    "ld64",
+    "lld",
+    "lld-link",
+    "gold",
+    "ar",
+    "ranlib",
+    "as",
+    "nm",
+    "objdump",
+    "objcopy",
+    "strip",
+    "size",
+    "strings",
+    "dsymutil",
+    "lipo",
+    "install_name_tool",
+    "libtool",
+    "otool",
+    "codesign",
+    "vtool",
+    "tapi",
+    // Build drivers / Xcode select surface
+    "make",
+    "gnumake",
+    "xcodebuild",
+    "xcrun",
+    "xcode-select",
+    "swift",
+    "swiftc",
+    // Prefer bottle CLT / freestanding installs over host copies
+    "git",
+    "git-receive-pack",
+    "git-upload-pack",
+    "git-upload-archive",
+    "git-shell",
+    // OpenSSH is installed explicitly as a host bridge at `usr/bin/ssh`
+    // with a fixed relative target; skip auto so we never thrash it.
+    "ssh",
+    "ssh-add",
+    "ssh-agent",
+    "ssh-keygen",
+    "ssh-keyscan",
+    "scp",
+    "sftp",
+];
+
+/// Apple-style `/usr/bin` trampolines → guest `xcrun` (same directory).
+///
+/// Real macOS ships many of these as thin stubs that `execv` into xcrun.
+/// When CLT is present, xcrun resolves the real tool under
+/// `DEVELOPER_DIR`; when missing, guests get a clear xcrun error instead of
+/// a silent Linux toolchain.
+const DEVELOPER_SHIMS: &[&str] = &[
+    "clang",
+    "clang++",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "cpp",
+    "ld",
+    "as",
+    "nm",
+    "ar",
+    "ranlib",
+    "strip",
+    "otool",
+    "dsymutil",
+    "lipo",
+    "install_name_tool",
+    "libtool",
+    "codesign",
+    "size",
+    "strings",
+    "objdump",
+    "make",
+    "gnumake",
+];
+
+/// Relative symlink target: from `guest_rel` (e.g. `usr/bin/touch`) to
+/// `Volumes/linux{host_abs}` (e.g. `/usr/bin/touch`).
+fn volumes_linux_rel_target(guest_rel: &str, host_abs: &str) -> String {
+    let depth = Path::new(guest_rel)
+        .parent()
+        .map_or(0, |p| p.components().count());
+    let host_tail = host_abs.trim_start_matches('/');
+    let mut out = String::with_capacity(
+        depth
+            .saturating_mul(3)
+            .saturating_add(VOLUMES_LINUX.len())
+            .saturating_add(host_tail.len())
+            .saturating_add(2),
+    );
+    for _ in 0..depth {
+        out.push_str("../");
+    }
+    out.push_str(VOLUMES_LINUX);
+    out.push('/');
+    out.push_str(host_tail);
+    out
+}
+
+/// Install or repair one relative symlink at `root/guest_rel` → `target`.
+///
+/// * Missing → create.
+/// * Correct symlink → no-op.
+/// * Wrong symlink → replace.
+/// * Non-symlink file → leave alone (real bottle install wins).
+fn ensure_rel_symlink(root: &Path, guest_rel: &str, target: &str) -> io::Result<()> {
+    let link_path = root.join(guest_rel);
+    if let Ok(meta) = link_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let cur = fs::read_link(&link_path)?;
+            if cur == Path::new(target) {
+                return Ok(());
+            }
+            fs::remove_file(&link_path)?;
+        } else {
+            return Ok(());
+        }
+    }
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, &link_path)
+}
+
+/// Whether `name` is a safe basename for an auto host bridge (no path seps).
+fn is_safe_util_basename(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    // Reject absolute/relative path smuggling and exotic names.
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    true
+}
+
+fn is_host_bridge_denied(name: &str) -> bool {
+    HOST_BRIDGE_DENY.contains(&name)
+}
+
+/// Ensure guest `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin` utilities exist as
+/// host-ELF bridges via `Volumes/linux`.
+///
+/// **Why bridges (not clean-room reimplementations, not full macOS base):**
+/// base tools like `rm` / `touch` are ordinary host Linux binaries; guest
+/// `execve` already re-execs non-Mach-O paths natively (`reexec_direct`) with
+/// host-env rewrite. Shipping Apple's userland would bloat the bottle and
+/// conflict with redistribution limits.
+///
+/// **Toolchain denylist:** names in [`HOST_BRIDGE_DENY`] are skipped so a
+/// host `clang` cannot appear at guest `/usr/bin/clang`. Use CLT paths or
+/// [`ensure_developer_shims`].
 ///
 /// Idempotent. Skips paths that already exist as non-symlink files.
 pub fn ensure_host_bin_bridges(root: &Path) -> io::Result<()> {
-    for &(rel, target) in HOST_BIN_BRIDGES {
-        let link_path = root.join(rel);
-        if let Ok(meta) = link_path.symlink_metadata() {
-            if meta.file_type().is_symlink() {
-                let cur = fs::read_link(&link_path)?;
-                if cur == Path::new(target) {
-                    continue;
-                }
-                fs::remove_file(&link_path)?;
-            } else {
+    // Minimal shells always (even if host dir scan fails in odd chroots).
+    ensure_rel_symlink(
+        root,
+        "bin/sh",
+        &volumes_linux_rel_target("bin/sh", "/bin/sh"),
+    )?;
+    ensure_rel_symlink(
+        root,
+        "bin/bash",
+        &volumes_linux_rel_target("bin/bash", "/bin/bash"),
+    )?;
+
+    for &(guest_dir, host_dir) in HOST_UTIL_DIRS {
+        let host_path = Path::new(host_dir);
+        let entries = match fs::read_dir(host_path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            if !is_safe_util_basename(name) || is_host_bridge_denied(name) {
                 continue;
             }
+            // Only regular files and symlinks to tools — not subdirectories
+            // (e.g. /usr/bin/X11) or sockets.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_file() && !ft.is_symlink() {
+                continue;
+            }
+            // Symlink to a directory → skip (merged trees sometimes have these).
+            if ft.is_symlink() {
+                let full = entry.path();
+                if full.is_dir() {
+                    continue;
+                }
+            }
+            let guest_rel = format!("{guest_dir}/{name}");
+            let host_abs = format!("{host_dir}/{name}");
+            let target = volumes_linux_rel_target(&guest_rel, &host_abs);
+            ensure_rel_symlink(root, &guest_rel, &target)?;
         }
-        if let Some(parent) = link_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        std::os::unix::fs::symlink(target, &link_path)?;
+    }
+    Ok(())
+}
+
+/// Ensure Apple-style `/usr/bin/<tool>` shims → `xcrun` when guest xcrun exists.
+///
+/// Idempotent. No-op if `{root}/usr/bin/xcrun` is missing. Does not replace
+/// a real (non-symlink) binary at the shim path.
+pub fn ensure_developer_shims(root: &Path) -> io::Result<()> {
+    // Same-directory relative target so the bottle stays relocatable.
+    const TARGET: &str = "xcrun";
+    let xcrun = root.join("usr/bin/xcrun");
+    if !xcrun.is_file() {
+        return Ok(());
+    }
+    for name in DEVELOPER_SHIMS {
+        let guest_rel = format!("usr/bin/{name}");
+        ensure_rel_symlink(root, &guest_rel, TARGET)?;
     }
     Ok(())
 }
@@ -407,6 +639,24 @@ mod tests {
         let sh = fs::read_link(root.join("bin/sh")).expect("bin/sh readlink");
         assert_eq!(sh, Path::new("../Volumes/linux/bin/sh"));
 
+        // Core utils are auto-bridged when present on the host (Linux CI / UTM).
+        // On macOS hosts the paths may be absent — then only the hard-coded
+        // shell bridges are required.
+        if Path::new("/bin/rm").is_file() || Path::new("/usr/bin/rm").is_file() {
+            let rm = root.join("bin/rm");
+            assert!(
+                rm.symlink_metadata().is_ok(),
+                "expected host bridge at bin/rm when host has rm"
+            );
+            // Must not bridge denied toolchain names even if host has them.
+            assert!(
+                !root.join("usr/bin/clang").exists()
+                    || fs::read_link(root.join("usr/bin/clang"))
+                        .map_or(true, |t| t == Path::new("xcrun")),
+                "clang must not be a host-ELF bridge"
+            );
+        }
+
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));
 
@@ -420,6 +670,53 @@ mod tests {
         ensure_host_bin_bridges(&root).expect("bin bridges again");
 
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn volumes_linux_rel_target_depth() {
+        assert_eq!(
+            volumes_linux_rel_target("bin/rm", "/bin/rm"),
+            "../Volumes/linux/bin/rm"
+        );
+        assert_eq!(
+            volumes_linux_rel_target("usr/bin/touch", "/usr/bin/touch"),
+            "../../Volumes/linux/usr/bin/touch"
+        );
+        assert_eq!(
+            volumes_linux_rel_target("usr/sbin/adduser", "/usr/sbin/adduser"),
+            "../../Volumes/linux/usr/sbin/adduser"
+        );
+    }
+
+    #[test]
+    fn developer_shims_point_at_xcrun() {
+        let root = temp_root("shims");
+        materialize(&root).expect("materialize");
+        // Fake guest xcrun (empty file is enough for is_file).
+        let xcrun = root.join("usr/bin/xcrun");
+        fs::write(&xcrun, b"fake").expect("write xcrun");
+        ensure_developer_shims(&root).expect("shims");
+        let clang = fs::read_link(root.join("usr/bin/clang")).expect("clang shim");
+        assert_eq!(clang, Path::new("xcrun"));
+        let make = fs::read_link(root.join("usr/bin/make")).expect("make shim");
+        assert_eq!(make, Path::new("xcrun"));
+        // Real file must not be replaced.
+        fs::write(root.join("usr/bin/gcc"), b"real-gcc").expect("gcc file");
+        ensure_developer_shims(&root).expect("shims again");
+        assert_eq!(
+            fs::read(root.join("usr/bin/gcc")).expect("read gcc"),
+            b"real-gcc"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn host_bridge_denies_toolchain_names() {
+        assert!(is_host_bridge_denied("clang"));
+        assert!(is_host_bridge_denied("make"));
+        assert!(is_host_bridge_denied("git"));
+        assert!(!is_host_bridge_denied("rm"));
+        assert!(!is_host_bridge_denied("touch"));
     }
 
     #[test]
@@ -457,5 +754,4 @@ mod tests {
         drop(fs::remove_file(&host_file));
         fs::remove_dir_all(&root).expect("cleanup");
     }
-
 }

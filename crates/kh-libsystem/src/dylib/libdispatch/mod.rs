@@ -187,6 +187,11 @@ pub(crate) unsafe extern "C" fn dispatch_group_wait(group: *mut c_void, _timeout
 }
 
 /// `dispatch_apply` — run serially `iterations` times.
+///
+/// Real GCD accepts `queue == NULL` (global concurrent). Soft ignores the
+/// queue and always runs on the calling thread so modern Apple `ld`
+/// `checkUndefines` still populates its local undef vector (it drives the
+/// collect via `dispatch_apply` + a stack block).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dispatch_apply(
     iterations: usize,
@@ -194,9 +199,11 @@ pub(crate) unsafe extern "C" fn dispatch_apply(
     block: *mut c_void,
 ) {
     let _ = queue;
-    if block.is_null() {
+    if block.is_null() || iterations == 0 {
         return;
     }
+    // Cap runaway iteration counts from corrupted options (soft).
+    let iters = iterations.min(1 << 20);
     // Block invoke for apply takes (block, index).
     unsafe {
         let invoke = block_invoke_ptr(block);
@@ -206,7 +213,7 @@ pub(crate) unsafe extern "C" fn dispatch_apply(
         let f: DispatchApplyFn = core::mem::transmute(invoke);
         if let Some(func) = f {
             let mut idx = 0_usize;
-            while idx < iterations {
+            while idx < iters {
                 func(block, idx);
                 idx = idx.saturating_add(1);
             }

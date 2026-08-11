@@ -71,9 +71,9 @@ enum Command {
         host_page_size: bool,
     },
 
-    /// Run a Mach-O binary under the translation layer.
+    /// Run a guest program (Mach-O under the translator; host ELF bridges natively).
     Run {
-        /// Path to the main executable.
+        /// Guest or host path (bare names search the bottle PATH).
         path: PathBuf,
 
         /// Bottle root (also `KAKEHASHI_ROOT`).

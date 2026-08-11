@@ -21,14 +21,26 @@ pub(crate) unsafe extern "C" fn __toupper(c: c_int) -> c_int {
 }
 
 /// C `memcmp` → nlist `_memcmp`.
+///
+/// **Null handling:** `nbytes == 0` is equal (POSIX). If `nbytes > 0` and either
+/// pointer is null, return non-zero (unequal). Soft used to return 0 on null,
+/// which made modern Apple `ld` `checkUndefines` treat every symbol as a match
+/// against an empty/null filter entry and drop the entire undefined list —
+/// diagnostics became only the header/footer with no symbol names.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn memcmp(
     s1: *const c_void,
     s2: *const c_void,
     nbytes: usize,
 ) -> c_int {
-    if nbytes == 0 || s1.is_null() || s2.is_null() {
+    if nbytes == 0 {
         return 0;
+    }
+    if s1.is_null() || s2.is_null() {
+        // Distinct nullness → unequal; both null with nbytes>0 is still
+        // undefined in C, but report unequal so filter logic does not
+        // silently match everything.
+        return if s1.is_null() == s2.is_null() { 1 } else { -1 };
     }
     // SAFETY: caller guarantees `nbytes` readable bytes on both sides.
     unsafe {
@@ -85,8 +97,10 @@ pub(crate) unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_cha
 /// C `strcmp` → nlist `_strcmp`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int {
+    // Null is not equal to a real string (soft used to return 0 and broke
+    // modern `ld` undef filtering / demangle helpers that pass provisional ptrs).
     if s1.is_null() || s2.is_null() {
-        return 0;
+        return if s1.is_null() == s2.is_null() { 1 } else { -1 };
     }
     // SAFETY: NUL-terminated C strings.
     unsafe {
@@ -573,8 +587,11 @@ pub(crate) unsafe extern "C" fn strcat(dst: *mut c_char, src: *const c_char) -> 
 /// C `strncmp` → nlist `_strncmp`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strncmp(s1: *const c_char, s2: *const c_char, n: usize) -> c_int {
-    if n == 0 || s1.is_null() || s2.is_null() {
+    if n == 0 {
         return 0;
+    }
+    if s1.is_null() || s2.is_null() {
+        return if s1.is_null() == s2.is_null() { 1 } else { -1 };
     }
     unsafe {
         let mut i = 0_usize;

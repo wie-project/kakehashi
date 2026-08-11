@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "kakehashi"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "clap",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "kh-libsystem"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "cc",
  "miniz_oxide",
