@@ -75,3 +75,11 @@ If the user sets a task as a **"cleanup"**, you must execute the explicit reques
 
 - If during your analysis you discover `unsafe` blocks or `#[allow(...)]` attributes that are genuinely redundant, unjustified, and safe to fix without losing performance, treat them as **implicit subtasks**.
 - Include these fixes in your cleanup scope and report them clearly to the user.
+
+# 5. Environment & Tooling Fallbacks (Escape Hatch)
+
+CRITICAL: Kakehashi requires a specific execution environment. If the target system is missing required tools, do not loop or crash. Follow this fallback protocol:
+
+- **Missing rtk wrapper:** If running `rtk` results in a "command not found" error, immediately stop. Inform the user that `rtk` is required to reduce token noise and ask for permission to use standard host commands (e.g., raw `cargo clippy`) only if they explicitly allow it.
+- **Missing Docker / VM Environment:** At least one testing environment (Docker/Colima or aarch64 VM) MUST be available. If neither is detected or configured, do not attempt to run integration/smoke tests on an incompatible host. 
+- **Proactive Setup Request:** Clearly list the missing requirements to the user and politely ask for permission to help install them (e.g., offering setup commands or referencing the installation guide), explaining that these are strict project prerequisites for correctness.
