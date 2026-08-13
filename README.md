@@ -1,115 +1,112 @@
 # Kakehashi
 
-Userspace **macOS ARM64 → Linux aarch64** translation layer. CLI-first, no JIT,
-no instruction emulator.
+Userspace **macOS ARM64 → Linux aarch64** translation layer. CLI-first, no JIT, no instruction emulator.
 
-It loads Darwin Mach-O binaries on Linux, maps a freestanding `libSystem`,
-translates BSD syscalls at the guest–host boundary, and runs real tools
-natively on aarch64.
+It loads Darwin Mach-O binaries on Linux, maps a freestanding `libSystem`, translates BSD syscalls at the guest–host boundary, and runs real tools natively on aarch64.
 
-| | |
-| --- | --- |
-| Live execution (`kh run`) | **Linux aarch64** only (bare metal, UTM, Colima/Docker) |
-| Dry-load / inspect | Any host (including macOS) |
-| Design docs | [`docs/`](docs/README.md) |
+| Feature / Target              | Environment                                                        |
+| ----------------------------- | ------------------------------------------------------------------ |
+| **Live execution (`kh run`)** | **Linux aarch64** only (bare metal, UTM, Colima, Docker, OrbStack) |
+| **Dry-load (`kh run --dry-load`)** | Any host (including macOS)                                    |
+| **Design docs**               | [`docs/`](docs/README.md)                                          |
 
-## Quick start
+## Installation & Quick Start
 
 ```bash
 cargo install kakehashi
-# or from a checkout:
+# Or from a checkout:
 cargo install --path crates/kh-cli --force
-
-kh bottle ensure
-kh install 7zip          # Darwin 7zz
-kh install curl          # Darwin curl
-kh install xcode-tools   # Apple CLT (git, clang, SDK; public swscan, no Apple ID)
 ```
 
-Relative paths use the **host CWD** of `kh`. Guest `/Volumes/linux/…` maps to
-the host root (`/` → host `/`).
+### Guest Environment Setup (The Bottle)
 
-## What works
+`Kakehashi` requires a guest filesystem root (the "bottle") containing native macOS binaries. **The bottle location is strictly fixed** and cannot be changed.
 
-Verified on **Docker/Colima** and **UTM** (Linux aarch64). Guest code runs as
-native ARM64; the runtime only intervenes at syscalls, threads, and faults.
+1. **Fixed Path Structure:** The runtime looks for the guest environment at:
+
+   ```text
+   ~/.local/share/kakehashi/bottle/
+   ```
+
+   _Storage Constraint:_ Due to filesystem and path mechanics, the bottle **must reside on the host's internal system drive**. External drives, or non-native mount systems (e.g., exFAT) are strictly unsupported.
+
+2. **Manual Binaries Transfer:** Manually copy the following core system directories from your **macOS 26+** installation into the host bottle directory:
+   - `/bin` → `~/.local/share/kakehashi/bottle/bin/`
+   - `/sbin` → `~/.local/share/kakehashi/bottle/sbin/`
+   - `/usr/bin` → `~/.local/share/kakehashi/bottle/usr/bin/`
+
+   _(Note: This base utility set—including `rm`, `zsh`, `codesign`—occupies ~256 MB uncompressed and is critical for runtime isolation)._
+
+3. **Install Xcode Command Line Tools:** Once the base directories are staged, bootstrap the rest of the environment by running:
+   ```bash
+   kh install xcode-tools
+   ```
+   This pulls and unpacks the official Apple CLT (including `clang`, `git`, and the SDK) into your bottle.
+
+_Note: Guest execution uses host CWD. Guest `/Volumes/linux/…` maps directly to host `/`._
+
+## Verified Ecosystem (What Works)
+
+Verified on **Docker/Colima/OrbStack** and **UTM** (Linux aarch64). Guest code runs as native ARM64; the runtime only intervenes at syscalls, threads, and faults.
 
 ### 7-Zip
 
 ```bash
 kh run 7zz -- a demo.7z README.md
 kh run 7zz -- t demo.7z
-# Multi-thread correctness gate:
-kh run 7zz -- a -t7z -m0=lzma2 -mx=5 -mmt=4 mt.7z README.md
-kh run 7zz -- t mt.7z   # Everything is Ok, exit 0
 ```
 
 ### curl
 
 ```bash
 kh run curl -- --version
-kh run curl -- -sS -o body http://example.com/
-kh run curl -- -sS -o https-body https://example.com/
+kh run curl -- -sS -o body http://example.com
 ```
-
-Details: [`docs/curl.md`](docs/curl.md).
 
 ### Apple git (CLT)
 
-Milestone met (G0–G8): local repos, HTTPS/SSH clone and push, large remotes
-(Wine full history, llvm shallow, …).
-
 ```bash
-kh install xcode-tools
 kh run git -- --version
 kh run git -- clone --depth 1 https://github.com/octocat/Hello-World.git hw
 ```
 
-Details: [`docs/git.md`](docs/git.md).
-
 ### Apple clang (CLT)
-
-Milestone met (G0–G5 + LTO): `--version`, compile, multi-file link with modern
-`ld`, `-flto`, and run of the produced Mach-O under `kh`.
 
 ```bash
 kh run clang -- --version
 kh run clang -- -c hello.c -o hello.o
-# Multi-file driver link + run product under kh (see docs/clang.md)
 ```
 
-Same install as git: `kh install xcode-tools`. Details: [`docs/clang.md`](docs/clang.md).
+### Not Claimed Yet
 
-### Not claimed yet
+Full curl feature surface, real Apple Security.framework, git LFS/svn, GUI, codesign, full macOS app stack. Nested `clang`/`ld` processes pay a process-start tax, not a correctness gap.
 
-Full curl feature surface, real Apple Security.framework, git LFS/svn, GUI,
-codesign, full macOS app stack. Multi‑GiB monorepo clones under a fixed wall
-budget are best-effort. Nested `clang`/`ld` processes still pay a start tax
-(process model), not a correctness gap.
+## Reference Hardware & Configuration
 
-## How it works (short)
+The project is explicitly tested and verified stable using the following environment setup:
 
-1. Resolve the **bottle** (guest FS root + freestanding `libSystem.B.dylib`).
-2. Load Mach-O + dylibs; bind symbols; wire the BSD hypercall into the runtime.
-3. Jump to `LC_MAIN`; guest ARM64 runs natively.
-4. Syscalls / helpers / pthread create-exit cross into `kh-runtime` and back.
+- **Build Host (Compiling `kh-libsystem`):** MacBook Pro M1 (2020), 8 GB RAM / 256 GB SSD, running **macOS 26.6.1**.
+- **Test Host (Running `kh run`):** **Ubuntu 26.04 live-server (arm64)** inside UTM on the same M1 Mac host.
 
-Not derived from Darling. No proprietary Apple blobs in-tree. Clean-room process:
-[`docs/legal-method.md`](docs/legal-method.md).
+## How it Works
+
+1. Resolve the static **bottle** path (`~/.local/share/kakehashi/bottle/`).
+2. Load Mach-O + dylibs, bind symbols, and wire the BSD hypercall into the runtime.
+3. Jump to `LC_MAIN`; guest ARM64 runs natively on the CPU.
+4. Syscalls, helpers, and pthread context boundaries cross into `kh-runtime` and back.
+
+_Note: Clean-room development process. Not derived from Darling. No proprietary Apple blobs in-tree._
 
 ## Crates
 
-| Crate | Role |
-| --- | --- |
-| **`kakehashi`** | Binary `kh` (install this) |
-| `kh-loader` | Mach-O parse, map, bind, execute |
-| `kh-runtime` | Memory, traps, BSD syscalls, bottle, threads; embeds `libSystem.B.dylib` |
-| `kh-libsystem` | Freestanding dylib source (`aarch64-apple-darwin` only) |
-| `kh-xcrun` | Clean-room guest `xcrun` (CLT helper) |
+| Crate           | Role                                                                     |
+| --------------- | ------------------------------------------------------------------------ |
+| **`kakehashi`** | Binary `kh` (install this)                                               |
+| `kh-loader`     | Mach-O parse, map, bind, execute                                         |
+| `kh-runtime`    | Memory, traps, BSD syscalls, bottle, threads; embeds `libSystem.B.dylib` |
+| `kh-libsystem`  | Freestanding dylib source (`aarch64-apple-darwin` only)                  |
 
 ### `kh-libsystem` layout
-
-Source mirrors Darwin surfaces (single product dylib, not multi-dylib link):
 
 ```text
 crates/kh-libsystem/src/
@@ -118,52 +115,21 @@ crates/kh-libsystem/src/
   frameworks/     # CoreFoundation, Security, CoreServices (soft)
 ```
 
-After freestanding ABI changes:
-
-```bash
-cargo build -p kh-libsystem --release --target aarch64-apple-darwin
-./scripts/stage-libsystem.sh   # → crates/kh-runtime/resources/libSystem.B.dylib
-```
-
 ## Requirements
 
-- Rust 1.88+
-- **Linux aarch64** for live `kh run` / `kh trace`
-- Page sizes: **4 KiB** (containers) and **16 KiB** (Asahi-class)
+- **Rust 1.88+**
+- **Linux aarch64** for live `kh run`
+- **Page sizes:** 4 KiB and 16 KiB (Asahi-class)
 
-## Performance (honest)
+## Performance
 
-Guest code runs **natively**. Cost is boundary × crossings (TLS, alt stack,
-NEON, dispatch), not an emulator.
+Guest code runs **natively**. Cost is boundary × crossings (TLS, alt stack, NEON, dispatch), not an emulator.
 
-Multi-file `7zz` (`mx=5 mmt=4`, ~14.5k files / ~309 MiB) on bare-metal aarch64:
-about **×1.24** vs native Linux `7zz`. Nested Apple clang still pays process-start
-tax per `-cc1`/`ld` hop; load path has been optimized, wall is not macOS parity.
-
-CI goal is correctness on cheap Linux arm64, not wall-clock parity with macOS.
-See [`docs/roadmap.md`](docs/roadmap.md).
-
-## Develop / test
-
-```bash
-cargo test --workspace --exclude kh-libsystem
-cargo clippy --workspace --exclude kh-libsystem --all-targets -- -D warnings
-./scripts/docker-smoke.sh
-```
-
-| Goal | Command |
-| --- | --- |
-| Unit + clippy | `cargo test` / `clippy` (exclude `kh-libsystem`) |
-| Docker smoke | `./scripts/docker-smoke.sh` |
-| Darwin tools | `./scripts/docker-kh.sh 7zz\|curl\|git\|clang -- …` |
-| Stage libSystem | `./scripts/stage-libsystem.sh` |
-
-Artifacts under host `.tmp/` (gitignored). Guest `/Volumes/linux/out/…` maps to
-`.tmp/kh-out/` via Docker helpers.
+Multi-file `7zz` runs at approximately **×1.24** vs native Linux `7zz`. Nested Apple clang pays a process-start tax per `-cc1`/`ld` hop; the load path is optimized, but wall-clock parity with native macOS is not the primary CI goal. See [`docs/roadmap.md`](docs/roadmap.md).
 
 ## License
 
 Apache-2.0 — [`LICENSE.txt`](LICENSE.txt), [`NOTICE`](NOTICE).
 
-Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md). Architecture and milestones:
-[`docs/`](docs/README.md).
+Detailed documentation: [`docs/`](docs/README.md).
+Contributing guidelines: [`CONTRIBUTING.md`](CONTRIBUTING.md).

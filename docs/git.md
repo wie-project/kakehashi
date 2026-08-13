@@ -56,7 +56,7 @@ Apple CLT does **not** ship OpenSSH (base macOS does). `git` SSH remotes
 | Piece | Location |
 | --- | --- |
 | Guest `/usr/bin/ssh` | Bottle symlink → host `/usr/bin/ssh` via `Volumes/linux` ([`layout::ensure_host_ssh_bridge`](../crates/kh-runtime/src/bottle/layout.rs)) |
-| Guest `/bin/sh` | Host shell bridge ([`layout::ensure_host_bin_bridges`](../crates/kh-runtime/src/bottle/layout.rs)) — required for `GIT_SSH_COMMAND` (`sh -c`) |
+| Guest `/bin/sh` | User-copied macOS prefix (`bin/` from macOS 26+ Apple Silicon) — required for `GIT_SSH_COMMAND` (`sh -c`) |
 | `execve` of host ELF | `reexec_direct` — native Linux OpenSSH (not nested `kh`) |
 | Host env rewrite | `HOME=/Volumes/linux…` → real host `HOME` so `~/.ssh` works |
 | Soft env | `GIT_SSH` / `GIT_SSH_COMMAND` seeded from host (same as other `GIT_*`) |

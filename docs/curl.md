@@ -5,7 +5,7 @@ Product goal: run a **Darwin `curl`** under `kh` on Linux aarch64 and prove
 Colima first, UTM later.
 
 **Method: trace-first.** Download a real Darwin arm64 binary → install into the
-bottle → `kh run` / `kh trace` → implement only what the log shows.
+bottle → `kh run` → implement only what the log shows.
 
 Clean-room rules: [legal-method.md](legal-method.md). See also:
 [roadmap](roadmap.md), [architecture](architecture.md), root

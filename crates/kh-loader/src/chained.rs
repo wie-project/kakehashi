@@ -4,12 +4,15 @@
 //! chains in DATA. Applying chains replaces classic section-array rebase and
 //! classic bind opcodes for those slots.
 //!
-//! Phase 11 supports userspace formats:
+//! Supported userspace formats:
 //! - [`DYLD_CHAINED_PTR_64`] — rebase target is preferred VA
 //! - [`DYLD_CHAINED_PTR_64_OFFSET`] — rebase target is offset from preferred base
+//! - [`DYLD_CHAINED_PTR_ARM64E_USERLAND`] / [`DYLD_CHAINED_PTR_ARM64E_USERLAND24`]
+//!   — 8-byte stride, unauth rebase is a vm offset; bind ordinal 16 or 24 bits.
+//!   Authenticated slots are rewritten as plain pointers (no PAC on Linux).
 //!
 //! Import tables: `DYLD_CHAINED_IMPORT`, `IMPORT_ADDEND`, `IMPORT_ADDEND64`.
-//! Arm64e authenticated formats and multi-start pages are rejected clearly.
+//! Multi-start pages are rejected clearly.
 
 use goblin::mach::Mach;
 use goblin::mach::load_command::CommandVariant;
@@ -29,10 +32,16 @@ pub const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
 /// Page uses multiple starts (not implemented in Phase 11).
 pub const DYLD_CHAINED_PTR_START_MULTI: u16 = 0x8000;
 
+/// Pointer format: arm64e, 8-byte stride, unauth rebase target is a vmaddr.
+pub const DYLD_CHAINED_PTR_ARM64E: u16 = 1;
 /// Pointer format: 64-bit, target is preferred VA (pre-slide).
 pub const DYLD_CHAINED_PTR_64: u16 = 2;
 /// Pointer format: 64-bit, target is offset from preferred image base.
 pub const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
+/// Pointer format: arm64e userland, 16-bit bind ordinal, 8-byte stride.
+pub const DYLD_CHAINED_PTR_ARM64E_USERLAND: u16 = 9;
+/// Pointer format: arm64e userland, 24-bit bind ordinal, 8-byte stride.
+pub const DYLD_CHAINED_PTR_ARM64E_USERLAND24: u16 = 12;
 
 /// Imports without addend (4 bytes each).
 pub const DYLD_CHAINED_IMPORT: u32 = 1;
@@ -54,6 +63,17 @@ pub struct ChainedImport {
     pub addend: i64,
 }
 
+/// Arm64e authentication metadata from an authenticated chain word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtrAuthInfo {
+    /// 16-bit diversity (salt).
+    pub diversity: u16,
+    /// When set, blend [`Self::diversity`] with the slot VA.
+    pub addr_div: bool,
+    /// 0=IA, 1=IB, 2=DA, 3=DB.
+    pub key: u8,
+}
+
 /// Result of decoding one chain pointer word.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainDecode {
@@ -61,6 +81,8 @@ pub enum ChainDecode {
     Rebase {
         /// Final absolute VA.
         value: u64,
+        /// Present when the chain word was authenticated.
+        auth: Option<PtrAuthInfo>,
     },
     /// Import table bind.
     Bind {
@@ -68,6 +90,8 @@ pub enum ChainDecode {
         import_ordinal: usize,
         /// 0..255 addend from the pointer word (`PTR_64`).
         ptr_addend: i64,
+        /// Present when the chain word was authenticated.
+        auth: Option<PtrAuthInfo>,
     },
 }
 
@@ -130,10 +154,11 @@ pub fn apply_chained_fixups(
     let mut writes: Vec<(u64, u64)> = Vec::with_capacity(pending.len());
     for (slot_va, decoded) in pending {
         let value = match decoded {
-            ChainDecode::Rebase { value } => value,
+            ChainDecode::Rebase { value, auth } => sign_decoded(value, auth, slot_va),
             ChainDecode::Bind {
                 import_ordinal,
                 ptr_addend,
+                auth,
             } => {
                 let import = imports.get(import_ordinal).ok_or_else(|| {
                     LoadError::Resolve(format!(
@@ -152,11 +177,12 @@ pub fn apply_chained_fixups(
                 };
                 let resolved =
                     bind::resolve_bind_symbol(cache, session.images(), image_idx, &site)?;
-                if site.addend == 0 {
+                let value = if site.addend == 0 {
                     resolved
                 } else {
                     resolved.wrapping_add(site.addend.cast_unsigned())
-                }
+                };
+                sign_decoded(value, auth, slot_va)
             }
         };
         tracing::debug!(slot = slot_va, value, "chained fixup");
@@ -450,7 +476,7 @@ fn walk_segment(
             let raw = memory.read_u64_le(slot_va).ok_or_else(|| {
                 LoadError::Resolve(format!("chained slot unreadable at {slot_va:#x}"))
             })?;
-            let (next, decoded) = decode_ptr_64(raw, pointer_format, preferred_base, slide)?;
+            let (next, decoded) = decode_ptr(raw, pointer_format, preferred_base, slide)?;
             out.push((slot_va, decoded));
             if next == 0 {
                 break;
@@ -464,16 +490,34 @@ fn walk_segment(
 fn pointer_stride(format: u16) -> Result<u64, LoadError> {
     match format {
         DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => Ok(4),
-        1 => Err(LoadError::NotImplemented("DYLD_CHAINED_PTR_ARM64E")),
+        DYLD_CHAINED_PTR_ARM64E
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND24 => Ok(8),
         7 => Err(LoadError::NotImplemented("DYLD_CHAINED_PTR_ARM64E_KERNEL")),
-        9 => Err(LoadError::NotImplemented(
-            "DYLD_CHAINED_PTR_ARM64E_USERLAND",
-        )),
-        12 => Err(LoadError::NotImplemented(
-            "DYLD_CHAINED_PTR_ARM64E_USERLAND24",
-        )),
         _ => Err(LoadError::NotImplemented(
             "unsupported chained pointer_format",
+        )),
+    }
+}
+
+/// Decode one chain pointer word for a known userspace format.
+pub fn decode_ptr(
+    raw: u64,
+    format: u16,
+    preferred_base: u64,
+    slide: u64,
+) -> Result<(u64, ChainDecode), LoadError> {
+    match format {
+        DYLD_CHAINED_PTR_64 | DYLD_CHAINED_PTR_64_OFFSET => {
+            decode_ptr_64(raw, format, preferred_base, slide)
+        }
+        DYLD_CHAINED_PTR_ARM64E
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND
+        | DYLD_CHAINED_PTR_ARM64E_USERLAND24 => {
+            decode_ptr_arm64e_userland(raw, format, preferred_base, slide)
+        }
+        _ => Err(LoadError::NotImplemented(
+            "decode_ptr: unexpected pointer_format",
         )),
     }
 }
@@ -497,6 +541,7 @@ pub fn decode_ptr_64(
             ChainDecode::Bind {
                 import_ordinal: usize::try_from(ordinal).unwrap_or(usize::MAX),
                 ptr_addend: i64::try_from(addend).unwrap_or(0),
+                auth: None,
             },
         ))
     } else {
@@ -512,8 +557,93 @@ pub fn decode_ptr_64(
                 ));
             }
         };
-        Ok((next, ChainDecode::Rebase { value }))
+        Ok((next, ChainDecode::Rebase { value, auth: None }))
     }
+}
+
+/// Decode `DYLD_CHAINED_PTR_ARM64E_USERLAND` / `_USERLAND24`.
+///
+/// Auth bits are ignored: the runtime writes a plain VA (Linux has no Apple PAC).
+pub fn decode_ptr_arm64e_userland(
+    raw: u64,
+    format: u16,
+    preferred_base: u64,
+    slide: u64,
+) -> Result<(u64, ChainDecode), LoadError> {
+    let auth = (raw >> 63) & 1 != 0;
+    let bind = (raw >> 62) & 1 != 0;
+    let next = (raw >> 51) & 0x7ff;
+    if bind {
+        let ordinal = if format == DYLD_CHAINED_PTR_ARM64E_USERLAND24 {
+            raw & 0xff_ffff
+        } else {
+            raw & 0xffff
+        };
+        let ptr_addend = if auth {
+            0
+        } else {
+            sign_extend_bits((raw >> 32) & 0x7_ffff, 19)
+        };
+        return Ok((
+            next,
+            ChainDecode::Bind {
+                import_ordinal: usize::try_from(ordinal).unwrap_or(usize::MAX),
+                ptr_addend,
+                auth: auth.then(|| ptr_auth_from_raw(raw)),
+            },
+        ));
+    }
+
+    let image_base = preferred_base.wrapping_add(slide);
+    let value = if auth {
+        // Auth rebase target is a 32-bit runtime offset for all arm64e formats.
+        image_base.wrapping_add(raw & 0xffff_ffff)
+    } else {
+        let target = raw & 0x7ff_ffff_ffff;
+        let high8 = (raw >> 43) & 0xff;
+        let unpacked = (high8 << 56) | target;
+        if format == DYLD_CHAINED_PTR_ARM64E {
+            unpacked.wrapping_add(slide)
+        } else {
+            image_base.wrapping_add(unpacked)
+        }
+    };
+    Ok((
+        next,
+        ChainDecode::Rebase {
+            value,
+            auth: auth.then(|| ptr_auth_from_raw(raw)),
+        },
+    ))
+}
+
+fn ptr_auth_from_raw(raw: u64) -> PtrAuthInfo {
+    let diversity = u16::try_from((raw >> 32) & 0xffff).unwrap_or(0);
+    let addr_div = (raw >> 48) & 1 != 0;
+    let key = u8::try_from((raw >> 49) & 0x3).unwrap_or(0);
+    PtrAuthInfo {
+        diversity,
+        addr_div,
+        key,
+    }
+}
+
+fn sign_decoded(value: u64, auth: Option<PtrAuthInfo>, slot_va: u64) -> u64 {
+    let Some(auth) = auth else {
+        return value;
+    };
+    let disc = if auth.addr_div {
+        kh_runtime::host::ptrauth_blend(slot_va, auth.diversity)
+    } else {
+        u64::from(auth.diversity)
+    };
+    kh_runtime::host::ptrauth_sign(value, disc, auth.key)
+}
+
+fn sign_extend_bits(val: u64, bits: u32) -> i64 {
+    let shift = 64_u32.saturating_sub(bits);
+    let shifted = val.wrapping_shl(shift);
+    i64::from_le_bytes(shifted.to_le_bytes()).wrapping_shr(shift)
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +783,8 @@ mod tests {
             dec,
             ChainDecode::Bind {
                 import_ordinal: 0,
-                ptr_addend: 0
+                ptr_addend: 0,
+                auth: None
             }
         );
 
@@ -665,7 +796,8 @@ mod tests {
         assert_eq!(
             dec,
             ChainDecode::Rebase {
-                value: target + slide
+                value: target + slide,
+                auth: None
             }
         );
 
@@ -674,7 +806,8 @@ mod tests {
         assert_eq!(
             dec,
             ChainDecode::Rebase {
-                value: 0x1000_0000 + slide + 0x4000
+                value: 0x1000_0000 + slide + 0x4000,
+                auth: None
             }
         );
     }
@@ -690,5 +823,70 @@ mod tests {
         assert_eq!(imp.name, "_kh_add");
         assert_eq!(imp.lib_ordinal, 1);
         assert!(!imp.weak);
+    }
+
+    #[test]
+    fn decode_userland24_bind_and_rebase() {
+        let base = 0x1000_0000_u64;
+        let slide = 0x2000_u64;
+        // unauth rebase: target=0x4000, next=1, bind=0, auth=0
+        let rebase = 0x4000_u64 | (1_u64 << 51);
+        let (next, dec) =
+            decode_ptr_arm64e_userland(rebase, DYLD_CHAINED_PTR_ARM64E_USERLAND24, base, slide)
+                .unwrap();
+        assert_eq!(next, 1);
+        assert_eq!(
+            dec,
+            ChainDecode::Rebase {
+                value: base + slide + 0x4000,
+                auth: None
+            }
+        );
+
+        // unauth bind24: ordinal=3, addend=-1, next=0, bind=1, auth=0
+        let addend_bits = 0x7_ffff_u64; // 19-bit -1
+        let bind = 3_u64 | (addend_bits << 32) | (1_u64 << 62);
+        let (next, dec) =
+            decode_ptr_arm64e_userland(bind, DYLD_CHAINED_PTR_ARM64E_USERLAND24, base, slide)
+                .unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(
+            dec,
+            ChainDecode::Bind {
+                import_ordinal: 3,
+                ptr_addend: -1,
+                auth: None
+            }
+        );
+
+        // auth rebase: runtimeOffset=0x80, bind=0, auth=1
+        let auth_rebase = 0x80_u64 | (1_u64 << 63);
+        let (_, dec) = decode_ptr_arm64e_userland(
+            auth_rebase,
+            DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+            base,
+            slide,
+        )
+        .unwrap();
+        assert_eq!(
+            dec,
+            ChainDecode::Rebase {
+                value: base + slide + 0x80,
+                auth: Some(PtrAuthInfo {
+                    diversity: 0,
+                    addr_div: false,
+                    key: 0
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn userland24_stride_is_eight() {
+        assert_eq!(
+            pointer_stride(DYLD_CHAINED_PTR_ARM64E_USERLAND24).unwrap(),
+            8
+        );
+        assert_eq!(pointer_stride(DYLD_CHAINED_PTR_ARM64E_USERLAND).unwrap(), 8);
     }
 }

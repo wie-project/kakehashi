@@ -601,7 +601,9 @@ pub fn with_bottle_root<R>(f: impl FnOnce(Option<&Path>) -> R) -> R {
 
 /// Records the guest-visible main executable path for `_NSGetExecutablePath`.
 pub fn set_guest_executable_path(path: Option<String>) {
-    let next = path.filter(|s| !s.is_empty() && !s.contains('\0')).map(Arc::from);
+    let next = path
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
+        .map(Arc::from);
     match GUEST_EXECUTABLE.write() {
         Ok(mut guard) => {
             *guard = next;

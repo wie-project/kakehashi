@@ -39,12 +39,12 @@ pub use bottle::{
     BottleError, BottleStatus, CreateOptions, CreateResult, DARWIN_7ZZ_URL, DARWIN_CURL_URL,
     DEFAULT_7ZZ_PATH, ENV_7ZZ, ENV_CURL, GUEST_7ZZ_REL, GUEST_CURL_REL, GUEST_LIBCURL_REL,
     GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_PATH_DIRS, InstallPackage,
-    InstallReport, PathError, ToolError, active_root, bottle_root, create as create_bottle,
-    create_with as create_bottle_with, destroy as destroy_bottle, discover_7zz, discover_curl,
-    ensure as ensure_bottle, ensure_libcurl_symlink, ensure_libcxx_symlink, guest_path_to_host,
-    has_libcurl_symlink, has_libcxx_symlink, install_package, package_host_path,
-    resolve_guest_program, set_bottle_root, status as bottle_status, translate_path,
-    translate_path_with_root,
+    InstallReport, PathError, ToolError, active_root, bottle_has_macos_prefix, bottle_root,
+    create as create_bottle, create_with as create_bottle_with, destroy as destroy_bottle,
+    discover_7zz, discover_curl, ensure as ensure_bottle, ensure_libcurl_symlink,
+    ensure_libcxx_symlink, guest_path_to_host, has_libcurl_symlink, has_libcxx_symlink,
+    install_package, macos_prefix_hint, package_host_path, resolve_guest_program, set_bottle_root,
+    status as bottle_status, translate_path, translate_path_with_root,
 };
 pub use dyld_table::{
     RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF, clear as dyld_table_clear, dlopen_lookup, dlsym_lookup,

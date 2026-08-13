@@ -19,12 +19,12 @@ pub mod rebase;
 pub mod resolve;
 pub mod session;
 
-pub use bind::{
-    BindResolveCache, BindSite, bind_process, collect_bind_sites, encode_pointer_bind,
-};
+pub use bind::{BindResolveCache, BindSite, bind_process, collect_bind_sites, encode_pointer_bind};
 pub use chained::{
     ChainDecode, ChainedImport, DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET,
-    apply_chained_fixups, bytes_have_chained_fixups, decode_ptr_64, encode_chained_fixups_blob,
+    DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND, DYLD_CHAINED_PTR_ARM64E_USERLAND24,
+    apply_chained_fixups,
+    bytes_have_chained_fixups, decode_ptr, decode_ptr_64, encode_chained_fixups_blob,
     encode_ptr_64_bind, encode_ptr_64_rebase, image_has_chained_fixups,
 };
 pub use deps::{DepEdge, MAX_DYLIBS, is_followable};

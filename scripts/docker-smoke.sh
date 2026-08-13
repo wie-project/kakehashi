@@ -4,7 +4,7 @@
 # What this proves (all exit codes / stdout checked in-script):
 #   - bottle create / ensure / Volumes/linux R-W / destroy
 #   - clang probes (write_exit, puts_hello, printf_hello, return_zero)
-#   - kh trace smoke
+#   - kh run --dry-load smoke
 #
 # This script is pass/fail in the terminal only — it does not leave large
 # artifacts. For inspectable .7z archives see:
@@ -87,36 +87,43 @@ test -f "$BOTTLE/.kakehashi-bottle"
 echo "bottle lifecycle ok"
 
 # Reuse the active bottle for clang probes.
+# Live `kh run` requires the user-copied macOS prefix (bin/sbin/usr/bin).
+# Dry-load works on the skeleton bottle used by this smoke image.
+PREFIX_READY=0
+if [[ -f "$BOTTLE/usr/bin/xcrun" && -f "$BOTTLE/bin/rm" ]]; then
+  PREFIX_READY=1
+fi
+
 if [[ -x tests/clang-probe/write_exit ]]; then
   echo "==> kh run --dry-load (clang write_exit)"
   kh run --dry-load --root "$BOTTLE" tests/clang-probe/write_exit
-
-  echo "==> kh run --expect-code 0 (clang write+exit → hello)"
-  clang_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/write_exit)"
-  test "${clang_out}" = "hello"
 fi
 
-if [[ -x tests/clang-probe/return_zero ]]; then
-  echo "==> kh run --expect-code 0 (clang return 0 from main)"
-  kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/return_zero
-fi
+if [[ "$PREFIX_READY" -eq 1 ]]; then
+  if [[ -x tests/clang-probe/write_exit ]]; then
+    echo "==> kh run --expect-code 0 (clang write+exit → hello)"
+    clang_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/write_exit)"
+    test "${clang_out}" = "hello"
+  fi
 
-if [[ -x tests/clang-probe/puts_hello ]]; then
-  echo "==> kh run --expect-code 0 (clang puts → hello)"
-  puts_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/puts_hello)"
-  test "${puts_out}" = "hello"
-fi
+  if [[ -x tests/clang-probe/return_zero ]]; then
+    echo "==> kh run --expect-code 0 (clang return 0 from main)"
+    kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/return_zero
+  fi
 
-if [[ -x tests/clang-probe/printf_hello ]]; then
-  echo "==> kh run --expect-code 0 (clang printf → hello)"
-  printf_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/printf_hello)"
-  test "${printf_out}" = "hello"
-fi
+  if [[ -x tests/clang-probe/puts_hello ]]; then
+    echo "==> kh run --expect-code 0 (clang puts → hello)"
+    puts_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/puts_hello)"
+    test "${puts_out}" = "hello"
+  fi
 
-if [[ -x tests/clang-probe/write_exit ]]; then
-  echo "==> kh trace (clang write_exit)"
-  # Freestanding process startup seeds env via many host getenvs after I/O.
-  kh trace --max-events 64 --root "$BOTTLE" tests/clang-probe/write_exit
+  if [[ -x tests/clang-probe/printf_hello ]]; then
+    echo "==> kh run --expect-code 0 (clang printf → hello)"
+    printf_out="$(kh run --expect-code 0 --root "$BOTTLE" tests/clang-probe/printf_hello)"
+    test "${printf_out}" = "hello"
+  fi
+else
+  echo "==> skip live kh run (macOS prefix not staged; copy bin/sbin/usr/bin from macOS 26+ Apple Silicon)"
 fi
 
 kh bottle destroy --yes
@@ -126,7 +133,7 @@ echo "probes ok"
 echo
 echo "================================================================"
 echo " smoke ok  (image: ${IMAGE})"
-echo "  checked: bottle lifecycle, clang probes (if present), trace"
+echo "  checked: bottle lifecycle, clang probes (if present), dry-load"
 echo "  no host artifacts  — for .7z you can open yourself:"
 echo "    ./scripts/docker-kh.sh 7zz -- a /Volumes/linux/out/demo.7z \\"
 echo "        /Volumes/linux/src/README.md"

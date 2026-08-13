@@ -16,6 +16,7 @@ pub(crate) mod libsystem_malloc;
 pub(crate) mod libsystem_notify;
 pub(crate) mod libsystem_pthread;
 pub(crate) mod libuuid;
+pub(crate) mod libxcselect;
 pub(crate) mod libxpc;
 pub(crate) mod libz;
 pub(crate) mod misc;

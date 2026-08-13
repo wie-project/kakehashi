@@ -3,6 +3,7 @@
 use std::io::{ErrorKind, Write};
 
 use anyhow::{Context, Result};
+use kh_loader::LoadError;
 
 /// Writes one line to `output`.
 ///
@@ -65,10 +66,16 @@ pub(crate) fn map_live_exec_error(err: impl std::fmt::Display + std::fmt::Debug)
     let msg = format!("{err:#}");
     if msg.contains("Linux aarch64") || msg.contains("trap backend") {
         anyhow::anyhow!(
-            "{msg}; live `kh run`/`kh trace` requires Linux aarch64 (use Docker/Colima). \
+            "{msg}; live `kh run` requires Linux aarch64 (use Docker/Colima). \
              `kh run --dry-load` works on any host."
         )
     } else {
         anyhow::anyhow!("{msg}")
     }
+}
+
+/// Maps a loader error to a process exit code for `main`.
+pub(crate) fn exit_code_for(err: &anyhow::Error) -> u8 {
+    err.downcast_ref::<LoadError>()
+        .map_or(1, LoadError::exit_code)
 }

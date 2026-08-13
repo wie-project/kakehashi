@@ -129,9 +129,7 @@ pub fn parse_path(path: &Path) -> Result<MachOImage, LoadError> {
 ///
 /// **Fat containers:** parse uses the full container so
 /// [`MachOSummary::file_slice_offset`] stays correct for map `fileoff`.
-pub fn parse_path_with_bytes(
-    path: &Path,
-) -> Result<(MachOImage, crate::FileImage), LoadError> {
+pub fn parse_path_with_bytes(path: &Path) -> Result<(MachOImage, crate::FileImage), LoadError> {
     let file = crate::FileImage::open(path)?;
     let image = parse_bytes(file.as_slice(), &path.display().to_string())?;
     Ok((image, file))

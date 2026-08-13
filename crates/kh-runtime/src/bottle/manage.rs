@@ -12,19 +12,11 @@ use thiserror::Error;
 use super::layout;
 use super::libsystem::{self, LibsystemInstall, LibsystemOrigin};
 use super::registry;
-use super::xcrun_tool::{self, XcrunInstall, XcrunOrigin};
 
 /// Freestanding guest libSystem shipped with this crate (crates.io / cargo install).
 ///
 /// Refresh after rebuilding `kh-libsystem` with `./scripts/stage-libsystem.sh`.
 static EMBEDDED_LIBSYSTEM: &[u8] = include_bytes!("../../resources/libSystem.B.dylib");
-
-/// Clean-room guest `xcrun` shipped with this crate (crates.io / cargo install).
-///
-/// Refresh after rebuilding `kh-xcrun` with `./scripts/stage-xcrun.sh`.
-/// Empty file is treated as "not embedded" so Linux-only checkouts without a
-/// staged Mach-O still compile; `bottle ensure` then skips xcrun install.
-static EMBEDDED_XCRUN: &[u8] = include_bytes!("../../resources/xcrun");
 
 /// Bottle management errors.
 #[derive(Debug, Error)]
@@ -77,6 +69,8 @@ pub struct BottleStatus {
     pub libcxx_alias: bool,
     /// Whether `{path}/usr/lib/libcurl.4.dylib` → `libSystem.B.dylib` alias exists.
     pub libcurl_alias: bool,
+    /// Whether `bin` / `sbin` / `usr/bin` look like a macOS 26+ Apple Silicon copy.
+    pub prefix_macos: bool,
 }
 
 /// Options for [`create`].
@@ -97,8 +91,6 @@ pub struct CreateResult {
     pub path: PathBuf,
     /// libSystem install details when a source was found and copied.
     pub libsystem: Option<LibsystemInstall>,
-    /// Guest `/usr/bin/xcrun` install details when a source was found.
-    pub xcrun: Option<XcrunInstall>,
 }
 
 /// Creates the single bottle at `path` (or the default data path when `None`).
@@ -160,19 +152,6 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
         }
     };
 
-    let xcrun = match install_xcrun_for_create(&target) {
-        Ok(v) => v,
-        Err(err) => {
-            drop(layout::remove_tree(&target));
-            return Err(err);
-        }
-    };
-
-    // After xcrun is on disk: Apple-style `/usr/bin/clang` → `xcrun` shims.
-    if let Err(e) = layout::ensure_developer_shims(&target) {
-        tracing::warn!(error = %e, "failed to install developer shims");
-    }
-
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(&target) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");
     }
@@ -181,7 +160,6 @@ pub fn create_with(opts: &CreateOptions<'_>) -> Result<CreateResult, BottleError
     Ok(CreateResult {
         path: target,
         libsystem,
-        xcrun,
     })
 }
 
@@ -215,20 +193,6 @@ fn install_libsystem_for_create(
         )?));
     }
 
-    Ok(None)
-}
-
-fn install_xcrun_for_create(target: &Path) -> Result<Option<XcrunInstall>, BottleError> {
-    if let Some((src, origin)) = xcrun_tool::discover(None) {
-        return Ok(Some(xcrun_tool::install(target, &src, origin)?));
-    }
-    if !EMBEDDED_XCRUN.is_empty() {
-        return Ok(Some(xcrun_tool::install_bytes(
-            target,
-            EMBEDDED_XCRUN,
-            XcrunOrigin::Embedded,
-        )?));
-    }
     Ok(None)
 }
 
@@ -269,6 +233,7 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
     let libsystem = exists && path.join(libsystem::GUEST_LIBSYSTEM_REL).is_file();
     let libcxx_alias = exists && layout::has_libcxx_symlink(&path);
     let libcurl_alias = exists && layout::has_libcurl_symlink(&path);
+    let prefix_macos = exists && layout::bottle_has_macos_prefix(&path);
     Ok(Some(BottleStatus {
         path,
         exists,
@@ -276,6 +241,7 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
         libsystem,
         libcxx_alias,
         libcurl_alias,
+        prefix_macos,
     }))
 }
 
@@ -331,13 +297,7 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_libz_symlink(path)?;
     layout::ensure_dev_nodes(path)?;
     layout::ensure_host_ssh_bridge(path)?;
-    layout::ensure_host_bin_bridges(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
-    let xcrun = install_xcrun_for_create(path)?;
-    // CLT-style `/usr/bin` shims need guest xcrun present first.
-    if let Err(e) = layout::ensure_developer_shims(path) {
-        tracing::warn!(error = %e, "failed to install developer shims");
-    }
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {
         tracing::warn!(error = %e, "failed to seed bottle CA bundle");
@@ -346,7 +306,6 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     Ok(CreateResult {
         path: path.to_path_buf(),
         libsystem,
-        xcrun,
     })
 }
 
@@ -519,13 +478,9 @@ mod tests {
         let _g = EnvGuard::new();
 
         // Staged freestanding guest dylib (crate resources/).
-        let libsystem = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources/libSystem.B.dylib");
-        assert!(
-            libsystem.is_file(),
-            "missing {}",
-            libsystem.display()
-        );
+        let libsystem =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/libSystem.B.dylib");
+        assert!(libsystem.is_file(), "missing {}", libsystem.display());
 
         let created = create_with(&CreateOptions {
             libsystem: Some(&libsystem),
@@ -550,8 +505,8 @@ mod tests {
         let _lock = test_env_lock();
         let _g = EnvGuard::new();
 
-        let libsystem = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources/libSystem.B.dylib");
+        let libsystem =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/libSystem.B.dylib");
         assert!(libsystem.is_file());
 
         let first = ensure(&CreateOptions {

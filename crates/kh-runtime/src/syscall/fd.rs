@@ -492,7 +492,8 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
                 return SyscallResult::err(name, EFAULT);
             }
             let gfd = reg_as_i32(args.x0);
-            let Some(guest_path) = process::fd_guest_path(gfd).or_else(|| guest_path_for_host_fd(h))
+            let Some(guest_path) =
+                process::fd_guest_path(gfd).or_else(|| guest_path_for_host_fd(h))
             else {
                 return SyscallResult::err(name, ENOENT);
             };

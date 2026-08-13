@@ -256,14 +256,11 @@ fn catalog_looks_valid(path: &Path) -> bool {
 
 fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanError> {
     let root = Value::from_file(catalog_path).map_err(|e| {
-        SwscanError::Parse(format!(
-            "sucatalog parse {}: {e}",
-            catalog_path.display()
-        ))
+        SwscanError::Parse(format!("sucatalog parse {}: {e}", catalog_path.display()))
     })?;
-    let dict = root.as_dictionary().ok_or_else(|| {
-        SwscanError::Parse("sucatalog root is not a dictionary".into())
-    })?;
+    let dict = root
+        .as_dictionary()
+        .ok_or_else(|| SwscanError::Parse("sucatalog root is not a dictionary".into()))?;
     let products = dict
         .get("Products")
         .and_then(Value::as_dictionary)
@@ -341,9 +338,8 @@ fn parse_clt_products(catalog_path: &Path) -> Result<Vec<CltPackage>, SwscanErro
     let mut out = Vec::new();
     for r in raw.into_iter().take(limit) {
         let name = match r.dist_url.as_deref() {
-            Some(url) => fetch_clt_title(url).unwrap_or_else(|| {
-                format!("Command Line Tools ({})", r.product_id)
-            }),
+            Some(url) => fetch_clt_title(url)
+                .unwrap_or_else(|| format!("Command Line Tools ({})", r.product_id)),
             None => format!("Command Line Tools ({})", r.product_id),
         };
         // Prefer titles that look like CLT; drop false-positive products.
@@ -424,14 +420,12 @@ fn plist_date_secs(v: &Value) -> Option<i64> {
                 .and_then(|d| i64::try_from(d.as_secs()).ok())
         }
         // XML catalogs almost always emit real Date values; string form is rare.
-        Value::String(s) => Date::from_xml_format(s.trim())
-            .ok()
-            .and_then(|d| {
-                SystemTime::from(d)
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .and_then(|d| i64::try_from(d.as_secs()).ok())
-            }),
+        Value::String(s) => Date::from_xml_format(s.trim()).ok().and_then(|d| {
+            SystemTime::from(d)
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+        }),
         _ => None,
     }
 }
@@ -597,7 +591,12 @@ pub(crate) fn fallback_help(writer: &mut dyn Write) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing, unsafe_code)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    unsafe_code
+)]
 mod tests {
     use super::*;
 

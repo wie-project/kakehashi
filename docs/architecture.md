@@ -26,7 +26,7 @@ Process detail (allowed sources, bans, PR provenance):
 ## Crate graph
 
 ```
-kh-cli (kakehashi)     CLI: run, trace, bottle, install, inspect
+kh-cli (kakehashi)     CLI: run, bottle, install
         │
         ├── kh-loader  Mach-O parse, map, bind, LC_MAIN entry
         │

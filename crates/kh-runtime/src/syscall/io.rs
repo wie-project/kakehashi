@@ -41,7 +41,9 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
             Ok(n) => SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
             Err(e) => {
                 let os = e.raw_os_error().unwrap_or(0);
-                if os == libc::EAGAIN || os == libc::EWOULDBLOCK || e.kind() == std::io::ErrorKind::WouldBlock
+                if os == libc::EAGAIN
+                    || os == libc::EWOULDBLOCK
+                    || e.kind() == std::io::ErrorKind::WouldBlock
                 {
                     return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
@@ -91,14 +93,7 @@ pub(crate) fn handle_pread(args: SyscallArgs) -> SyscallResult {
     let offset = super::common::reg_as_i64(args.x3);
     let buf = guest_slice_mut(args.x1, len);
     // SAFETY: host pread into identity-mapped guest buffer.
-    let n = unsafe {
-        libc::pread(
-            host_fd,
-            buf.as_mut_ptr().cast(),
-            len,
-            offset,
-        )
-    };
+    let n = unsafe { libc::pread(host_fd, buf.as_mut_ptr().cast(), len, offset) };
     if n < 0 {
         let os = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
@@ -128,14 +123,7 @@ pub(crate) fn handle_pwrite(args: SyscallArgs) -> SyscallResult {
     }
     let offset = super::common::reg_as_i64(args.x3);
     let slice = guest_slice(args.x1, len);
-    let n = unsafe {
-        libc::pwrite(
-            host_fd,
-            slice.as_ptr().cast(),
-            len,
-            offset,
-        )
-    };
+    let n = unsafe { libc::pwrite(host_fd, slice.as_ptr().cast(), len, offset) };
     if n < 0 {
         tracing::warn!("pwrite fail");
         return SyscallResult::err(name, EPERM);
@@ -174,7 +162,9 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
             }
             Err(e) => {
                 let os = e.raw_os_error().unwrap_or(0);
-                if os == libc::EAGAIN || os == libc::EWOULDBLOCK || e.kind() == std::io::ErrorKind::WouldBlock
+                if os == libc::EAGAIN
+                    || os == libc::EWOULDBLOCK
+                    || e.kind() == std::io::ErrorKind::WouldBlock
                 {
                     tracing::debug!(gfd, "tls read EAGAIN");
                     return SyscallResult::err(name, DARWIN_EAGAIN);

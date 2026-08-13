@@ -75,7 +75,7 @@ pub enum TrapOutcome {
 /// Configuration for the trap backend.
 #[derive(Debug, Clone)]
 pub struct TrapConfig {
-    /// Maximum number of events to retain for `kh trace`.
+    /// Maximum number of events to retain for trap dumps.
     pub max_events: usize,
     /// Maximum syscalls before forced exit (safety cap).
     pub max_syscalls: usize,
@@ -156,7 +156,11 @@ pub fn patch_svc_to_brk(regions: &mut [MappedRegion]) -> Result<usize, TrapError
                 let Some(scan) = bytes.get(start..end) else {
                     continue;
                 };
-                hits.extend(find_svc_offsets(scan).into_iter().map(|o| start.saturating_add(o)));
+                hits.extend(
+                    find_svc_offsets(scan)
+                        .into_iter()
+                        .map(|o| start.saturating_add(o)),
+                );
             }
             hits
         };
@@ -239,11 +243,7 @@ fn find_svc_offsets_parallel(scan: &[u8]) -> Vec<usize> {
     if total < 4 {
         return Vec::new();
     }
-    let chunk = (total
-        .checked_div(nthreads)
-        .unwrap_or(total)
-        & !3_usize)
-        .max(4);
+    let chunk = (total.checked_div(nthreads).unwrap_or(total) & !3_usize).max(4);
     let mut hits = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(nthreads);
@@ -302,19 +302,13 @@ fn find_svc_offsets_range(scan: &[u8], base_off: usize) -> Vec<usize> {
             hits.push(base_off.saturating_add(i.saturating_mul(4)));
         }
         if is_svc(u32::from_le(w1)) {
-            hits.push(
-                base_off.saturating_add(i.saturating_add(1).saturating_mul(4)),
-            );
+            hits.push(base_off.saturating_add(i.saturating_add(1).saturating_mul(4)));
         }
         if is_svc(u32::from_le(w2)) {
-            hits.push(
-                base_off.saturating_add(i.saturating_add(2).saturating_mul(4)),
-            );
+            hits.push(base_off.saturating_add(i.saturating_add(2).saturating_mul(4)));
         }
         if is_svc(u32::from_le(w3)) {
-            hits.push(
-                base_off.saturating_add(i.saturating_add(3).saturating_mul(4)),
-            );
+            hits.push(base_off.saturating_add(i.saturating_add(3).saturating_mul(4)));
         }
         i = i.saturating_add(4);
     }
@@ -928,7 +922,7 @@ unsafe extern "C" fn guest_fault_sigaction(
     unsafe { libc::_exit(128_i32.saturating_add(signo)) };
 }
 
-/// Drains recorded trap events (for `kh trace`).
+/// Drains recorded trap events.
 #[must_use]
 pub fn take_trace_events() -> Vec<TrapEvent> {
     EVENTS

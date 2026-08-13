@@ -118,9 +118,7 @@ mod linux_aarch64 {
             ));
         }
         // Variable slot: header + C string + NUL, rounded up to 16 bytes.
-        let raw = HEADER
-            .saturating_add(name_bytes.len())
-            .saturating_add(1);
+        let raw = HEADER.saturating_add(name_bytes.len()).saturating_add(1);
         let need = raw.saturating_add(15) & !15_usize;
         if pool.used.saturating_add(need) > pool.len {
             return Err(LoadError::NotImplemented("missing-stub pool exhausted"));

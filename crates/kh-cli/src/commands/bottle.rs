@@ -4,9 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use kh_runtime::bottle::{
-    self, BottleError, BottleStatus, CreateOptions, LibsystemOrigin, XcrunOrigin,
-};
+use kh_runtime::bottle::{self, BottleError, BottleStatus, CreateOptions, LibsystemOrigin};
 use serde_json::json;
 
 /// Subcommands for bottle management.
@@ -117,20 +115,13 @@ fn print_create_result(
                 "id_rewritten": ls.id_rewritten,
             })
         });
-        let xcrun = created.xcrun.as_ref().map(|xc| {
-            json!({
-                "source": xc.source.display().to_string(),
-                "dest": xc.dest.display().to_string(),
-                "origin": xcrun_origin_str(xc.origin),
-            })
-        });
         println!(
             "{}",
             json!({
                 "action": action,
                 "path": created.path.display().to_string(),
                 "libsystem": libsystem,
-                "xcrun": xcrun,
+                "prefix_macos": bottle::bottle_has_macos_prefix(&created.path),
             })
         );
         return;
@@ -174,21 +165,13 @@ fn print_create_result(
             env = bottle::ENV_LIBSYSTEM
         );
     }
-    if let Some(xc) = &created.xcrun {
-        println!(
-            "  xcrun:     {} → {}",
-            xc.source.display(),
-            xc.dest.display()
-        );
-        println!("    origin: {}", xcrun_origin_str(xc.origin));
+    if bottle::bottle_has_macos_prefix(&created.path) {
+        println!("  prefix:    macOS bin/sbin/usr/bin present");
     } else {
-        println!("  xcrun:     not found (CLT gcc/ar shims need /usr/bin/xcrun)");
-        println!("    rebuild:  cargo build -p kh-xcrun --release --target aarch64-apple-darwin");
-        println!("    stage:    ./scripts/stage-xcrun.sh  # → crates/kh-runtime/resources/xcrun");
-        println!(
-            "    or:       set {env} to a Mach-O xcrun before kh bottle ensure",
-            env = bottle::ENV_XCRUN
-        );
+        println!("  prefix:    missing — copy bin, sbin, usr/bin from macOS 26+ Apple Silicon");
+        println!("    /bin     → {}/bin/", created.path.display());
+        println!("    /sbin    → {}/sbin/", created.path.display());
+        println!("    /usr/bin → {}/usr/bin/", created.path.display());
     }
 }
 
@@ -199,15 +182,6 @@ fn origin_str(o: LibsystemOrigin) -> &'static str {
         LibsystemOrigin::Adjacent => "adjacent",
         LibsystemOrigin::DevTarget => "dev_target",
         LibsystemOrigin::Embedded => "embedded (crates.io)",
-    }
-}
-
-fn xcrun_origin_str(o: XcrunOrigin) -> &'static str {
-    match o {
-        XcrunOrigin::Explicit => "explicit",
-        XcrunOrigin::Adjacent => "adjacent",
-        XcrunOrigin::DevTarget => "dev_target",
-        XcrunOrigin::Embedded => "embedded (crates.io)",
     }
 }
 
@@ -264,6 +238,7 @@ fn print_path(json: bool) -> Result<()> {
                     "libsystem": st.libsystem,
                     "libcxx_alias": st.libcxx_alias,
                     "libcurl_alias": st.libcurl_alias,
+                    "prefix_macos": st.prefix_macos,
                 })
             );
         } else {
@@ -289,6 +264,7 @@ fn print_status(json: bool) -> Result<()> {
             println!("libSystem: {}", st.libsystem);
             println!("libc++:    {}", st.libcxx_alias);
             println!("libcurl:   {}", st.libcurl_alias);
+            println!("prefix:    {}", st.prefix_macos);
             if st.exists && st.valid_marker {
                 let bridge = st.path.join(bottle::VOLUMES_LINUX);
                 println!("linux:     {} -> /", bridge.display());
@@ -336,5 +312,6 @@ fn status_json(st: &BottleStatus) -> serde_json::Value {
         "libsystem": st.libsystem,
         "libcxx_alias": st.libcxx_alias,
         "libcurl_alias": st.libcurl_alias,
+        "prefix_macos": st.prefix_macos,
     })
 }

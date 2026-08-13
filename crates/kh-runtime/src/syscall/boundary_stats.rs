@@ -9,7 +9,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::helpers::{
@@ -368,9 +368,7 @@ mod tests {
 
         assert_eq!(TOTAL.load(Ordering::Relaxed), 5);
         assert_eq!(
-            BSD_COUNT
-                .get(20)
-                .map_or(0, |a| a.load(Ordering::Relaxed)),
+            BSD_COUNT.get(20).map_or(0, |a| a.load(Ordering::Relaxed)),
             3
         );
         let park_id = usize::try_from(KH_HELPER_PARK & 0xFFFF).unwrap_or(0);
@@ -391,12 +389,7 @@ mod tests {
         let t = begin();
         std::thread::sleep(std::time::Duration::from_micros(50));
         end(t, 4); // write
-        assert_eq!(
-            BSD_COUNT
-                .get(4)
-                .map_or(0, |a| a.load(Ordering::Relaxed)),
-            1
-        );
+        assert_eq!(BSD_COUNT.get(4).map_or(0, |a| a.load(Ordering::Relaxed)), 1);
         assert!(BSD_NS.get(4).map_or(0, |a| a.load(Ordering::Relaxed)) > 0);
         assert!(NS_TOTAL.load(Ordering::Relaxed) > 0);
     }

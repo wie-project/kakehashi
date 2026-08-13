@@ -70,8 +70,8 @@ impl InstallPackage {
         match name.to_ascii_lowercase().as_str() {
             "7zip" | "7zz" | "sevenzip" | "p7zip" => Some(Self::SevenZip),
             "curl" => Some(Self::Curl),
-            "xcode-tools" | "xcodetools" | "clt" | "command-line-tools"
-            | "commandlinetools" | "git" => Some(Self::XcodeTools),
+            "xcode-tools" | "xcodetools" | "clt" | "command-line-tools" | "commandlinetools"
+            | "git" => Some(Self::XcodeTools),
             _ => None,
         }
     }
@@ -240,10 +240,8 @@ fn install_sevenzip() -> Result<InstallReport, ToolError> {
         });
     }
 
-    let archive =
-        download_cache::ensure_named_url(DARWIN_7ZZ_URL, CACHE_7ZZ_ARCHIVE).map_err(|e| {
-            ToolError::Command(e.to_string())
-        })?;
+    let archive = download_cache::ensure_named_url(DARWIN_7ZZ_URL, CACHE_7ZZ_ARCHIVE)
+        .map_err(|e| ToolError::Command(e.to_string()))?;
 
     let tmp_root = download_cache::cache_dir()
         .map_err(ToolError::Io)?
@@ -319,10 +317,8 @@ fn install_curl() -> Result<InstallReport, ToolError> {
         });
     }
 
-    let archive =
-        download_cache::ensure_named_url(DARWIN_CURL_URL, CACHE_CURL_ARCHIVE).map_err(|e| {
-            ToolError::Command(e.to_string())
-        })?;
+    let archive = download_cache::ensure_named_url(DARWIN_CURL_URL, CACHE_CURL_ARCHIVE)
+        .map_err(|e| ToolError::Command(e.to_string()))?;
 
     let tmp_root = download_cache::cache_dir()
         .map_err(ToolError::Io)?
@@ -494,8 +490,14 @@ mod tests {
             InstallPackage::parse("xcode-tools"),
             Some(InstallPackage::XcodeTools)
         );
-        assert_eq!(InstallPackage::parse("clt"), Some(InstallPackage::XcodeTools));
-        assert_eq!(InstallPackage::parse("git"), Some(InstallPackage::XcodeTools));
+        assert_eq!(
+            InstallPackage::parse("clt"),
+            Some(InstallPackage::XcodeTools)
+        );
+        assert_eq!(
+            InstallPackage::parse("git"),
+            Some(InstallPackage::XcodeTools)
+        );
         assert!(InstallPackage::parse("foo").is_none());
     }
 

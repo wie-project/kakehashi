@@ -81,7 +81,10 @@ pub(crate) fn ensure_ca_bundle_with(
     }
 
     download_mozilla_ca(&pem_path)?;
-    tracing::info!(url = MOZILLA_CACERT_URL, "bottle CA: downloaded Mozilla cacert.pem");
+    tracing::info!(
+        url = MOZILLA_CACERT_URL,
+        "bottle CA: downloaded Mozilla cacert.pem"
+    );
     Ok(pem_path)
 }
 

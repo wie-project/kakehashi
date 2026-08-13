@@ -231,7 +231,10 @@ fn darwin_sockaddr_to_host(buf: &mut Vec<u8>) -> Result<(), i64> {
             let host_path = if is_abstract {
                 path_bytes
             } else {
-                let cstr_end = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+                let cstr_end = path_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(path_bytes.len());
                 let guest = String::from_utf8_lossy(path_bytes.get(..cstr_end).unwrap_or(&[]));
                 if let Ok(p) = crate::bottle::translate_path(guest.as_ref()) {
                     let mut b = p.into_os_string().into_encoded_bytes();
@@ -247,7 +250,10 @@ fn darwin_sockaddr_to_host(buf: &mut Vec<u8>) -> Result<(), i64> {
             };
             // Linux sockaddr_un is typically 110 bytes; **grow** the buffer so
             // translated bottle paths are not truncated to Darwin sa_len.
-            let need = 2usize.saturating_add(host_path.len()).max(buf.len()).min(110);
+            let need = 2usize
+                .saturating_add(host_path.len())
+                .max(buf.len())
+                .min(110);
             let mut out = vec![0_u8; need];
             let fam = u16::try_from(libc::AF_UNIX).unwrap_or(1).to_ne_bytes();
             put_u8(&mut out, 0, *fam.first().unwrap_or(&0));
@@ -499,10 +505,7 @@ pub(crate) fn handle_connect(args: SyscallArgs) -> SyscallResult {
     };
     net_log(&format!("connect hfd={hfd} len={len}"));
     let r = with_translated_sockaddr(name, args.x1, len, |addr| host::connect(hfd, addr));
-    net_log(&format!(
-        "connect done err={} ret={:?}",
-        r.error, r.retval
-    ));
+    net_log(&format!("connect done err={} ret={:?}", r.error, r.retval));
     r
 }
 
@@ -668,11 +671,7 @@ fn handle_sockname(
     if args.x1 == 0 || args.x2 == 0 || !registry_check_range(args.x2, 4, true) {
         return SyscallResult::err(name, EFAULT);
     }
-    let alen = u32::from_le_bytes(
-        guest_slice(args.x2, 4)
-            .try_into()
-            .unwrap_or([0, 0, 0, 0]),
-    );
+    let alen = u32::from_le_bytes(guest_slice(args.x2, 4).try_into().unwrap_or([0, 0, 0, 0]));
     let max = usize::try_from(alen).unwrap_or(0).min(128);
     if max == 0 || !registry_check_range(args.x1, max, true) {
         return SyscallResult::err(name, EFAULT);

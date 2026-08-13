@@ -357,10 +357,10 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         81 => Some(BsdSyscall::Getpgrp),
         82 => Some(BsdSyscall::Setpgid),
         147 => Some(BsdSyscall::Setsid),
-        27 | 402 => Some(BsdSyscall::Recvmsg),  // recvmsg / nocancel
-        28 | 408 => Some(BsdSyscall::Sendmsg),  // sendmsg / nocancel-ish
+        27 | 402 => Some(BsdSyscall::Recvmsg), // recvmsg / nocancel
+        28 | 408 => Some(BsdSyscall::Sendmsg), // sendmsg / nocancel-ish
         29 | 403 => Some(BsdSyscall::Recvfrom), // recvfrom / nocancel
-        30 | 404 => Some(BsdSyscall::Accept),   // accept / nocancel
+        30 | 404 => Some(BsdSyscall::Accept),  // accept / nocancel
         31 => Some(BsdSyscall::Getpeername),
         32 => Some(BsdSyscall::Getsockname),
         41 => Some(BsdSyscall::Dup),
@@ -388,7 +388,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         118 => Some(BsdSyscall::Getsockopt),
         124 => Some(BsdSyscall::Fchmod),
         128 => Some(BsdSyscall::Rename),
-        153 | 474 => Some(BsdSyscall::Pread),  // pread / pread_nocancel-ish
+        153 | 474 => Some(BsdSyscall::Pread), // pread / pread_nocancel-ish
         154 | 475 => Some(BsdSyscall::Pwrite), // pwrite
         133 | 407 => Some(BsdSyscall::Sendto), // sendto / nocancel
         134 => Some(BsdSyscall::Shutdown),

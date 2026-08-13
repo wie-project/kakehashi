@@ -27,9 +27,8 @@
 #   KAKEHASHI_BOUNDARY_STATS / KAKEHASHI_FUTEX_STATS / KAKEHASHI_HEAP_STATS
 #   KAKEHASHI_LOAD_TIMING
 #   KAKEHASHI_CURL          host path to Darwin curl (skip download)
-#   KH_CURL_PROBE=1         curl: capture stderr + optional kh trace
+#   KH_CURL_PROBE=1         curl: capture stderr in probe mode
 #   KH_PROBE_DIR            probe logs (default: .tmp/kh-curl-probe)
-#   KH_TRACE_JSON           1 = kh trace --json in probe mode (default: 1)
 #   KH_CLONE_IN_SRC=1       git: do not rewrite bare clone into /out
 #   GIT_SSH_COMMAND         passed into the container
 #   KH_NO_SSH_MOUNT=1       do not mount host ~/.ssh
@@ -91,7 +90,7 @@ fi
 IMAGE="${KAKEHASHI_SMOKE_IMAGE:-kakehashi:dev}"
 KH_OUT="${KH_OUT:-$ROOT/.tmp/kh-out}"
 KH_PROBE_DIR="${KH_PROBE_DIR:-$ROOT/.tmp/kh-curl-probe}"
-KH_TRACE_JSON="${KH_TRACE_JSON:-1}"
+
 
 # Tool-specific host defaults.
 case "$TOOL" in
@@ -193,7 +192,6 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/src/target \
   -e "KH_EXTRA_CARGO_ARGS=${KH_EXTRA_CARGO_ARGS:-}" \
   -e "KH_CURL_PROBE=${KH_CURL_PROBE:-0}" \
-  -e "KH_TRACE_JSON=${KH_TRACE_JSON}" \
   -e "KH_TOOL=${TOOL}" \
   "${IMAGE}" \
   bash -c '
@@ -271,11 +269,6 @@ case "${KH_TOOL}" in
     }
     run_rc=0
     run_one run "$KH" run curl -- "$@" || run_rc=$?
-    if [[ "${KH_TRACE_JSON:-1}" == "1" ]]; then
-      run_one trace "$KH" trace --json curl -- "$@" || true
-    else
-      run_one trace "$KH" trace curl -- "$@" || true
-    fi
     echo
     echo "==> probe artifacts under /probe"
     ls -lah /probe | sed "s/^/    /"

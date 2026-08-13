@@ -206,8 +206,9 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // Residual Darwin `svc` is always rewritten to `brk` below;
     // that is *not* a second production path (see invariants 7, 12).
     warn_if_hypercall_env_opt_out();
-    let hypercall_wired =
-        crate::load_timing::time("wire_hypercall", || install_libsystem_hypercall(&mut session));
+    let hypercall_wired = crate::load_timing::time("wire_hypercall", || {
+        install_libsystem_hypercall(&mut session)
+    });
     // Rewrite any leftover Darwin `svc` so Linux never executes them as host syscalls.
     let mut patched_svc = 0usize;
     crate::load_timing::time_result("patch_svc", || {
@@ -337,11 +338,7 @@ fn register_dyld_images(session: &LoadSession) {
             .exports
             .iter()
             .map(|e| (e.name.clone(), e.value.wrapping_add(slide)));
-        kh_runtime::dyld_register_image(
-            img.path.clone(),
-            img.install_name.clone(),
-            exports,
-        );
+        kh_runtime::dyld_register_image(img.path.clone(), img.install_name.clone(), exports);
     }
 }
 
@@ -407,8 +404,8 @@ const GUEST_DEFAULT_DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 /// on a real Mac with Command Line Tools only.
 fn guest_sdk_env(bottle: Option<&Path>) -> Option<Vec<String>> {
     let bottle = bottle?;
-    let stdio = bottle
-        .join("Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h");
+    let stdio =
+        bottle.join("Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/stdio.h");
     if !stdio.is_file() {
         // Fall back: any MacOSX*.sdk with headers (symlink missing).
         let sdks = bottle.join("Library/Developer/CommandLineTools/SDKs");

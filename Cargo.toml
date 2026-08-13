@@ -5,16 +5,12 @@ members = [
     "crates/kh-cli",
     # Guest libSystem stubs — Apple Darwin dylib only (not part of Linux CI).
     "crates/kh-libsystem",
-    # Guest `/usr/bin/xcrun` — clean-room; product binary is aarch64-apple-darwin.
-    "crates/kh-xcrun",
 ]
 # Default host/Linux aarch64 build surface (excludes kh-libsystem).
-# `kh-xcrun` is pure-Rust + host-testable; include it for clippy/tests.
 default-members = [
     "crates/kh-loader",
     "crates/kh-runtime",
     "crates/kh-cli",
-    "crates/kh-xcrun",
 ]
 resolver = "2"
 

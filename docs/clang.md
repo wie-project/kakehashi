@@ -183,8 +183,8 @@ Observed / Spec / Impl / Not used — see [legal-method.md](legal-method.md).
 Install is the same product as git: `kh install xcode-tools` (public Software
 Update catalog; no Apple ID). That product also installs the current MacOSX
 SDK (`CLTools_macOSNMOS_SDK` only — not previous-major LMOS). Freestanding
-seeds `SDKROOT` + `DEVELOPER_DIR` so Apple clang finds headers without a
-working `xcrun`.
+seeds `SDKROOT` + `DEVELOPER_DIR` so Apple clang finds headers. Guest
+`xcrun` is the real Apple binary from the user-copied macOS `usr/bin` prefix.
 
 ## Docker helpers
 

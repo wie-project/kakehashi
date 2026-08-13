@@ -11,7 +11,9 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use anyhow::{Context, Result};
 use kh_loader::{LoadSession, RunOptions, run_micro};
 use kh_runtime::GuestPageSize;
-use kh_runtime::bottle::{guest_path_to_host, resolve_guest_program};
+use kh_runtime::bottle::{
+    bottle_has_macos_prefix, guest_path_to_host, macos_prefix_hint, resolve_guest_program,
+};
 use serde_json::json;
 
 use super::util::{
@@ -41,6 +43,15 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
 
     let root = resolve_root(args.root);
 
+    // Live execution needs the user-copied macOS prefix (bin / sbin / usr/bin).
+    // Dry-load only maps the Mach-O and can run on any host without that tree.
+    if !args.dry_load
+        && let Some(bottle) = root.as_deref()
+        && !bottle_has_macos_prefix(bottle)
+    {
+        anyhow::bail!("{}", macos_prefix_hint(bottle));
+    }
+
     // Bare names (`7zz`) resolve under the bottle at macOS paths
     // (`/usr/local/bin/7zz`). Absolute guest paths stay as-is for translation.
     let program = resolve_guest_program(args.path, root.as_deref());
@@ -63,9 +74,9 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         );
     }
 
-    // Bottle host bridges (`/bin/rm`, `/bin/sh`, …) are native Linux ELF, not
+    // Residual host-ELF paths in the bottle (e.g. the OpenSSH bridge) are not
     // Mach-O. Nested guest `execve` already re-execs them on the host; top-level
-    // `kh run rm` should do the same instead of failing with "Invalid magic".
+    // `kh run` should do the same instead of failing with "Invalid magic".
     if !is_macho_file(&host_open) {
         return run_host_native(&host_open, &program, args);
     }
@@ -79,7 +90,6 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         guest_args: args.guest_args.to_vec(),
         // Plain `kh run` must not record trap events — max_syscalls is 50M+ and
         // each event is a String + Mutex push (catastrophic on archive I/O).
-        // Use `kh trace` when you need a ring buffer of traps.
         max_events: 0,
         max_syscalls: args.max_syscalls,
         dry_load: false,

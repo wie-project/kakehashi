@@ -9,6 +9,68 @@
 
 pub mod fat_thin;
 
+/// Sign `value` with a process pointer-auth key (0=IA, 1=IB, 2=DA, 3=DB).
+///
+/// Arm64e chained fixups store authenticated GOT/DATA slots. The guest later
+/// runs `AUT*`; signing here uses the same process keys so that succeeds.
+#[must_use]
+pub fn ptrauth_sign(value: u64, discriminator: u64, key: u8) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: live `kh run` is Apple Silicon (FEAT_PAuth).
+        unsafe { ptrauth_sign_paca(value, discriminator, key) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (discriminator, key);
+        value
+    }
+}
+
+/// `paca` is not on by default for `aarch64-unknown-linux-gnu`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "paca", enable = "pacg")]
+unsafe fn ptrauth_sign_paca(value: u64, discriminator: u64, key: u8) -> u64 {
+    let mut ptr = value;
+    // SAFETY: PAC* only rewrites the destination register.
+    unsafe {
+        match key {
+            0 => core::arch::asm!(
+                "pacia {ptr}, {disc}",
+                ptr = inout(reg) ptr,
+                disc = in(reg) discriminator,
+                options(nomem, nostack, preserves_flags)
+            ),
+            1 => core::arch::asm!(
+                "pacib {ptr}, {disc}",
+                ptr = inout(reg) ptr,
+                disc = in(reg) discriminator,
+                options(nomem, nostack, preserves_flags)
+            ),
+            2 => core::arch::asm!(
+                "pacda {ptr}, {disc}",
+                ptr = inout(reg) ptr,
+                disc = in(reg) discriminator,
+                options(nomem, nostack, preserves_flags)
+            ),
+            3 => core::arch::asm!(
+                "pacdb {ptr}, {disc}",
+                ptr = inout(reg) ptr,
+                disc = in(reg) discriminator,
+                options(nomem, nostack, preserves_flags)
+            ),
+            _ => {}
+        }
+    }
+    ptr
+}
+
+/// Blend a slot address into a 16-bit diversity (Apple `ptrauth` mix).
+#[must_use]
+pub fn ptrauth_blend(slot_va: u64, diversity: u16) -> u64 {
+    (slot_va & 0x0000_ffff_ffff_ffff) | (u64::from(diversity) << 48)
+}
+
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -94,11 +156,7 @@ pub fn dup2_fd(old: RawFd, new: RawFd) -> Option<RawFd> {
 pub fn fork_process() -> Result<i32, i32> {
     // SAFETY: Linux fork; only the calling thread is duplicated.
     let rc = unsafe { libc::fork() };
-    if rc < 0 {
-        Err(last_errno())
-    } else {
-        Ok(rc)
-    }
+    if rc < 0 { Err(last_errno()) } else { Ok(rc) }
 }
 
 /// Host `waitpid`. Returns `(pid, status)` or `Err(errno)`. `pid == 0` with
@@ -159,11 +217,7 @@ pub unsafe fn posix_spawn_host(
             envp.as_ptr().cast_mut().cast(),
         )
     };
-    if rc != 0 {
-        Err(rc)
-    } else {
-        Ok(pid)
-    }
+    if rc != 0 { Err(rc) } else { Ok(pid) }
 }
 
 fn last_errno() -> i32 {
@@ -249,9 +303,7 @@ fn poll_fd(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> bool {
         // SAFETY: single pollfd on the stack; fd is a live host descriptor.
         let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
         if rc < 0 {
-            let err = io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(0);
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == libc::EINTR {
                 continue;
             }
@@ -390,13 +442,7 @@ pub fn accept(fd: RawFd) -> Result<RawFd, i32> {
 pub fn accept_addr(fd: RawFd, addr_out: &mut [u8]) -> Result<(RawFd, usize), i32> {
     let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
     // SAFETY: live socket; `addr_out` is writable for `alen` bytes.
-    let rc = unsafe {
-        libc::accept(
-            fd,
-            addr_out.as_mut_ptr().cast(),
-            ptr::addr_of_mut!(alen),
-        )
-    };
+    let rc = unsafe { libc::accept(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen)) };
     if rc < 0 {
         return Err(last_errno());
     }
@@ -416,15 +462,7 @@ pub fn setsockopt(
         return Err(libc::EINVAL);
     };
     // SAFETY: live socket; value buffer valid for `len` bytes.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            optname,
-            value.as_ptr().cast(),
-            len,
-        )
-    };
+    let rc = unsafe { libc::setsockopt(fd, level, optname, value.as_ptr().cast(), len) };
     if rc == 0 { Ok(()) } else { Err(last_errno()) }
 }
 
@@ -533,9 +571,8 @@ pub fn recvfrom(
 pub fn getsockname(fd: RawFd, addr_out: &mut [u8]) -> Result<usize, i32> {
     let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
     // SAFETY: live socket; buffer writable for `alen` bytes.
-    let rc = unsafe {
-        libc::getsockname(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen))
-    };
+    let rc =
+        unsafe { libc::getsockname(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen)) };
     if rc == 0 {
         Ok(usize::try_from(alen).unwrap_or(0).min(addr_out.len()))
     } else {
@@ -547,9 +584,8 @@ pub fn getsockname(fd: RawFd, addr_out: &mut [u8]) -> Result<usize, i32> {
 pub fn getpeername(fd: RawFd, addr_out: &mut [u8]) -> Result<usize, i32> {
     let mut alen = socklen_of(addr_out.len()).unwrap_or(0);
     // SAFETY: live socket; buffer writable for `alen` bytes.
-    let rc = unsafe {
-        libc::getpeername(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen))
-    };
+    let rc =
+        unsafe { libc::getpeername(fd, addr_out.as_mut_ptr().cast(), ptr::addr_of_mut!(alen)) };
     if rc == 0 {
         Ok(usize::try_from(alen).unwrap_or(0).min(addr_out.len()))
     } else {
@@ -802,9 +838,8 @@ impl MappedFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let len_u64 = file.metadata()?.len();
-        let len = usize::try_from(len_u64).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "file too large to map")
-        })?;
+        let len = usize::try_from(len_u64)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large to map"))?;
         if len == 0 {
             return Ok(Self {
                 ptr: ptr::null_mut(),
@@ -814,14 +849,7 @@ impl MappedFile {
         let fd = file.as_raw_fd();
         // Lazy faults: do **not** use MAP_POPULATE — parse only needs headers;
         // segment fill touches only file-backed ranges.
-        let Some(base) = mmap(
-            None,
-            len,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            fd,
-            0,
-        ) else {
+        let Some(base) = mmap(None, len, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0) else {
             return Err(io::Error::last_os_error());
         };
         // Mapping keeps its own reference; fd may close with `file` drop.

@@ -2,7 +2,7 @@
 
 use kh_runtime::GuestPageSize;
 
-/// High-level header summary used by `kh inspect`.
+/// High-level header summary (dry-load / loader diagnostics).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MachOSummary {

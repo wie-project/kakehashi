@@ -161,11 +161,7 @@ fn base64_encode(data: &[u8]) -> String {
 fn temp_dir() -> Result<PathBuf, String> {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "kh-tls-verify-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("kh-tls-verify-{}-{}", std::process::id(), n));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }

@@ -8,7 +8,8 @@
 //!   crate-embedded freestanding dylib (`resources/libSystem.B.dylib`,
 //!   published on crates.io).
 //! * **Guest tools** — host path discovery for integration binaries (`7zz`,
-//!   `curl`, Apple CLT / `git`).
+//!   `curl`, Apple CLT / `git`). Guest `/bin`, `/sbin`, `/usr/bin` are not
+//!   synthesized: the user copies those trees from macOS 26+ Apple Silicon.
 
 mod ca_bundle;
 mod download_cache;
@@ -21,7 +22,6 @@ mod pkg_extract;
 mod registry;
 mod swscan;
 mod xcode_tools;
-mod xcrun_tool;
 
 pub use ca_bundle::{
     ENV_CA_BUNDLE, GUEST_CA_DIR_REL, GUEST_CA_FILE_REL, MOZILLA_CACERT_URL, active_ca_pem_path,
@@ -35,9 +35,10 @@ pub use guest_tools::{
 };
 pub use layout::{
     GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_SSH_REL,
-    MARKER_MAGIC, MARKER_NAME, VOLUMES_LINUX, ensure_developer_shims, ensure_dev_nodes,
-    ensure_host_bin_bridges, ensure_host_ssh_bridge, ensure_libcurl_symlink, ensure_libcxx_symlink,
-    has_host_ssh_bridge, has_libcurl_symlink, has_libcxx_symlink, is_bottle_root, materialize,
+    MARKER_MAGIC, MARKER_NAME, REQUIRED_PREFIX_DIRS, VOLUMES_LINUX, bottle_has_macos_prefix,
+    ensure_dev_nodes, ensure_host_ssh_bridge, ensure_libcurl_symlink, ensure_libcxx_symlink,
+    has_host_ssh_bridge, has_libcurl_symlink, has_libcxx_symlink, is_bottle_root,
+    macos_prefix_hint, materialize,
 };
 pub use libsystem::{
     EMBEDDED_SOURCE_LABEL, ENV_LIBSYSTEM, GUEST_LIBSYSTEM_ID, GUEST_LIBSYSTEM_REL,
@@ -59,8 +60,3 @@ pub use registry::{
 };
 pub use swscan::ENV_XCODE_TOOLS_VERSION;
 pub use xcode_tools::{GUEST_CLT_REL, GUEST_GIT_PATH, GUEST_GIT_REL, bottle_has_git, discover_git};
-pub use xcrun_tool::{
-    EMBEDDED_SOURCE_LABEL as XCRUN_EMBEDDED_SOURCE_LABEL, ENV_XCRUN, GUEST_XCRUN_REL, XcrunInstall,
-    XcrunOrigin, discover as discover_xcrun, install as install_xcrun,
-    install_bytes as install_xcrun_bytes,
-};

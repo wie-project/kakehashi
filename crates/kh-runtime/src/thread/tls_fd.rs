@@ -283,9 +283,7 @@ pub fn read(gfd: i32, host_fd: RawFd, buf: &mut [u8], guest_blocking: bool) -> i
                     if !crate::host::poll_fd_io(host_fd, -1) {
                         return Err(e);
                     }
-                } else if !has_pending_in(gfd)
-                    && !crate::host::poll_fd_readable(host_fd, -1)
-                {
+                } else if !has_pending_in(gfd) && !crate::host::poll_fd_readable(host_fd, -1) {
                     return Err(e);
                 }
             }

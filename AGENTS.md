@@ -31,7 +31,7 @@ CRITICAL: To optimize context window and reduce token noise, standard terminal o
   - Never run raw `cat`, `grep`, or `cargo` commands unless explicitly requested by the user.
 
 - **Exceptions for Low-Level Analysis:** Do NOT use the `rtk` prefix for binary inspection, tracing, and debugging tools where raw, unedited stdout/stderr is required for correctness.
-  - _Allowed Raw Commands:_ `otool`, `llvm-objdump`, `strace`, `kh trace`, and similar reverse-engineering or low-level diagnostic tools.
+  - _Allowed Raw Commands:_ `otool`, `llvm-objdump`, `strace`, `kh run`, and similar reverse-engineering or low-level diagnostic tools.
 
 ---
 

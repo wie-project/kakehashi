@@ -1,4 +1,4 @@
-//! `kh` — Kakehashi CLI (inspect, run, trace).
+//! `kh` — Kakehashi CLI (run, bottle, install).
 
 mod commands;
 
@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[command(long_about = "\
 Userspace macOS translation layer for Linux ARM64 (no JIT).\n\
 \n\
-Commands: inspect | run | trace | bottle | install.\n\
+Commands: run | bottle | install.\n\
 Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR,\n\
      KAKEHASHI_CACHE_DIR, KAKEHASHI_FORCE_DOWNLOAD,\n\
      KAKEHASHI_LIBSYSTEM, KAKEHASHI_7ZZ, KAKEHASHI_CURL,\n\
@@ -36,41 +36,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Static Mach-O inspection (no execution).
-    Inspect {
-        /// Path to a Mach-O binary (thin arm64 or fat containing arm64).
-        /// Optional when only `--host-page-size` is requested.
-        path: Option<PathBuf>,
-
-        /// List segments and sections.
-        #[arg(long)]
-        sections: bool,
-
-        /// List `LC_LOAD_*DYLIB` dependencies.
-        #[arg(long)]
-        imports: bool,
-
-        /// Filter imports by substring (implies `--imports`).
-        #[arg(long)]
-        find: Option<String>,
-
-        /// Dump load commands.
-        #[arg(long)]
-        load_commands: bool,
-
-        /// Print planned VA layout (guest page policy).
-        #[arg(long)]
-        image: bool,
-
-        /// Guest page size for `--image` (4096 or 16384; default 16384).
-        #[arg(long, value_name = "BYTES")]
-        page_size: Option<u32>,
-
-        /// Print detected host page size and exit.
-        #[arg(long)]
-        host_page_size: bool,
-    },
-
     /// Run a guest program (Mach-O under the translator; host ELF bridges natively).
     Run {
         /// Guest or host path (bare names search the bottle PATH).
@@ -95,24 +60,6 @@ enum Command {
         /// Map and plan only; do not jump to entry.
         #[arg(long)]
         dry_load: bool,
-
-        /// Guest argv after the program name.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        guest_args: Vec<String>,
-    },
-
-    /// Trace syscalls / traps for a Mach-O binary.
-    Trace {
-        /// Path to the main executable.
-        path: PathBuf,
-
-        /// Bottle root (also `KAKEHASHI_ROOT`).
-        #[arg(long)]
-        root: Option<PathBuf>,
-
-        /// Maximum events to capture.
-        #[arg(long, default_value_t = 256)]
-        max_events: usize,
 
         /// Guest argv after the program name.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -203,7 +150,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let code = commands::inspect::exit_code_for(&err);
+            let code = commands::util::exit_code_for(&err);
             eprintln!("error: {err:#}");
             ExitCode::from(code)
         }
@@ -215,26 +162,6 @@ fn run() -> Result<()> {
     init_tracing(cli.verbose);
 
     match cli.command {
-        Command::Inspect {
-            path,
-            sections,
-            imports,
-            find,
-            load_commands,
-            image,
-            page_size,
-            host_page_size,
-        } => commands::inspect::run(&commands::inspect::InspectArgs {
-            path: path.as_deref(),
-            sections,
-            imports,
-            find: find.as_deref(),
-            load_commands,
-            image,
-            page_size,
-            host_page_size,
-            json: cli.json,
-        }),
         Command::Run {
             path,
             root,
@@ -252,18 +179,6 @@ fn run() -> Result<()> {
             expect_code,
             guest_page_size,
             dry_load,
-            guest_args: &guest_args,
-            json: cli.json,
-        }),
-        Command::Trace {
-            path,
-            root,
-            max_events,
-            guest_args,
-        } => commands::trace::run(&commands::trace::TraceArgs {
-            path: &path,
-            root: root.as_deref(),
-            max_events,
             guest_args: &guest_args,
             json: cli.json,
         }),

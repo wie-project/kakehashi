@@ -137,8 +137,7 @@ impl MapRequest {
             return true;
         }
         // PAGEZERO is typically 4 GiB — never materialize it.
-        self.name == "__PAGEZERO"
-            || (self.initprot == 0 && self.fileoff == 0 && self.filesize == 0)
+        self.name == "__PAGEZERO" || (self.initprot == 0 && self.fileoff == 0 && self.filesize == 0)
     }
 }
 
@@ -300,14 +299,7 @@ impl GuestMemory {
         );
 
         // Carve segments with MAP_FIXED (replaces PROT_NONE pages in place).
-        match Self::try_map_all(
-            host,
-            preferred_base,
-            slide,
-            active,
-            src,
-            FixedMode::Replace,
-        ) {
+        match Self::try_map_all(host, preferred_base, slide, active, src, FixedMode::Replace) {
             Ok(regions) => {
                 // Carve-outs leave PROT_NONE residue in gaps; release it so the
                 // address space does not retain untracked maps.
@@ -612,8 +604,7 @@ fn map_one(
     // CLT tools (clang __TEXT ~100+ MiB) hit this — avoid anon+overlay and
     // bulk I-cache flush so the guest stays demand-paged until first use.
     if let SegmentSource::File(file) = src
-        && let Some(region) =
-            try_map_pure_file(host, req, target_guest, file, mode, map_len, fixed)
+        && let Some(region) = try_map_pure_file(host, req, target_guest, file, mode, map_len, fixed)
     {
         return Ok(region);
     }
@@ -926,10 +917,7 @@ fn fill_segment_file(
         }
     }
 
-    Ok(FillOutcome {
-        ok: true,
-        dirtied,
-    })
+    Ok(FillOutcome { ok: true, dirtied })
 }
 
 /// Fill from an in-memory container (mmap of the same file or heap).

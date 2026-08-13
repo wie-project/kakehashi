@@ -282,7 +282,11 @@ pub(crate) fn handle_getcwd(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, ERANGE);
     }
     guest_write(args.x0, bytes);
-    guest_write(args.x0.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)), &[0]);
+    guest_write(
+        args.x0
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(0)),
+        &[0],
+    );
     SyscallResult::ok(name, 0)
 }
 

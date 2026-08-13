@@ -182,10 +182,9 @@ impl BindResolveCache {
 /// Call **after** map and (non-chained) section rebase.
 pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
     crate::load_timing::time_result("bind_fill_exports", || fill_exports(session))?;
-    let cache = crate::load_timing::time(
-        "bind_resolve_cache",
-        || BindResolveCache::build(session.images()),
-    );
+    let cache = crate::load_timing::time("bind_resolve_cache", || {
+        BindResolveCache::build(session.images())
+    });
 
     let n = session.images.len();
     let mut used_any = false;
@@ -198,32 +197,28 @@ pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
             continue;
         }
         // Prefer container from parse (mmap or heap; no second disk pass).
-        let container =
-            if let Some(b) = session.images.get_mut(idx).and_then(|i| i.file_bytes.take()) {
-                b
-            } else {
-                let path = session
-                    .images
-                    .get(idx)
-                    .map(|i| i.path.clone())
-                    .unwrap_or_default();
-                if path.as_os_str().is_empty() {
-                    continue;
-                }
-                crate::load_timing::time_result("bind_reread_file", || {
-                    crate::FileImage::open(&path)
-                })?
-            };
+        let container = if let Some(b) = session
+            .images
+            .get_mut(idx)
+            .and_then(|i| i.file_bytes.take())
+        {
+            b
+        } else {
+            let path = session
+                .images
+                .get(idx)
+                .map(|i| i.path.clone())
+                .unwrap_or_default();
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            crate::load_timing::time_result("bind_reread_file", || crate::FileImage::open(&path))?
+        };
         // Bind/chained operate on the arm64 thin view (identity for thin files).
         // Keep `container` alive for the duration — no full-file copy.
         if crate::chained::bytes_have_chained_fixups(container.as_slice())? {
             crate::load_timing::time_result("bind_chained", || {
-                crate::chained::apply_chained_fixups(
-                    session,
-                    idx,
-                    container.as_slice(),
-                    &cache,
-                )
+                crate::chained::apply_chained_fixups(session, idx, container.as_slice(), &cache)
             })?;
             used_any = true;
             continue;
