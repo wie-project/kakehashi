@@ -303,8 +303,92 @@ fn env_ptrs(env: &[CString]) -> Vec<*const libc::c_char> {
     v
 }
 
+/// `otool-classic -t -v` on arm64 `dlopen`s `libLTO` for `LLVMCreateDisasm`.
+/// Mid-run map of that ~150 MiB dylib currently faults; sibling `llvm-objdump
+/// --macho -d` already runs under kh. Rewrite when the flags ask for LLVM
+/// disassembly.
+#[must_use]
+pub fn rewrite_otool_classic_disasm(
+    host_path: &Path,
+    argv: &[String],
+) -> Option<(PathBuf, Vec<String>)> {
+    let name = host_path.file_name()?.to_str()?;
+    if name != "otool-classic" {
+        return None;
+    }
+    if !otool_args_want_llvm_disasm(argv) {
+        return None;
+    }
+    let objdump = host_path.parent()?.join("llvm-objdump");
+    if !objdump.is_file() {
+        return None;
+    }
+    let mut out = vec![
+        "llvm-objdump".to_owned(),
+        "-d".to_owned(),
+        "--macho".to_owned(),
+    ];
+    let rest = match argv.first().map(String::as_str) {
+        Some(first)
+            if first.ends_with("otool-classic")
+                || first.ends_with("otool")
+                || first.ends_with("llvm-objdump") =>
+        {
+            argv.get(1..).unwrap_or(&[])
+        }
+        _ => argv,
+    };
+    let mut skip_next = false;
+    for a in rest {
+        if skip_next {
+            skip_next = false;
+            if !a.starts_with('-') {
+                // `-arch arm64` — llvm-objdump uses `--arch=`.
+                out.push(format!("--arch={a}"));
+            }
+            continue;
+        }
+        if a == "-arch" {
+            skip_next = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    tracing::info!(
+        from = %host_path.display(),
+        to = %objdump.display(),
+        "otool-classic -t -v → llvm-objdump --macho -d"
+    );
+    Some((objdump, out))
+}
+
+fn otool_args_want_llvm_disasm(argv: &[String]) -> bool {
+    let mut text = false;
+    let mut verbose = false;
+    for a in argv {
+        if a == "-t" || a == "-x" {
+            text = true;
+        }
+        if a == "-v" || a == "-V" {
+            verbose = true;
+        }
+        if matches!(a.as_str(), "-tv" | "-vt" | "-xv" | "-vx") {
+            return true;
+        }
+    }
+    text && verbose
+}
+
 fn reexec_kh_macho(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
-    let Some((args_c, env_c)) = kh_run_argv_env(host_path, argv, envp) else {
+    let rewritten = rewrite_otool_classic_disasm(host_path, argv);
+    let (host_path, argv_ref): (&Path, &[String]) = match rewritten.as_ref() {
+        Some((p, a)) => (p.as_path(), a.as_slice()),
+        None => (host_path, argv),
+    };
+    let Some((args_c, env_c)) = kh_run_argv_env(host_path, argv_ref, envp) else {
         return libc::EINVAL;
     };
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
@@ -347,6 +431,11 @@ pub(crate) fn spawn_kh_macho(
     argv: &[String],
     envp: &[String],
 ) -> Result<i32, i32> {
+    let rewritten = rewrite_otool_classic_disasm(host_path, argv);
+    let (host_path, argv): (&Path, &[String]) = match rewritten.as_ref() {
+        Some((p, a)) => (p.as_path(), a.as_slice()),
+        None => (host_path, argv),
+    };
     let (args_c, env_c) = kh_run_argv_env(host_path, argv, envp).ok_or(libc::EINVAL)?;
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());

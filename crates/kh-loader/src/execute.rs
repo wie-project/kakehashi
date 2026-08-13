@@ -84,7 +84,21 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     crate::load_timing::begin_run();
     crate::load_timing::note(format!("executable={}", path.display()));
 
+    kh_runtime::set_dlopen_loader(load_dylib_on_demand);
     set_bottle_root(opts.root.clone());
+
+    // `kh run otool-classic -- -t -v` (and llvm-otool's exec of it).
+    let (path, opts) = if let Some((new_path, new_argv)) =
+        kh_runtime::rewrite_otool_classic_disasm(path, &opts.guest_args)
+    {
+        let mut o = opts.clone();
+        o.guest_args = new_argv.into_iter().skip(1).collect();
+        (new_path, o)
+    } else {
+        (path.to_path_buf(), opts.clone())
+    };
+    let path = path.as_path();
+    let opts = &opts;
     // Guest-visible main path for `_NSGetExecutablePath` (clang -cc1 re-spawn).
     let guest_exec = host_path_to_guest(path).or_else(|| {
         // Bare host path outside bottle: still prefer an absolute guest-ish form.
@@ -369,6 +383,67 @@ fn stack_err_static(err: &kh_runtime::StackError) -> &'static str {
         kh_runtime::StackError::TooSmall { .. } => "guest stack too small",
         kh_runtime::StackError::InvalidString => "invalid stack string",
     }
+}
+
+/// Late `dlopen` of a dylib that was not in the startup image set.
+///
+/// Maps one file, binds it against already-registered exports (libSystem /
+/// libc++), runs its initializers, and publishes it in the dyld table.
+fn load_dylib_on_demand(host: &Path, guest: &str) -> Option<u64> {
+    match load_dylib_on_demand_inner(host, guest) {
+        Ok(h) => Some(h),
+        Err(err) => {
+            tracing::warn!(
+                path = %host.display(),
+                guest,
+                error = %err,
+                "dlopen on-demand failed"
+            );
+            None
+        }
+    }
+}
+
+fn load_dylib_on_demand_inner(host: &Path, guest: &str) -> Result<u64, LoadError> {
+    if let Some(h) = kh_runtime::dlopen_lookup(Some(host), guest) {
+        return Ok(h);
+    }
+    let root = kh_runtime::bottle_root();
+    let mut session = LoadSession::open_with_guest(host, root, GuestPageSize::default())?;
+    session.map_standalone()?;
+    let _ = crate::rebase::rebase_process(&mut session)?;
+    let extra = kh_runtime::dyld_exports_flat();
+    crate::bind::bind_process_with_flat(&mut session, &extra)?;
+
+    for memory in session.mapped_memories_mut() {
+        let _ = patch_svc_to_brk(memory.regions_mut()).map_err(trap_to_load)?;
+    }
+    for img in session.images() {
+        if let Some(memory) = img.memory.as_ref() {
+            for region in memory.regions() {
+                kh_runtime::register_borrowed(region);
+            }
+        }
+    }
+
+    let host_pages = kh_runtime::HostPageSize::detect()
+        .map_err(|err| LoadError::PageLayout(err.to_string()))?;
+    let ctor_stack = map_stack(host_pages, 1024 * 1024).map_err(|err| {
+        LoadError::PageLayout(format!("dlopen ctor stack: {err}"))
+    })?;
+    kh_runtime::register_borrowed(&ctor_stack);
+    let sp = ctor_stack
+        .guest_addr
+        .saturating_add(ctor_stack.vmsize)
+        .saturating_sub(16)
+        & !15;
+    let _ = init::run_initializers(&session, sp)?;
+    std::mem::forget(ctor_stack);
+
+    register_dyld_images(&session);
+    std::mem::forget(session);
+    kh_runtime::dlopen_lookup(Some(host), guest)
+        .ok_or(LoadError::NotImplemented("dlopen: image not in table after map"))
 }
 
 /// Guest `HOME=…` for the bootstrap env block.

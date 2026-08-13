@@ -323,6 +323,10 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
     }
 }
 
+/// Same cookie as freestanding `dlsym` (`0x4B48C701`). Already-mapped `libLTO`
+/// (ld / clang `-lto_library`) must not `dlsym` into live LLVM plugin APIs.
+const LTO_DLOPEN_COOKIE: u64 = 0x0000_4B48_C701;
+
 fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
     let name = "kh_dlopen";
     let path_va = args.x0;
@@ -330,16 +334,71 @@ fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
     if path_va == 0 {
         return SyscallResult::ok(name, crate::dyld_table::RTLD_DEFAULT);
     }
-    let Some(guest_path) = bottle::read_c_string(path_va, CSTR_MAX) else {
+    let Some(raw_path) = bottle::read_c_string(path_va, CSTR_MAX) else {
         return SyscallResult::err(name, EFAULT);
     };
+    let guest_path = resolve_dlopen_guest_path(&raw_path);
     let host = bottle::translate_path(&guest_path).ok();
     if let Some(h) = crate::dyld_table::dlopen_lookup(host.as_deref(), &guest_path) {
-        SyscallResult::ok(name, h)
+        if guest_path.ends_with("libLTO.dylib") {
+            return SyscallResult::ok(name, LTO_DLOPEN_COOKIE);
+        }
+        return SyscallResult::ok(name, h);
+    }
+    // First open of a file that was not in the startup image set.
+    // Do **not** on-demand-map `libLTO.dylib` here: a mid-run bind of that
+    // ~150 MiB image SIGSEGVs (TEXT RX). `otool -t -v` is rewritten to
+    // `llvm-objdump` instead.
+    if guest_path.ends_with("libLTO.dylib") {
+        tracing::debug!(guest = %guest_path, "dlopen: skip on-demand libLTO");
+        return SyscallResult::ok(name, 0);
+    }
+    if let Some(hp) = host.as_deref()
+        && hp.is_file()
+        && let Some(h) = crate::try_dlopen_load(hp, &guest_path)
+    {
+        return SyscallResult::ok(name, h);
+    }
+    tracing::debug!(guest = %guest_path, "dlopen: no mapped image");
+    SyscallResult::ok(name, 0)
+}
+
+/// Make `dlopen` paths absolute and collapse `..`.
+///
+/// cctools `otool-classic` opens `$exedir/../lib/libLTO.dylib` (absolute with
+/// `..`). Bottle translation rejects `..` as an escape; collapse first.
+/// Relative names are resolved against `_NSGetExecutablePath`.
+fn resolve_dlopen_guest_path(guest: &str) -> String {
+    let joined = if guest.starts_with('/') {
+        std::path::PathBuf::from(guest)
+    } else if let Some(exe) = crate::process::guest_executable_path() {
+        let dir = std::path::Path::new(&exe)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"));
+        dir.join(guest)
     } else {
-        // Not mapped yet — soft fail (no on-demand load of 150 MiB plugins).
-        tracing::debug!(guest = %guest_path, "dlopen: no mapped image");
-        SyscallResult::ok(name, 0)
+        std::path::PathBuf::from(guest)
+    };
+    normalize_guest_abs(&joined)
+}
+
+fn normalize_guest_abs(path: &std::path::Path) -> String {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => out.push("/"),
+            Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        "/".to_owned()
+    } else {
+        out.to_string_lossy().into_owned()
     }
 }
 

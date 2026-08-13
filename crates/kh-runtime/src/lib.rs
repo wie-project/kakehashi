@@ -48,8 +48,9 @@ pub use bottle::{
 };
 pub use dyld_table::{
     RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF, clear as dyld_table_clear, dlopen_lookup, dlsym_lookup,
-    register_image as dyld_register_image,
+    exports_flat as dyld_exports_flat, register_image as dyld_register_image,
 };
+pub use process::dlopen_load::{set_dlopen_loader, try_dlopen_load};
 pub use process::{ProcessState, reset_run};
 
 pub use entry::{EntryError, call_guest, call_guest_args, jump_to_guest, jump_to_guest_args};
@@ -64,6 +65,7 @@ pub use regs::ThreadRegs;
 pub use stack::{StackError, bootstrap_stack};
 pub use syscall::{
     BsdSyscall, SyscallArgs, SyscallResult, known_syscalls, lookup as lookup_syscall, name_of,
+    rewrite_otool_classic_disasm,
 };
 pub use tls::{
     GUEST_TLS_MAGIC, enter_host_tls, install_main_guest_tls, leave_host_tls, prepare_host_meta,

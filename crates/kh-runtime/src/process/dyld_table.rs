@@ -142,6 +142,24 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Snapshot of every registered export (`nlist` → slid guest VA).
+///
+/// Used when binding a late `dlopen` image against already-mapped libSystem /
+/// libc++ without remapping those dylibs.
+#[must_use]
+pub fn exports_flat() -> Vec<(String, u64)> {
+    let Ok(g) = TABLE.lock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for img in g.iter() {
+        for (name, va) in &img.exports {
+            out.push((name.clone(), *va));
+        }
+    }
+    out
+}
+
 /// `dlsym(handle, name)` — name is the guest C nlist (often with leading `_`).
 #[must_use]
 pub fn dlsym_lookup(handle: u64, name: &str) -> Option<u64> {

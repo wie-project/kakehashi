@@ -11,6 +11,7 @@
 )]
 
 use core::ffi::{c_char, c_int, c_void};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::kh_core::errno;
 use crate::kh_core::heap::{free, malloc};
@@ -2639,6 +2640,83 @@ const VM_PAGE: usize = 16_384;
 const VM_META_WORDS: usize = 2;
 const VM_META_BYTES: usize = core::mem::size_of::<usize>() * VM_META_WORDS;
 
+/// Side table of `vm_allocate` interiors. Darwin guests (otool, cctools) pair
+/// `mmap` with `vm_deallocate`; peeking 16 bytes before `addr` SIGSEGVs when
+/// that page is not ours.
+const VM_REG_CAP: usize = 128;
+
+#[derive(Clone, Copy)]
+struct VmRegion {
+    user: usize,
+    raw: usize,
+    map_size: usize,
+}
+
+static mut VM_REGS: [VmRegion; VM_REG_CAP] = [VmRegion {
+    user: 0,
+    raw: 0,
+    map_size: 0,
+}; VM_REG_CAP];
+static VM_REGS_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn vm_regs_lock() {
+    while VM_REGS_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn vm_regs_unlock() {
+    VM_REGS_LOCK.store(false, Ordering::Release);
+}
+
+fn vm_reg_insert(user: usize, raw: usize, map_size: usize) {
+    if user == 0 {
+        return;
+    }
+    vm_regs_lock();
+    // SAFETY: exclusive via VM_REGS_LOCK.
+    unsafe {
+        for slot in &mut VM_REGS {
+            if slot.user == 0 {
+                *slot = VmRegion {
+                    user,
+                    raw,
+                    map_size,
+                };
+                break;
+            }
+        }
+    }
+    vm_regs_unlock();
+}
+
+fn vm_reg_take(user: usize) -> Option<(usize, usize)> {
+    if user == 0 {
+        return None;
+    }
+    vm_regs_lock();
+    let found = unsafe {
+        let mut hit = None;
+        for slot in &mut VM_REGS {
+            if slot.user == user {
+                hit = Some((slot.raw, slot.map_size));
+                *slot = VmRegion {
+                    user: 0,
+                    raw: 0,
+                    map_size: 0,
+                };
+                break;
+            }
+        }
+        hit
+    };
+    vm_regs_unlock();
+    found
+}
+
 /// `vm_allocate(task, *addr, size, flags)` → anonymous RW map.
 ///
 /// `flags` bit0 = anywhere (1) vs fixed (0). Soft: always anywhere via mmap.
@@ -2646,7 +2724,8 @@ const VM_META_BYTES: usize = core::mem::size_of::<usize>() * VM_META_WORDS;
 /// **Alignment (G5):** host Linux mmap is often 4 KiB-aligned; modern Apple `ld`
 /// `UnsafeHeaderWriter` requires `buffer.data()` aligned to guest page (16 KiB).
 /// Over-map and return a 16 KiB-aligned interior pointer. Raw base + map size
-/// sit in two words immediately before the returned address for deallocate.
+/// are recorded in a side table — never recovered by reading before the user
+/// pointer (`mmap`+`vm_deallocate` has no prefix page).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn vm_allocate(
     _task: usize,
@@ -2683,19 +2762,18 @@ pub(crate) unsafe extern "C" fn vm_allocate(
         let _ = unsafe { munmap(raw, map_size) };
         return KERN_NO_SPACE;
     }
-    // Layout: [raw_base][map_size][…pad…][user…]
+    vm_reg_insert(user_addr, raw_addr, map_size);
     unsafe {
-        let meta = core::ptr::with_exposed_provenance_mut::<usize>(
-            user_addr.saturating_sub(VM_META_BYTES),
-        );
-        meta.write(raw_addr);
-        meta.add(1).write(map_size);
         addr.write(core::ptr::with_exposed_provenance_mut(user_addr));
     }
     KERN_SUCCESS
 }
 
 /// `vm_deallocate(task, addr, size)`.
+///
+/// Must not load from `addr - N`. Apple cctools (`otool-classic`) maps a file
+/// with `mmap` and releases it with `vm_deallocate`; the bytes before the map
+/// are unmapped.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn vm_deallocate(
     _task: usize,
@@ -2705,26 +2783,11 @@ pub(crate) unsafe extern "C" fn vm_deallocate(
     if addr.is_null() || size == 0 {
         return KERN_INVALID_ARGUMENT;
     }
-    let user = addr.addr();
-    if user >= VM_META_BYTES {
-        let meta = core::ptr::with_exposed_provenance::<usize>(user.saturating_sub(VM_META_BYTES));
-        let raw_base = unsafe { meta.read() };
-        let map_size = unsafe { meta.add(1).read() };
-        if raw_base != 0
-            && raw_base < user
-            && map_size >= size
-            && user.saturating_sub(raw_base) < map_size
-        {
-            let rc = unsafe { munmap(core::ptr::with_exposed_provenance_mut(raw_base), map_size) };
-            return if rc != 0 {
-                KERN_INVALID_ARGUMENT
-            } else {
-                KERN_SUCCESS
-            };
-        }
-    }
-    // Fallback: treat addr/size as the whole mapping (legacy callers).
-    let rc = unsafe { munmap(addr, size) };
+    let (unmap_ptr, unmap_len) = match vm_reg_take(addr.addr()) {
+        Some((raw, map_size)) => (core::ptr::with_exposed_provenance_mut(raw), map_size),
+        None => (addr, size),
+    };
+    let rc = unsafe { munmap(unmap_ptr, unmap_len) };
     if rc != 0 {
         KERN_INVALID_ARGUMENT
     } else {
@@ -2902,6 +2965,124 @@ pub(crate) unsafe extern "C" fn localtime_r(clock: *const i64, result: *mut c_vo
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn difftime(time1: f64, time0: f64) -> f64 {
     time1 - time0
+}
+
+/// POSIX `asctime` buffer: `"Www Mmm dd hh:mm:ss yyyy\n"` + NUL (26+1).
+static mut CTIME_BUF: [c_char; 32] = [0; 32];
+
+const WEEKDAYS: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+const MONTHS: [&[u8; 3]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+];
+
+#[allow(clippy::integer_division)]
+fn write_two_digits(dst: &mut [u8], tens_idx: usize, v: c_int, space_pad_tens: bool) {
+    let n = v.max(0);
+    let tens = n / 10;
+    let ones = n % 10;
+    if let Some(slot) = dst.get_mut(tens_idx) {
+        *slot = if space_pad_tens && tens == 0 {
+            b' '
+        } else {
+            b'0'.wrapping_add(u8::try_from(tens).unwrap_or(0))
+        };
+    }
+    if let Some(slot) = dst.get_mut(tens_idx.saturating_add(1)) {
+        *slot = b'0'.wrapping_add(u8::try_from(ones).unwrap_or(0));
+    }
+}
+
+/// `"Www Mmm dd hh:mm:ss yyyy\n\0"` into `dst` (needs 27 bytes).
+unsafe fn write_asctime(tm: &Tm, dst: *mut c_char) {
+    let mut buf = *b"Thu Jan  1 00:00:00 1970\n\0";
+    let w = usize::try_from(tm.wday.rem_euclid(7)).unwrap_or(0);
+    let mo = usize::try_from(tm.mon.rem_euclid(12)).unwrap_or(0);
+    if let (Some(day), Some(slot)) = (WEEKDAYS.get(w), buf.get_mut(0..3)) {
+        slot.copy_from_slice(*day);
+    }
+    if let (Some(mon), Some(slot)) = (MONTHS.get(mo), buf.get_mut(4..7)) {
+        slot.copy_from_slice(*mon);
+    }
+    write_two_digits(&mut buf, 8, tm.mday, true);
+    write_two_digits(&mut buf, 11, tm.hour, false);
+    write_two_digits(&mut buf, 14, tm.min, false);
+    write_two_digits(&mut buf, 17, tm.sec, false);
+    let year = tm.year.saturating_add(1900).max(0);
+    let y = u32::try_from(year).unwrap_or(1970);
+    #[allow(clippy::integer_division)]
+    {
+        if let Some(slot) = buf.get_mut(20) {
+            *slot = b'0'.wrapping_add(u8::try_from((y / 1000) % 10).unwrap_or(1));
+        }
+        if let Some(slot) = buf.get_mut(21) {
+            *slot = b'0'.wrapping_add(u8::try_from((y / 100) % 10).unwrap_or(9));
+        }
+        if let Some(slot) = buf.get_mut(22) {
+            *slot = b'0'.wrapping_add(u8::try_from((y / 10) % 10).unwrap_or(7));
+        }
+        if let Some(slot) = buf.get_mut(23) {
+            *slot = b'0'.wrapping_add(u8::try_from(y % 10).unwrap_or(0));
+        }
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr().cast::<c_char>(), dst, buf.len());
+    }
+}
+
+/// C `asctime` → nlist `_asctime`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn asctime(tm: *const c_void) -> *mut c_char {
+    if tm.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        write_asctime(&*tm.cast::<Tm>(), CTIME_BUF.as_mut_ptr());
+        CTIME_BUF.as_mut_ptr()
+    }
+}
+
+/// C `asctime_r` → nlist `_asctime_r`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn asctime_r(tm: *const c_void, buf: *mut c_char) -> *mut c_char {
+    if tm.is_null() || buf.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        write_asctime(&*tm.cast::<Tm>(), buf);
+        buf
+    }
+}
+
+/// C `ctime` → nlist `_ctime` (otool `-l` timestamps).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ctime(clock: *const i64) -> *mut c_char {
+    unsafe { asctime(fill_tm(clock).cast()) }
+}
+
+/// C `ctime_r` → nlist `_ctime_r`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ctime_r(clock: *const i64, buf: *mut c_char) -> *mut c_char {
+    if buf.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut tmp = Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 1,
+        mon: 0,
+        year: 70,
+        wday: 4,
+        yday: 0,
+        isdst: 0,
+        gmtoff: 0,
+        zone: core::ptr::null(),
+    };
+    unsafe {
+        fill_tm_into(clock, core::ptr::addr_of_mut!(tmp));
+        write_asctime(&tmp, buf);
+        buf
+    }
 }
 
 unsafe fn fill_tm(clock: *const i64) -> *mut Tm {

@@ -19,7 +19,10 @@ pub mod rebase;
 pub mod resolve;
 pub mod session;
 
-pub use bind::{BindResolveCache, BindSite, bind_process, collect_bind_sites, encode_pointer_bind};
+pub use bind::{
+    BindResolveCache, BindSite, bind_process, bind_process_with_flat, collect_bind_sites,
+    encode_pointer_bind,
+};
 pub use chained::{
     ChainDecode, ChainedImport, DYLD_CHAINED_PTR_64, DYLD_CHAINED_PTR_64_OFFSET,
     DYLD_CHAINED_PTR_ARM64E, DYLD_CHAINED_PTR_ARM64E_USERLAND, DYLD_CHAINED_PTR_ARM64E_USERLAND24,

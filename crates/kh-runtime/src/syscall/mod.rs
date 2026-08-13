@@ -40,6 +40,7 @@ use crate::trap::TrapOutcome;
 pub use common::{
     EBADF, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, EPERM, SyscallArgs, SyscallResult,
 };
+pub use process::rewrite_otool_classic_disasm;
 pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
 
 /// Resets FD table, soft signal state, and syscall counter for a new run.

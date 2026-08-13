@@ -295,6 +295,13 @@ impl LoadSession {
         self.main_plan_ref()
     }
 
+    /// Parse + plan + map the session executable only (no dependency walk).
+    ///
+    /// Used for late `dlopen` of a single dylib already resolved on the host.
+    pub fn map_standalone(&mut self) -> Result<(), LoadError> {
+        self.map_main_only()
+    }
+
     /// Maps main only into `images = [main]` (no dependency walk).
     ///
     /// Unit tests / simple tooling. Production `dry_load` and `run_micro` use

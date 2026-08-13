@@ -12,19 +12,14 @@ use crate::kh_core::helpers::{KH_HELPER_DLOPEN, KH_HELPER_DLSYM};
 // `dlopen`/`dlsym`. Returning the existing image handle (not null) unblocks
 // non-bitcode links without a second map of LLVM.
 
-/// C `dlopen` → non-null handle for `libLTO.dylib`, else host table / null.
+/// C `dlopen` → host mapped-image table (and on-demand load).
 ///
-/// Clang always passes `-lto_library …/libLTO.dylib`. Modern `ld` already has
-/// `@rpath/libLTO` mapped at process start. Returning null from `dlopen` wedges
-/// the linker; a cookie handle (without calling into real LLVM via `dlsym`) is
-/// enough for non-bitcode links. Bitcode LTO codegen needs real `dlsym` later.
+/// Policy for `libLTO.dylib` lives in the host helper: already-mapped (ld /
+/// clang `-lto_library`) still gets the cookie so `dlsym` does not enter live
+/// LLVM plugin entry points; a first-time `dlopen` (otool-classic) maps the
+/// dylib and returns a real handle.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dlopen(path: *const c_char, _mode: c_int) -> *mut c_void {
-    // Prefer the LTO cookie first so we never hand out a handle that `dlsym`
-    // resolves into live LLVM (those entry points hang under freestanding).
-    if path_ends_with_liblto(path) {
-        return core::ptr::with_exposed_provenance_mut(0x0000_4B48_C701);
-    }
     let path_va = if path.is_null() {
         0_u64
     } else {
@@ -37,34 +32,6 @@ pub(crate) unsafe extern "C" fn dlopen(path: *const c_char, _mode: c_int) -> *mu
         return core::ptr::with_exposed_provenance_mut(usize::try_from(bits).unwrap_or(0));
     }
     core::ptr::null_mut()
-}
-
-const LIBLTO_SUFFIX: &[u8] = b"libLTO.dylib";
-
-#[inline]
-fn path_ends_with_liblto(path: *const c_char) -> bool {
-    if path.is_null() {
-        return false;
-    }
-    let mut i = 0_usize;
-    while i < 4096 {
-        let b = unsafe { path.add(i).read() };
-        if b == 0 {
-            break;
-        }
-        i = i.saturating_add(1);
-    }
-    if i < LIBLTO_SUFFIX.len() {
-        return false;
-    }
-    let start = i.saturating_sub(LIBLTO_SUFFIX.len());
-    for (j, &sb) in LIBLTO_SUFFIX.iter().enumerate() {
-        let b = unsafe { path.add(start.saturating_add(j)).read() }.cast_unsigned();
-        if b != sb {
-            return false;
-        }
-    }
-    true
 }
 
 /// C `dlsym` → guest VA from the mapped-image table, or null.

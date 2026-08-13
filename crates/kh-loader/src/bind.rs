@@ -181,10 +181,30 @@ impl BindResolveCache {
 ///
 /// Call **after** map and (non-chained) section rebase.
 pub fn bind_process(session: &mut LoadSession) -> Result<(), LoadError> {
+    bind_process_with_flat(session, &[])
+}
+
+/// Bind with extra slid exports (already-mapped process images).
+///
+/// Late `dlopen` maps only the new dylib; two-level ordinals to libc++ /
+/// libSystem miss the session set and fall back to this flat table.
+pub fn bind_process_with_flat(
+    session: &mut LoadSession,
+    extra_flat: &[(String, u64)],
+) -> Result<(), LoadError> {
     crate::load_timing::time_result("bind_fill_exports", || fill_exports(session))?;
-    let cache = crate::load_timing::time("bind_resolve_cache", || {
+    let mut cache = crate::load_timing::time("bind_resolve_cache", || {
         BindResolveCache::build(session.images())
     });
+    for (name, va) in extra_flat {
+        cache.flat.entry(name.clone()).or_insert(*va);
+    }
+    if cache.missing_named.is_none() {
+        cache.missing_named = cache.flat.get("_kh_missing_symbol_named").copied();
+    }
+    if cache.missing_anon.is_none() {
+        cache.missing_anon = cache.flat.get("_kh_missing_symbol").copied();
+    }
 
     let n = session.images.len();
     let mut used_any = false;
