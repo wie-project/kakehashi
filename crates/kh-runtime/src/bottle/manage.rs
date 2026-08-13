@@ -295,6 +295,7 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_libcurl_symlink(path)?;
     layout::ensure_libxar_symlink(path)?;
     layout::ensure_libz_symlink(path)?;
+    layout::ensure_libedit_symlink(path)?;
     layout::ensure_dev_nodes(path)?;
     layout::ensure_host_ssh_bridge(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;

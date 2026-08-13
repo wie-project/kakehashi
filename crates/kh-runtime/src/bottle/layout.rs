@@ -53,6 +53,15 @@ pub(crate) const GUEST_LIBZ_REL: &str = "usr/lib/libz.1.dylib";
 /// Relative symlink target of [`GUEST_LIBZ_REL`].
 pub(crate) const GUEST_LIBZ_TARGET: &str = "libSystem.B.dylib";
 
+/// Guest path for `libedit.3.dylib` (SDK `libreadline.tbd` install name).
+///
+/// Soft `readline` / `add_history` / `rl_readline_name` live in freestanding
+/// libSystem (`libedit` module).
+pub(crate) const GUEST_LIBEDIT_REL: &str = "usr/lib/libedit.3.dylib";
+
+/// Relative symlink target of [`GUEST_LIBEDIT_REL`].
+pub(crate) const GUEST_LIBEDIT_TARGET: &str = "libSystem.B.dylib";
+
 /// Empty directories that form the post-install macOS root skeleton.
 ///
 /// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`,
@@ -132,6 +141,7 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     // ld-classic (clang G4): libxar + libz → freestanding surface.
     ensure_libxar_symlink(root)?;
     ensure_libz_symlink(root)?;
+    ensure_libedit_symlink(root)?;
 
     // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
     let volumes_linux = root.join(VOLUMES_LINUX);
@@ -332,6 +342,11 @@ pub(crate) fn ensure_libxar_symlink(root: &Path) -> io::Result<()> {
 /// Ensures `usr/lib/libz.1.dylib` → freestanding libSystem.
 pub(crate) fn ensure_libz_symlink(root: &Path) -> io::Result<()> {
     ensure_lib_alias_symlink(root, GUEST_LIBZ_REL, GUEST_LIBZ_TARGET, true)
+}
+
+/// Ensures `usr/lib/libedit.3.dylib` → freestanding libSystem (readline).
+pub(crate) fn ensure_libedit_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBEDIT_REL, GUEST_LIBEDIT_TARGET, true)
 }
 
 /// Shared install-name alias helper (libc++ / libcurl → freestanding libSystem).

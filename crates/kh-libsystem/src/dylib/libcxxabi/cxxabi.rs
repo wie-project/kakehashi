@@ -328,6 +328,26 @@ pub unsafe extern "C" fn tlv_bootstrap_entry() {
 
 // ── libunwind ───────────────────────────────────────────────────────────────
 
+/// Itanium `_URC_END_OF_STACK` — search found no handler.
+const URC_END_OF_STACK: c_int = 5;
+
+/// `_Unwind_RaiseException` → nlist `__Unwind_RaiseException`.
+///
+/// Spec: Itanium C++ ABI §1.3. `__cxa_throw` must call this after filling the
+/// language header. Compact-unwind walk is not implemented yet, so search
+/// reports end-of-stack and the caller terminates. The export itself is
+/// required: guests that import it must not bind the missing-symbol trampoline
+/// (hard exit 127).
+#[unsafe(export_name = "_Unwind_RaiseException")]
+pub(crate) unsafe extern "C" fn unwind_raise_exception(_exception_object: *mut c_void) -> c_int {
+    trace::note(b"[kh-libsystem] __Unwind_RaiseException (no handler)\n");
+    URC_END_OF_STACK
+}
+
+/// `_Unwind_DeleteException` → nlist `__Unwind_DeleteException`.
+#[unsafe(export_name = "_Unwind_DeleteException")]
+pub(crate) unsafe extern "C" fn unwind_delete_exception(_exception_object: *mut c_void) {}
+
 /// `_Unwind_Resume` → nlist `__Unwind_Resume` (never returns).
 #[unsafe(export_name = "_Unwind_Resume")]
 pub(crate) unsafe extern "C" fn unwind_resume(_exception_object: *mut c_void) -> ! {
@@ -612,6 +632,8 @@ pub(crate) unsafe extern "C" fn cxa_throw(
         force_note_hex(ra);
     }
     trace::force_note(b"\n");
+    // Itanium: raise, then terminate if no handler was installed.
+    let _ = unsafe { unwind_raise_exception(exception) };
     unsafe {
         exit_now(1);
     }

@@ -6,6 +6,7 @@ pub(crate) mod libcxx;
 pub(crate) mod libcxxabi;
 pub(crate) mod libdispatch;
 pub(crate) mod libdyld;
+pub(crate) mod libedit;
 pub(crate) mod libiconv;
 pub(crate) mod libobjc;
 pub(crate) mod libsystem_blocks;
