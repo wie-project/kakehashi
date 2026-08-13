@@ -86,6 +86,27 @@ const SB_HM: usize = 0x58;
 const SB_MODE: usize = 0x60;
 const MODE_OUT: u32 = 0x10;
 const MODE_IN: u32 = 0x08;
+/// Soft cap for one `xsputn` / put-area span. Leftover stack width or a
+/// long-string size byte used to request ~300 MiB `memmove`s.
+const SB_MAX_PUT: usize = 1 << 20;
+
+#[inline]
+unsafe fn sb_put_area_sane(this: *mut c_void) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let pbase = unsafe { sb_load_ptr(this, SB_PBASE) };
+    let pptr = unsafe { sb_load_ptr(this, SB_PPTR) };
+    let epptr = unsafe { sb_load_ptr(this, SB_EPPTR) };
+    if pbase.is_null() || pptr.is_null() || epptr.is_null() {
+        return false;
+    }
+    if pptr < pbase || epptr < pptr {
+        return false;
+    }
+    let span = unsafe { epptr.offset_from(pbase) as usize };
+    span > 0 && span <= SB_MAX_PUT
+}
 
 #[inline]
 unsafe fn sb_load_ptr(this: *mut c_void, off: usize) -> *mut u8 {
@@ -124,10 +145,10 @@ unsafe fn soft_init_buf_ptrs(this: *mut c_void) {
         sb_store_ptr(this, SB_PBASE, data);
         sb_store_ptr(this, SB_PPTR, pptr);
         sb_store_ptr(this, SB_EPPTR, epptr);
-        let hm = sb_load_ptr(this, SB_HM);
-        if hm.is_null() || hm < pptr {
-            sb_store_ptr(this, SB_HM, pptr);
-        }
+        // Always plant `__hm_` in the live buffer. After SSO→heap growth the
+        // previous hm is still the stack SSO; `str()` does `memmove(dst,
+        // pbase, hm - pbase)` and that difference is hundreds of MiB.
+        sb_store_ptr(this, SB_HM, pptr);
         let mode_p = this.cast::<u8>().add(SB_MODE).cast::<u32>();
         let m = mode_p.read();
         if m & MODE_OUT == 0 {
@@ -190,30 +211,20 @@ unsafe fn soft_sync_string_from_put(this: *mut c_void) {
 }
 
 /// Soft `xsputn` — write into put area / grow string; update `__hm_`.
-///
-/// Also mirrors bytes to guest stderr so partial diagnostics remain visible
-/// even if a later `str()` path is wrong.
 unsafe extern "C" fn soft_xsputn(this: *mut c_void, s: *const u8, n: usize) -> usize {
-    if !s.is_null() && n > 0 {
-        let _ = unsafe {
-            crate::kh_core::sys::syscall3(
-                crate::kh_core::sys::SYS_WRITE,
-                2,
-                u64::try_from(s.addr()).unwrap_or(0),
-                u64::try_from(n).unwrap_or(0),
-            )
-        };
+    // Insane counts come from leftover `width` / long-string size, not from
+    // `ld` diagnostics (symbol names are short). Claim success so parse
+    // does not failbit — same observable as a failed sentry.
+    if n > SB_MAX_PUT {
+        return n;
     }
     if this.is_null() || s.is_null() || n == 0 {
         return n;
     }
     unsafe {
-        let pptr0 = sb_load_ptr(this, SB_PPTR);
-        let epptr0 = sb_load_ptr(this, SB_EPPTR);
-        if pptr0.is_null() || epptr0.is_null() {
-            // No put area: append the whole slice into the freestanding string.
+        if !sb_put_area_sane(this) {
+            // No / garbage put area: append into the freestanding string.
             let str_p = this.cast::<u8>().add(SB_STRING).cast::<c_void>();
-            // Host empty short may encode size_byte=22; clear if no put area.
             crate::dylib::libcxx::string::string_clear(str_p);
             let _ = crate::dylib::libcxx::string::string_append_ptr_len(
                 str_p,
@@ -1189,19 +1200,30 @@ pub(crate) unsafe extern "C" fn get_collation_name(name: *const c_char) -> *cons
     name
 }
 
+/// Public `ios_base` fmtflags used by modern `ld` `__put_character_sequence`
+/// (`ldr w, [ios,#8]` then `and #0xb0` for `adjustfield`; `left` is 0x20).
+const IOS_FMT_DEC: u32 = 0x0002;
+const IOS_FMT_SKIPWS: u32 = 0x1000;
+const IOS_STATE_BADBIT: u32 = 0x1;
+
 /// `ios_base::init(void* sb)`.
 ///
-/// Soft: install the streambuf and clear a few known `ios_base` / `basic_ios`
-/// fields. **Do not bulk-zero a large region** — modern Apple `ld`
-/// `checkUndefines` builds a stack `stringstream` whose virtual-base `this`
-/// can sit near (or at) a local `vector` of undefined symbols. A `memset` of
-/// 0x100 (or even 0x90) from that `this` stomps the vector begin/end and yields
-/// empty undef diagnostics:
-/// ```text
-/// Undefined symbols for architecture arm64:
-/// ld: symbol(s) not found for architecture
-/// ```
-/// Field offsets are ABI-observed for Apple arm64 libc++ (not a paste of headers).
+/// Member order from the public MacOSX.sdk `ios` class body (names only) plus
+/// the vptr, checked against modern Apple `ld` `__put_character_sequence`
+/// (loads flags @+0x08, width @+0x18, rdbuf @+0x28, fill @+0x90):
+///   +0x00 vptr (caller stores this before `init` — do not overwrite)
+///   +0x08 fmtflags    +0x10 precision    +0x18 width
+///   +0x20 rdstate     +0x24 exceptions   +0x28 rdbuf
+///   +0x30 locale      +0x38..+0x80 callback / iword / pword scalars
+///   +0x88 tie (basic_ios)   +0x90 fill cache
+///
+/// Inlined `__pad_and_output` does `string(width - n, fill)` then
+/// `memset`/`memmove` of that count. Width must be 0 here: leftover stack
+/// (~300 MiB) was used as a copy length into a 16 KiB page (`Options::parse`).
+///
+/// **Do not bulk-zero 0x100** — `checkUndefines` keeps its undef `vector` just
+/// past this object (`this+0x98` on that frame). Do not store `rdbuf` at +0x00
+/// (that is the vptr) or 0 at +0x28 (that is `rdbuf`, not `rdstate`).
 #[unsafe(export_name = "_ZNSt3__18ios_base4initEPv")]
 pub(crate) unsafe extern "C" fn ios_base_init(this: *mut c_void, sb: *mut c_void) {
     ensure_iostream_vtables();
@@ -1210,20 +1232,23 @@ pub(crate) unsafe extern "C" fn ios_base_init(this: *mut c_void, sb: *mut c_void
     }
     unsafe {
         let base = this.cast::<u8>();
-        // rdbuf: common placements at +0x00 (some subobjects) and +0x20 (basic_ios).
-        base.cast::<*mut c_void>().write(sb);
-        base.add(0x20).cast::<*mut c_void>().write(sb);
-        // iostate at +0x20.. also used as flags word in some layouts — set goodbit=0
-        // only if not the same slot we just used for rdbuf; use +0x28 for state.
-        base.add(0x28).cast::<u32>().write(0); // rdstate goodbit
-        base.add(0x2c).cast::<u32>().write(0); // exceptions
-        // precision / width (isize pair around +0x30)
-        base.add(0x30).cast::<usize>().write(6); // precision default
-        base.add(0x38).cast::<isize>().write(0); // width
-        // fmtflags at +0x40-ish
-        base.add(0x40).cast::<u32>().write(0x1000); // skipws|dec-ish soft default
-        // clear small tail used by post-init stores (+0x88..+0x90) without a bulk wipe.
-        base.add(0x88).cast::<u64>().write(0);
+        // Scalars only — the caller already installed the vptr / VTT.
+        base.add(0x08).cast::<u32>().write(IOS_FMT_SKIPWS | IOS_FMT_DEC);
+        base.add(0x10).cast::<isize>().write(6); // precision
+        base.add(0x18).cast::<isize>().write(0); // width
+        let state = if sb.is_null() { IOS_STATE_BADBIT } else { 0 };
+        base.add(0x20).cast::<u32>().write(state);
+        base.add(0x24).cast::<u32>().write(0); // exceptions
+        base.add(0x28).cast::<*mut c_void>().write(sb);
+        base.add(0x30).cast::<usize>().write(LOCALE_SOFT_BODY);
+        // Callback / iword / pword: empty (8-byte stores through +0x80 inclusive).
+        let mut off = 0x38_usize;
+        while off <= 0x80 {
+            base.add(off).cast::<usize>().write(0);
+            off = off.saturating_add(8);
+        }
+        // `basic_ios::init` tail (ld also stores these after the call).
+        base.add(0x88).cast::<u64>().write(0); // tie
     }
 }
 
@@ -1272,14 +1297,18 @@ pub(crate) unsafe extern "C" fn iostream_dtor_d2(_this: *mut c_void) {}
 pub(crate) unsafe extern "C" fn basic_ios_dtor_d2(_this: *mut c_void) {}
 
 /// `basic_ostream::sentry::sentry(ostream&)`.
+///
+/// Apple `ld` `__put_character_sequence` does `ldrb [sentry+0]; cmp #1`.
+/// First word still holds `ostream*` (high bytes); low byte is `__ok_`.
 #[unsafe(export_name = "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_")]
 pub(crate) unsafe extern "C" fn ostream_sentry_ctor(this: *mut c_void, os: *mut c_void) {
     if this.is_null() {
         return;
     }
     unsafe {
-        // layout: { ostream*, ok bool }
         this.cast::<usize>().write(os as usize);
+        // `__put_character_sequence` tests this byte, not +8.
+        this.cast::<u8>().write(1);
         this.cast::<u8>().add(8).write(1);
     }
 }
@@ -1298,9 +1327,9 @@ pub(crate) unsafe extern "C" fn istream_sentry_ctor(
     if this.is_null() {
         return;
     }
+    let _ = is;
     unsafe {
-        this.cast::<usize>().write(is as usize);
-        this.cast::<u8>().add(8).write(1);
+        this.cast::<u8>().write(1);
     }
 }
 
@@ -1326,15 +1355,6 @@ unsafe fn ostream_put_decimal(this: *mut c_void, mut v: u64, neg: bool) {
         buf[i] = b'-';
     }
     let digs = &buf[i..];
-    // Mirror to stderr for sparse-diagnostic recovery.
-    let _ = unsafe {
-        crate::kh_core::sys::syscall3(
-            crate::kh_core::sys::SYS_WRITE,
-            2,
-            u64::try_from(digs.as_ptr().addr()).unwrap_or(0),
-            u64::try_from(digs.len()).unwrap_or(0),
-        )
-    };
     // rdbuf offsets observed for stringstream/ostream (basic_ios +0x28, etc.).
     for off in [0x28usize, 0x98, 0x20, 0x0, 0x18] {
         let cand = unsafe { this.cast::<u8>().add(off).cast::<*mut c_void>().read() };
