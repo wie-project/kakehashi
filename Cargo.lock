@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "kh-libsystem"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "cc",
  "miniz_oxide",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "kh-loader"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "goblin",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "kh-runtime"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "flate2",
  "libc",
