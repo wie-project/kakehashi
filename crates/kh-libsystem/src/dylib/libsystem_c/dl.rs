@@ -14,10 +14,10 @@ use crate::kh_core::helpers::{KH_HELPER_DLOPEN, KH_HELPER_DLSYM};
 
 /// C `dlopen` → host mapped-image table (and on-demand load).
 ///
-/// Policy for `libLTO.dylib` lives in the host helper: already-mapped (ld /
-/// clang `-lto_library`) still gets the cookie so `dlsym` does not enter live
-/// LLVM plugin entry points; a first-time `dlopen` (otool-classic) maps the
-/// dylib and returns a real handle.
+/// Policy for `libLTO.dylib` lives in the host helper: a mapped image returns
+/// a real handle. `dlsym` allows the LLVM C disassembler plus
+/// `lto_initialize_disassembler` (`otool -t -v`) and still hides `lto_*`
+/// plugin entry points (clang `-lto_library`).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dlopen(path: *const c_char, _mode: c_int) -> *mut c_void {
     let path_va = if path.is_null() {
@@ -36,8 +36,8 @@ pub(crate) unsafe extern "C" fn dlopen(path: *const c_char, _mode: c_int) -> *mu
 
 /// C `dlsym` → guest VA from the mapped-image table, or null.
 ///
-/// The LTO cookie handle never resolves symbols (avoids jumping into LLVM
-/// under freestanding). Other handles use the host table for real VAs.
+/// The legacy LTO cookie handle never resolves symbols. Real handles go to
+/// the host table (`LLVMCreateDisasm` is allowed; `lto_*` stays hidden).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
     if symbol.is_null() {

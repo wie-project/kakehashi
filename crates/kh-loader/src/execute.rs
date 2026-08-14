@@ -86,19 +86,6 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
 
     kh_runtime::set_dlopen_loader(load_dylib_on_demand);
     set_bottle_root(opts.root.clone());
-
-    // `kh run otool-classic -- -t -v` (and llvm-otool's exec of it).
-    let (path, opts) = if let Some((new_path, new_argv)) =
-        kh_runtime::rewrite_otool_classic_disasm(path, &opts.guest_args)
-    {
-        let mut o = opts.clone();
-        o.guest_args = new_argv.into_iter().skip(1).collect();
-        (new_path, o)
-    } else {
-        (path.to_path_buf(), opts.clone())
-    };
-    let path = path.as_path();
-    let opts = &opts;
     // Guest-visible main path for `_NSGetExecutablePath` (clang -cc1 re-spawn).
     let guest_exec = host_path_to_guest(path).or_else(|| {
         // Bare host path outside bottle: still prefer an absolute guest-ish form.
@@ -111,6 +98,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let mut session = crate::load_timing::time_result("open_session", || {
         LoadSession::open_with_guest(path, opts.root.clone(), opts.guest_page_size)
     })?;
+    // `otool-classic -t -v` `dlopen`s sibling `libLTO` for `LLVMCreateDisasm`.
+    // Mid-run map of that image faults (RX TEXT bind). Seed it here so it
+    // takes the same startup `map_process` path that already works for `ld`.
+    maybe_seed_otool_liblto(&mut session, path, &opts.guest_args);
     // Sub-phases recorded inside `map_process` (map_main / walk_deps / rebase / bind).
     let _ = session.map_process()?;
 
@@ -383,6 +374,33 @@ fn stack_err_static(err: &kh_runtime::StackError) -> &'static str {
         kh_runtime::StackError::TooSmall { .. } => "guest stack too small",
         kh_runtime::StackError::InvalidString => "invalid stack string",
     }
+}
+
+/// Seed sibling `libLTO.dylib` when `otool-classic` will ask LLVM for `-t -v`.
+fn maybe_seed_otool_liblto(session: &mut LoadSession, path: &Path, argv: &[String]) {
+    if !kh_runtime::otool_classic_wants_llvm_disasm(path, argv) {
+        return;
+    }
+    let Some(guest) = liblto_install_name_for_otool(path) else {
+        tracing::debug!(
+            exe = %path.display(),
+            "otool-classic -t -v: sibling libLTO.dylib not on disk"
+        );
+        return;
+    };
+    tracing::info!(liblto = %guest, "seed libLTO for otool-classic LLVM disasm");
+    session.seed_dylib(guest);
+}
+
+/// Guest install name for `$exedir/../lib/libLTO.dylib` (cctools layout).
+fn liblto_install_name_for_otool(otool: &Path) -> Option<String> {
+    let lib = otool.parent()?.join("..").join("lib").join("libLTO.dylib");
+    if !lib.is_file() {
+        return None;
+    }
+    kh_runtime::bottle::host_path_to_guest(&lib).or_else(|| {
+        Some("/Library/Developer/CommandLineTools/usr/lib/libLTO.dylib".to_owned())
+    })
 }
 
 /// Late `dlopen` of a dylib that was not in the startup image set.

@@ -65,7 +65,7 @@ pub use regs::ThreadRegs;
 pub use stack::{StackError, bootstrap_stack};
 pub use syscall::{
     BsdSyscall, SyscallArgs, SyscallResult, known_syscalls, lookup as lookup_syscall, name_of,
-    rewrite_otool_classic_disasm,
+    otool_classic_wants_llvm_disasm,
 };
 pub use tls::{
     GUEST_TLS_MAGIC, enter_host_tls, install_main_guest_tls, leave_host_tls, prepare_host_meta,

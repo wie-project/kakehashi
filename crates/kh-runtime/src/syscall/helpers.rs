@@ -323,8 +323,8 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
     }
 }
 
-/// Same cookie as freestanding `dlsym` (`0x4B48C701`). Already-mapped `libLTO`
-/// (ld / clang `-lto_library`) must not `dlsym` into live LLVM plugin APIs.
+/// Same cookie as freestanding `dlsym` (`0x4B48C701`). Kept so an old
+/// handle still never resolves `lto_*` plugin entry points.
 const LTO_DLOPEN_COOKIE: u64 = 0x0000_4B48_C701;
 
 fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
@@ -340,15 +340,13 @@ fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
     let guest_path = resolve_dlopen_guest_path(&raw_path);
     let host = bottle::translate_path(&guest_path).ok();
     if let Some(h) = crate::dyld_table::dlopen_lookup(host.as_deref(), &guest_path) {
-        if guest_path.ends_with("libLTO.dylib") {
-            return SyscallResult::ok(name, LTO_DLOPEN_COOKIE);
-        }
+        // Real handle: `otool-classic` `dlsym`s `LLVMCreateDisasm`. `lto_*`
+        // plugin APIs stay blocked in `handle_dlsym` (ld `-lto_library`).
         return SyscallResult::ok(name, h);
     }
     // First open of a file that was not in the startup image set.
     // Do **not** on-demand-map `libLTO.dylib` here: a mid-run bind of that
-    // ~150 MiB image SIGSEGVs (TEXT RX). `otool -t -v` is rewritten to
-    // `llvm-objdump` instead.
+    // ~150 MiB image SIGSEGVs (TEXT RX). `otool -t -v` seeds it at load.
     if guest_path.ends_with("libLTO.dylib") {
         tracing::debug!(guest = %guest_path, "dlopen: skip on-demand libLTO");
         return SyscallResult::ok(name, 0);
@@ -409,11 +407,42 @@ fn handle_dlsym(args: SyscallArgs) -> SyscallResult {
     let Some(sym) = bottle::read_c_string(sym_va, CSTR_MAX) else {
         return SyscallResult::err(name, EFAULT);
     };
+    if handle == LTO_DLOPEN_COOKIE {
+        return SyscallResult::ok(name, 0);
+    }
+    // `libLTO` is linked into `ld` (bound `lto_*` imports). A second
+    // `dlopen`/`dlsym` of the plugin APIs hangs under freestanding.
+    // `otool-classic` only needs the LLVM C disassembler surface.
+    if crate::dyld_table::handle_basename_is(handle, "libLTO.dylib") && !is_llvm_c_disasm_symbol(&sym)
+    {
+        tracing::debug!(sym = %sym, "dlsym: hide libLTO plugin symbol");
+        return SyscallResult::ok(name, 0);
+    }
     if let Some(va) = crate::dyld_table::dlsym_lookup(handle, &sym) {
+        tracing::debug!(sym = %sym, va, "dlsym: resolved");
         SyscallResult::ok(name, va)
     } else {
+        tracing::debug!(sym = %sym, "dlsym: not found");
         SyscallResult::ok(name, 0)
     }
+}
+
+/// Symbols `otool-classic` `dlsym`s from `libLTO` for `-t -v`.
+///
+/// Includes `lto_initialize_disassembler` (registers the MC target). Other
+/// `lto_*` plugin APIs stay blocked so clang `-lto_library` does not hang.
+fn is_llvm_c_disasm_symbol(sym: &str) -> bool {
+    let s = sym.strip_prefix('_').unwrap_or(sym);
+    matches!(
+        s,
+        "LLVMCreateDisasm"
+            | "LLVMCreateDisasmCPU"
+            | "LLVMCreateDisasmCPUFeatures"
+            | "LLVMDisasmDispose"
+            | "LLVMDisasmInstruction"
+            | "LLVMSetDisasmOptions"
+            | "lto_initialize_disassembler"
+    )
 }
 
 const KHTLS_MAGIC: u32 = 0x4B48_544C; // KHTL
@@ -1601,5 +1630,17 @@ mod tests {
         assert!(is_helper(KH_HELPER_HEAP_STATS_ON));
         assert!(!is_helper(4)); // write
         assert!(!is_helper(1)); // exit
+    }
+
+    #[test]
+    fn llvm_c_disasm_allowlist() {
+        assert!(is_llvm_c_disasm_symbol("LLVMCreateDisasm"));
+        assert!(is_llvm_c_disasm_symbol("_LLVMDisasmInstruction"));
+        assert!(is_llvm_c_disasm_symbol("LLVMSetDisasmOptions"));
+        assert!(is_llvm_c_disasm_symbol("lto_initialize_disassembler"));
+        assert!(is_llvm_c_disasm_symbol("_lto_initialize_disassembler"));
+        assert!(!is_llvm_c_disasm_symbol("lto_get_version"));
+        assert!(!is_llvm_c_disasm_symbol("_lto_codegen_compile"));
+        assert!(!is_llvm_c_disasm_symbol("LLVMCreateCoverageIterator"));
     }
 }

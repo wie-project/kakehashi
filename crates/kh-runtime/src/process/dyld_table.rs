@@ -76,6 +76,19 @@ fn handle_for_index(idx: usize) -> u64 {
     HANDLE_TAG | i
 }
 
+/// True when `handle` is a registered image whose basename matches `base`.
+#[must_use]
+pub fn handle_basename_is(handle: u64, base: &str) -> bool {
+    let Some(idx) = index_from_handle(handle) else {
+        return false;
+    };
+    TABLE
+        .lock()
+        .ok()
+        .and_then(|g| g.get(idx).map(|img| img.basename == base))
+        .unwrap_or(false)
+}
+
 fn index_from_handle(handle: u64) -> Option<usize> {
     if handle & !0xffff == HANDLE_TAG {
         let i = handle & 0xffff;
@@ -225,6 +238,8 @@ mod tests {
         assert_eq!(dlsym_lookup(h, "_lto_get_version"), Some(0x1000));
         assert_eq!(dlsym_lookup(h, "lto_get_version"), Some(0x1000));
         assert_eq!(dlsym_lookup(RTLD_DEFAULT, "_lto_api_version"), Some(0x2000));
+        assert!(handle_basename_is(h, "libLTO.dylib"));
+        assert!(!handle_basename_is(h, "libc++.1.dylib"));
         clear();
     }
 }

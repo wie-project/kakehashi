@@ -178,6 +178,9 @@ pub struct LoadSession {
     pub images: Vec<ProcessImage>,
     /// Pre-map main parse/plan; cleared when main is pushed into `images`.
     staged_main: Option<StagedMain>,
+    /// Extra install names mapped as if the main image had `LC_LOAD_DYLIB`
+    /// for them (`otool-classic -t -v` → sibling `libLTO.dylib`).
+    extra_seed_dylibs: Vec<String>,
 }
 
 /// Result of a successful map-only (`--dry-load`) session.
@@ -260,7 +263,19 @@ impl LoadSession {
             pages: PageLayout::new(host, guest),
             images: Vec::new(),
             staged_main: None,
+            extra_seed_dylibs: Vec::new(),
         })
+    }
+
+    /// Map `install_name` during the dependency walk (in addition to `LC_LOAD_*`).
+    pub fn seed_dylib(&mut self, install_name: impl Into<String>) {
+        let name = install_name.into();
+        if name.is_empty() {
+            return;
+        }
+        if !self.extra_seed_dylibs.iter().any(|s| s == &name) {
+            self.extra_seed_dylibs.push(name);
+        }
     }
 
     /// Executable path.
@@ -555,6 +570,14 @@ impl LoadSession {
 
         let mut queue: VecDeque<DepEdge> =
             edges_from_image(&main_image, &exe_dir, &main_rpaths).into();
+        for name in &self.extra_seed_dylibs {
+            queue.push_back(DepEdge {
+                install_name: name.clone(),
+                kind: DylibKind::Load,
+                loader_dir: exe_dir.clone(),
+                rpaths: main_rpaths.clone(),
+            });
+        }
 
         while let Some(edge) = queue.pop_front() {
             let dylib_count = self

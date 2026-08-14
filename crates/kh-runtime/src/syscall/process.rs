@@ -303,66 +303,20 @@ fn env_ptrs(env: &[CString]) -> Vec<*const libc::c_char> {
     v
 }
 
-/// `otool-classic -t -v` on arm64 `dlopen`s `libLTO` for `LLVMCreateDisasm`.
-/// Mid-run map of that ~150 MiB dylib currently faults; sibling `llvm-objdump
-/// --macho -d` already runs under kh. Rewrite when the flags ask for LLVM
-/// disassembly.
+/// True when `otool-classic` will `dlopen` `libLTO` for `LLVMCreateDisasm`.
+///
+/// Combined `-t`/`-x` plus `-v`/`-V` (and glued `-tv`) on arm64. The loader
+/// seeds sibling `libLTO.dylib` at process start so the C API is already
+/// mapped; mid-run bind of that image still faults.
 #[must_use]
-pub fn rewrite_otool_classic_disasm(
-    host_path: &Path,
-    argv: &[String],
-) -> Option<(PathBuf, Vec<String>)> {
-    let name = host_path.file_name()?.to_str()?;
-    if name != "otool-classic" {
-        return None;
-    }
-    if !otool_args_want_llvm_disasm(argv) {
-        return None;
-    }
-    let objdump = host_path.parent()?.join("llvm-objdump");
-    if !objdump.is_file() {
-        return None;
-    }
-    let mut out = vec![
-        "llvm-objdump".to_owned(),
-        "-d".to_owned(),
-        "--macho".to_owned(),
-    ];
-    let rest = match argv.first().map(String::as_str) {
-        Some(first)
-            if first.ends_with("otool-classic")
-                || first.ends_with("otool")
-                || first.ends_with("llvm-objdump") =>
-        {
-            argv.get(1..).unwrap_or(&[])
-        }
-        _ => argv,
+pub fn otool_classic_wants_llvm_disasm(host_path: &Path, argv: &[String]) -> bool {
+    let Some(name) = host_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
     };
-    let mut skip_next = false;
-    for a in rest {
-        if skip_next {
-            skip_next = false;
-            if !a.starts_with('-') {
-                // `-arch arm64` — llvm-objdump uses `--arch=`.
-                out.push(format!("--arch={a}"));
-            }
-            continue;
-        }
-        if a == "-arch" {
-            skip_next = true;
-            continue;
-        }
-        if a.starts_with('-') {
-            continue;
-        }
-        out.push(a.clone());
+    if name != "otool-classic" {
+        return false;
     }
-    tracing::info!(
-        from = %host_path.display(),
-        to = %objdump.display(),
-        "otool-classic -t -v → llvm-objdump --macho -d"
-    );
-    Some((objdump, out))
+    otool_args_want_llvm_disasm(argv)
 }
 
 fn otool_args_want_llvm_disasm(argv: &[String]) -> bool {
@@ -383,12 +337,7 @@ fn otool_args_want_llvm_disasm(argv: &[String]) -> bool {
 }
 
 fn reexec_kh_macho(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
-    let rewritten = rewrite_otool_classic_disasm(host_path, argv);
-    let (host_path, argv_ref): (&Path, &[String]) = match rewritten.as_ref() {
-        Some((p, a)) => (p.as_path(), a.as_slice()),
-        None => (host_path, argv),
-    };
-    let Some((args_c, env_c)) = kh_run_argv_env(host_path, argv_ref, envp) else {
+    let Some((args_c, env_c)) = kh_run_argv_env(host_path, argv, envp) else {
         return libc::EINVAL;
     };
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
@@ -431,11 +380,6 @@ pub(crate) fn spawn_kh_macho(
     argv: &[String],
     envp: &[String],
 ) -> Result<i32, i32> {
-    let rewritten = rewrite_otool_classic_disasm(host_path, argv);
-    let (host_path, argv): (&Path, &[String]) = match rewritten.as_ref() {
-        Some((p, a)) => (p.as_path(), a.as_slice()),
-        None => (host_path, argv),
-    };
     let (args_c, env_c) = kh_run_argv_env(host_path, argv, envp).ok_or(libc::EINVAL)?;
     let mut argv_ptrs: Vec<*const libc::c_char> = args_c.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(core::ptr::null());
@@ -764,5 +708,39 @@ mod bridge_env_tests {
             rewrite_guest_bridge_env("NOTE=see /Volumes/linux/tmp later"),
             "NOTE=see /Volumes/linux/tmp later"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod otool_disasm_flag_tests {
+    use super::{otool_args_want_llvm_disasm, otool_classic_wants_llvm_disasm};
+    use std::path::Path;
+
+    #[test]
+    fn detects_text_plus_verbose() {
+        assert!(otool_args_want_llvm_disasm(&[
+            "otool-classic".into(),
+            "-t".into(),
+            "-v".into(),
+            "a".into()
+        ]));
+        assert!(otool_args_want_llvm_disasm(&["-tv".into(), "a".into()]));
+        assert!(otool_args_want_llvm_disasm(&["-x".into(), "-V".into()]));
+        assert!(!otool_args_want_llvm_disasm(&["-t".into(), "a".into()]));
+        assert!(!otool_args_want_llvm_disasm(&["-h".into(), "a".into()]));
+    }
+
+    #[test]
+    fn only_classic_binary() {
+        let argv = ["-t".into(), "-v".into()];
+        assert!(otool_classic_wants_llvm_disasm(
+            Path::new("/usr/bin/otool-classic"),
+            &argv
+        ));
+        assert!(!otool_classic_wants_llvm_disasm(
+            Path::new("/usr/bin/otool"),
+            &argv
+        ));
     }
 }
