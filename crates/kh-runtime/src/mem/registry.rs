@@ -141,6 +141,7 @@ impl AddressSpace {
     }
 
     fn rebuild_snap(&mut self) {
+        LAST_RANGE.with(|c| c.set(None));
         let snap: Vec<RangeCache> = self.regions.iter().map(RangeCache::from_region).collect();
         self.check_snap = Arc::new(snap);
     }
@@ -174,7 +175,12 @@ impl AddressSpace {
     }
 
     /// Registers an owned mapping created by a guest `mmap`.
+    ///
+    /// A later `MAP_FIXED` at the same `[addr, len)` replaces the previous
+    /// owned entry so protection updates (RW → `PROT_NONE` guard pages).
     pub fn register_owned(&mut self, guest_addr: u64, ptr: *mut u8, len: usize, prot: u32) {
+        self.regions
+            .retain(|r| !(r.owned && r.guest_addr == guest_addr && r.len == len));
         self.regions.push(RegRegion {
             guest_addr,
             len,
@@ -183,6 +189,30 @@ impl AddressSpace {
             owned: true,
         });
         self.rebuild_snap();
+    }
+
+    /// Index of the tightest region that fully contains `[addr, addr+len)`.
+    ///
+    /// Guest `MAP_FIXED` overlays (Rust std stack guard) sit on top of a
+    /// larger borrowed stack; callers must see the smaller mapping.
+    fn best_covering_index(&self, addr: u64, len: usize) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, region) in self.regions.iter().enumerate() {
+            if !region.contains_range(addr, len) {
+                continue;
+            }
+            match best {
+                None => best = Some(i),
+                Some(j) => {
+                    if let Some(cur) = self.regions.get(j)
+                        && (region.len < cur.len || (region.len == cur.len && i > j))
+                    {
+                        best = Some(i);
+                    }
+                }
+            }
+        }
+        best
     }
 
     /// Validates that `[addr, addr+len)` lies in a registered region with the
@@ -199,44 +229,42 @@ impl AddressSpace {
         if self.regions.is_empty() {
             return true;
         }
-        for region in &self.regions {
-            if !region.contains_range(addr, len) {
-                continue;
-            }
-            if need_write {
-                return region.prot & VM_PROT_WRITE != 0;
-            }
-            // Readable if any of R/W is set (writable maps are readable for load).
-            return region.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0;
+        let Some(i) = self.best_covering_index(addr, len) else {
+            return false;
+        };
+        let Some(region) = self.regions.get(i) else {
+            return false;
+        };
+        if need_write {
+            return region.prot & VM_PROT_WRITE != 0;
         }
-        false
+        // Readable if any of R/W is set (writable maps are readable for load).
+        region.prot & (VM_PROT_READ | VM_PROT_WRITE) != 0
     }
 
     /// Finds the region that fully contains `[addr, addr+len)`, if any.
     #[must_use]
     pub fn find_covering(&self, addr: u64, len: usize) -> Option<RegRegionSnapshot> {
-        for region in &self.regions {
-            if region.contains_range(addr, len) {
-                return Some(RegRegionSnapshot {
-                    guest_addr: region.guest_addr,
-                    len: region.len,
-                    ptr: region.ptr,
-                    prot: region.prot,
-                    owned: region.owned,
-                });
-            }
-        }
-        None
+        let i = self.best_covering_index(addr, len)?;
+        let region = self.regions.get(i)?;
+        Some(RegRegionSnapshot {
+            guest_addr: region.guest_addr,
+            len: region.len,
+            ptr: region.ptr,
+            prot: region.prot,
+            owned: region.owned,
+        })
     }
 
     /// Updates protection bits on the region covering `addr`.
     pub fn update_prot(&mut self, addr: u64, len: usize, prot: u32) -> bool {
-        for region in &mut self.regions {
-            if region.contains_range(addr, len) {
-                region.prot = prot;
-                self.rebuild_snap();
-                return true;
-            }
+        let Some(i) = self.best_covering_index(addr, len) else {
+            return false;
+        };
+        if let Some(region) = self.regions.get_mut(i) {
+            region.prot = prot;
+            self.rebuild_snap();
+            return true;
         }
         false
     }
@@ -245,10 +273,7 @@ impl AddressSpace {
     ///
     /// Borrowed regions are removed from tracking **without** `munmap`.
     pub fn remove_range(&mut self, addr: u64, len: usize) -> RemoveOutcome {
-        let idx = self
-            .regions
-            .iter()
-            .position(|r| r.contains_range(addr, len));
+        let idx = self.best_covering_index(addr, len);
         let Some(i) = idx else {
             return RemoveOutcome::NotFound;
         };
@@ -370,17 +395,28 @@ pub fn check_range(addr: u64, len: usize, need_write: bool) -> bool {
         // Empty space → allow (unit tests without maps).
         return true;
     }
+    let mut best: Option<&RangeCache> = None;
     for region in snap.iter() {
         if !region.contains(addr, len) {
             continue;
         }
-        let ok = region.allows(need_write);
-        if ok {
-            LAST_RANGE.with(|c| c.set(Some(*region)));
+        match best {
+            None => best = Some(region),
+            Some(cur) => {
+                if region.len <= cur.len {
+                    best = Some(region);
+                }
+            }
         }
-        return ok;
     }
-    false
+    let Some(region) = best else {
+        return false;
+    };
+    let ok = region.allows(need_write);
+    if ok {
+        LAST_RANGE.with(|c| c.set(Some(*region)));
+    }
+    ok
 }
 
 /// Finds a covering region in the active address space.
@@ -477,6 +513,27 @@ mod tests {
         assert!(!space.check_range(0, 8, false));
         let outside = base.wrapping_add(u64::try_from(stack.host_len()).unwrap_or(0));
         assert!(!space.check_range(outside, 8, false));
+        space.clear();
+        drop(stack);
+    }
+
+    #[test]
+    fn overlay_prefers_smaller_region() {
+        let host = HostPageSize::detect().expect("host page");
+        let stack = map_stack(host, 64 * 1024).expect("stack");
+        let mut space = AddressSpace::new();
+        space.register_borrowed(&stack);
+        let page = usize::try_from(host.bytes()).unwrap_or(4096);
+        space.register_owned(stack.guest_addr, host_ptr_from_addr(stack.host_addr()), page, 0);
+        assert!(
+            !space.check_range(stack.guest_addr, 8, true),
+            "PROT_NONE overlay must not look writable"
+        );
+        let above = stack.guest_addr.wrapping_add(u64::try_from(page).unwrap_or(0));
+        assert!(
+            space.check_range(above, 8, true),
+            "rest of stack stays writable"
+        );
         space.clear();
         drop(stack);
     }

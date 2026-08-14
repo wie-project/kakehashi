@@ -580,8 +580,13 @@ pub(crate) fn write_host_fd(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
 
 /// Reads from a host fd.
 pub(crate) fn read_host_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    if fd == 0 {
+    // TTY stdin must not go through Rust's `Stdin` BufReader: raw-mode
+    // guests (menus, REPLs) mix `read(1)` with `FIONREAD` / `select`.
+    if fd == 0 && !host::isatty(fd) {
         return std::io::stdin().lock().read(buf);
+    }
+    if fd == 0 {
+        return host::read_fd(fd, buf);
     }
     host::read_fd(fd, buf)
 }

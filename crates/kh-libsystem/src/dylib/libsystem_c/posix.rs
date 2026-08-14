@@ -17,6 +17,7 @@ use crate::kh_core::errno;
 use crate::kh_core::heap::{free, malloc};
 use crate::kh_core::sys::{
     self, SYS_ACCESS, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_DUP2, SYS_EXECVE, SYS_FCNTL, SYS_FCHMOD,
+    SYS_IOCTL,
     SYS_FORK, SYS_FSTAT64, SYS_FSTATAT, SYS_FSYNC, SYS_FTRUNCATE, SYS_GETCWD, SYS_GETEGID,
     SYS_GETEUID, SYS_GETGID, SYS_GETPGRP, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID,
     SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
@@ -26,8 +27,8 @@ use crate::kh_core::sys::{
 };
 use crate::kh_core::trace;
 use crate::{
-    KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU, KH_HELPER_READDIR,
-    KH_HELPER_SPAWN,
+    KH_HELPER_ARGV, KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU,
+    KH_HELPER_READDIR, KH_HELPER_SPAWN,
 };
 
 const ENOSYS: i32 = 78;
@@ -465,22 +466,40 @@ pub(crate) unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
 /// open/mkdir still reach the host FS through the bottle bridge.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
-    if buf.is_null() || size == 0 {
-        errno::set_errno(22);
-        return core::ptr::null_mut();
-    }
+    // Darwin: `buf == NULL` allocates (as if by malloc). `size == 0` with a
+    // non-null buf is EINVAL; with a null buf, pick a PATH_MAX-class buffer.
+    let (out, cap, allocated) = if buf.is_null() {
+        let cap = if size == 0 { 1024 } else { size };
+        let p = unsafe { malloc(cap) }.cast::<c_char>();
+        if p.is_null() {
+            errno::set_errno(ENOMEM);
+            return core::ptr::null_mut();
+        }
+        (p, cap, true)
+    } else {
+        if size == 0 {
+            errno::set_errno(EINVAL);
+            return core::ptr::null_mut();
+        }
+        (buf, size, false)
+    };
     let ret = unsafe {
         sys::syscall2(
             SYS_GETCWD,
-            ptr_u64(buf.cast()),
-            u64::try_from(size).unwrap_or(0),
+            ptr_u64(out.cast()),
+            u64::try_from(cap).unwrap_or(0),
         )
     };
     if ret < 0 {
         let _ = apply_ret(ret);
+        if allocated {
+            unsafe {
+                free(out.cast());
+            }
+        }
         return core::ptr::null_mut();
     }
-    buf
+    out
 }
 
 /// C `chmod` → nlist `_chmod` (soft success for path mode; prefer `fchmod` for `+x`).
@@ -879,19 +898,46 @@ pub(crate) unsafe extern "C" fn getpgid(pid: c_int) -> c_int {
     pid
 }
 
-/// C `tcgetpgrp` → soft: report session group (no real tty).
+/// Darwin `TIOCGPGRP` (`_IOR('t', 119, int)`).
+const TIOCGPGRP: u64 = 0x4004_7477;
+/// Darwin `TIOCSPGRP` (`_IOW('t', 118, int)`).
+const TIOCSPGRP: u64 = 0x8004_7476;
+/// Darwin `TIOCGETA` (`_IOR('t', 19, struct termios)`, arm64 size 72).
+const TIOCGETA: u64 = 0x4048_7413;
+
+/// C `tcgetpgrp` → `ioctl(TIOCGPGRP)` (host controlling tty).
 ///
 /// Observed: Apple `git index-pack -v` probes controlling-terminal pgrp.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn tcgetpgrp(_fd: c_int) -> c_int {
-    // Same as getpgrp when there is no guest tty association.
-    unsafe { getpgrp() }
+pub(crate) unsafe extern "C" fn tcgetpgrp(fd: c_int) -> c_int {
+    let mut pgrp = 0_i32;
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_IOCTL,
+            u64::from(fd.cast_unsigned()),
+            TIOCGPGRP,
+            ptr_u64(core::ptr::from_mut(&mut pgrp).cast()),
+        )
+    };
+    if apply_ret(ret) < 0 {
+        -1
+    } else {
+        pgrp
+    }
 }
 
-/// C `tcsetpgrp` → soft success (no guest tty).
+/// C `tcsetpgrp` → `ioctl(TIOCSPGRP)`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn tcsetpgrp(_fd: c_int, _pgrp: c_int) -> c_int {
-    0
+pub(crate) unsafe extern "C" fn tcsetpgrp(fd: c_int, pgrp: c_int) -> c_int {
+    let mut pg = pgrp;
+    ret_c_int(unsafe {
+        sys::syscall3(
+            SYS_IOCTL,
+            u64::from(fd.cast_unsigned()),
+            TIOCSPGRP,
+            ptr_u64(core::ptr::from_mut(&mut pg).cast()),
+        )
+    })
 }
 
 /// C `kill` → nlist `_kill`.
@@ -1404,17 +1450,27 @@ pub(crate) unsafe extern "C" fn setrlimit(_resource: c_int, _rlp: *const c_void)
     0
 }
 
-/// C `isatty` → nlist `_isatty` (false for bottle).
+/// C `isatty` → nlist `_isatty` (host tty via `TIOCGETA`).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn isatty(_fd: c_int) -> c_int {
-    0
+pub(crate) unsafe extern "C" fn isatty(fd: c_int) -> c_int {
+    let mut dummy = [0_u8; 72];
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_IOCTL,
+            u64::from(fd.cast_unsigned()),
+            TIOCGETA,
+            ptr_u64(dummy.as_mut_ptr().cast()),
+        )
+    };
+    i32::from(apply_ret(ret) >= 0)
 }
 
-/// C `ioctl` → nlist `_ioctl` (ENOTTY-ish).
+/// Impl for C `ioctl` (varargs wrapper in `ioctl_varargs.c`).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn ioctl(_fd: c_int, _request: u64, _arg: *mut c_void) -> c_int {
-    errno::set_errno(25); // ENOTTY
-    -1
+pub(crate) unsafe extern "C" fn kh_ioctl_impl(fd: c_int, request: u64, arg: u64) -> c_int {
+    ret_c_int(unsafe {
+        sys::syscall3(SYS_IOCTL, u64::from(fd.cast_unsigned()), request, arg)
+    })
 }
 
 /// C `usleep` → nlist `_usleep` (yield-based soft sleep for curl G3 cleanup).
@@ -1451,6 +1507,12 @@ pub(crate) unsafe extern "C" fn nanosleep(req: *const c_void, rem: *mut c_void) 
         }
     }
     0
+}
+
+/// C `getdtablesize` → nlist `_getdtablesize` (same ceiling as `_SC_OPEN_MAX`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getdtablesize() -> c_int {
+    1024
 }
 
 /// C `sysconf` → nlist `_sysconf`.
@@ -1777,6 +1839,74 @@ pub(crate) unsafe extern "C" fn sigaction(
     ret_c_int(ret)
 }
 
+/// C `sigemptyset` → nlist `_sigemptyset`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigemptyset(set: *mut c_void) -> c_int {
+    if set.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    unsafe {
+        set.cast::<u32>().write(0);
+    }
+    0
+}
+
+/// C `sigfillset` → nlist `_sigfillset`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigfillset(set: *mut c_void) -> c_int {
+    if set.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    unsafe {
+        set.cast::<u32>().write(u32::MAX);
+    }
+    0
+}
+
+/// C `sigaddset` → nlist `_sigaddset`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigaddset(set: *mut c_void, signo: c_int) -> c_int {
+    if set.is_null() || signo <= 0 || signo > 32 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let bit = 1_u32.wrapping_shl(signo.cast_unsigned().saturating_sub(1));
+    unsafe {
+        let p = set.cast::<u32>();
+        p.write(p.read() | bit);
+    }
+    0
+}
+
+/// C `sigdelset` → nlist `_sigdelset`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigdelset(set: *mut c_void, signo: c_int) -> c_int {
+    if set.is_null() || signo <= 0 || signo > 32 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let bit = 1_u32.wrapping_shl(signo.cast_unsigned().saturating_sub(1));
+    unsafe {
+        let p = set.cast::<u32>();
+        p.write(p.read() & !bit);
+    }
+    0
+}
+
+/// C `sigismember` → nlist `_sigismember`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sigismember(set: *const c_void, signo: c_int) -> c_int {
+    if set.is_null() || signo <= 0 || signo > 32 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let bit = 1_u32.wrapping_shl(signo.cast_unsigned().saturating_sub(1));
+    let cur = unsafe { set.cast::<u32>().read() };
+    i32::from((cur & bit) != 0)
+}
+
 /// Darwin `___darwin_check_fd_set_overflow` → safe for small FD_SET uses.
 #[unsafe(export_name = "__darwin_check_fd_set_overflow")]
 pub(crate) unsafe extern "C" fn __darwin_check_fd_set_overflow(
@@ -1909,6 +2039,8 @@ fn soft_env_seed_defaults() {
         (b"TMPDIR\0".as_slice(), tmp),
         (b"SDKROOT\0".as_slice(), sdkroot.as_slice()),
         (b"DEVELOPER_DIR\0".as_slice(), developer_dir.as_slice()),
+        (b"BASH_ENV\0".as_slice(), b"/dev/null\0".as_slice()),
+        (b"ENV\0".as_slice(), b"/dev/null\0".as_slice()),
     ] {
         let _ = unsafe { soft_env_set(name.as_ptr().cast(), val.as_ptr().cast(), 1) };
     }
@@ -2076,6 +2208,89 @@ pub(crate) unsafe extern "C" fn ns_get_environ() -> *mut *mut *mut c_char {
     core::ptr::addr_of_mut!(environ)
 }
 
+const NS_ARGV_MAX: usize = 16;
+const NS_ARGV_BYTES: usize = 4096;
+
+static mut NS_ARGC: i32 = 0;
+static mut NS_ARG_STORE: [c_char; NS_ARGV_BYTES] = [0; NS_ARGV_BYTES];
+static mut NS_ARGV: [*mut c_char; NS_ARGV_MAX] = [core::ptr::null_mut(); NS_ARGV_MAX];
+static mut NS_ARGV_VEC: *mut *mut c_char = core::ptr::null_mut();
+
+fn ns_args_ensure() {
+    unsafe {
+        if NS_ARGC != 0 {
+            return;
+        }
+        let mut packed = [0_u8; NS_ARGV_BYTES];
+        let n = sys::helper2(
+            KH_HELPER_ARGV,
+            u64::try_from(packed.as_mut_ptr().addr()).unwrap_or(0),
+            u64::try_from(packed.len()).unwrap_or(0),
+        );
+        if n > 4 {
+            let nbytes = usize::try_from(n).unwrap_or(4).min(packed.len());
+            let argc = u32::from_ne_bytes([
+                packed.first().copied().unwrap_or(0),
+                packed.get(1).copied().unwrap_or(0),
+                packed.get(2).copied().unwrap_or(0),
+                packed.get(3).copied().unwrap_or(0),
+            ]) as usize;
+            let argc = argc.min(NS_ARGV_MAX.saturating_sub(1));
+            let mut off = 4_usize;
+            let mut store_off = 0_usize;
+            for slot in NS_ARGV.iter_mut().take(argc) {
+                let start = off;
+                while off < nbytes && packed.get(off).copied().unwrap_or(1) != 0 {
+                    off = off.saturating_add(1);
+                }
+                let slen = off.saturating_sub(start).saturating_add(1);
+                if store_off.saturating_add(slen) > NS_ARG_STORE.len() {
+                    break;
+                }
+                for k in 0..slen {
+                    if let Some(b) = NS_ARG_STORE.get_mut(store_off.saturating_add(k)) {
+                        *b = packed
+                            .get(start.saturating_add(k))
+                            .copied()
+                            .unwrap_or(0)
+                            .cast_signed();
+                    }
+                }
+                *slot = NS_ARG_STORE.as_mut_ptr().wrapping_add(store_off);
+                store_off = store_off.saturating_add(slen);
+                off = off.saturating_add(1);
+            }
+            if let Some(last) = NS_ARGV.get_mut(argc) {
+                *last = core::ptr::null_mut();
+            }
+            NS_ARGV_VEC = NS_ARGV.as_mut_ptr();
+            NS_ARGC = i32::try_from(argc).unwrap_or(0);
+            if NS_ARGC != 0 {
+                return;
+            }
+        }
+        NS_ARG_STORE[0] = 0;
+        NS_ARGV[0] = NS_ARG_STORE.as_mut_ptr();
+        NS_ARGV[1] = core::ptr::null_mut();
+        NS_ARGV_VEC = NS_ARGV.as_mut_ptr();
+        NS_ARGC = 1;
+    }
+}
+
+/// Darwin `_NSGetArgc` → nlist `__NSGetArgc`.
+#[unsafe(export_name = "_NSGetArgc")]
+pub(crate) unsafe extern "C" fn ns_get_argc() -> *mut i32 {
+    ns_args_ensure();
+    core::ptr::addr_of_mut!(NS_ARGC)
+}
+
+/// Darwin `_NSGetArgv` → nlist `__NSGetArgv`.
+#[unsafe(export_name = "_NSGetArgv")]
+pub(crate) unsafe extern "C" fn ns_get_argv() -> *mut *mut *mut c_char {
+    ns_args_ensure();
+    core::ptr::addr_of_mut!(NS_ARGV_VEC)
+}
+
 fn soft_env_c_str_len(p: *const c_char) -> usize {
     if p.is_null() {
         return 0;
@@ -2170,6 +2385,40 @@ pub(crate) unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
         }
     }
     core::ptr::null_mut()
+}
+
+/// C `putenv` → nlist `_putenv` (`"KEY=value"` string, stored as-is).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn putenv(string: *mut c_char) -> c_int {
+    if string.is_null() {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    let len = soft_env_c_str_len(string);
+    let mut eq = None;
+    for i in 0..len {
+        // SAFETY: bounded scan of guest C string.
+        if unsafe { *string.add(i) } == b'='.cast_signed() {
+            eq = Some(i);
+            break;
+        }
+    }
+    let Some(eq) = eq else {
+        errno::set_errno(EINVAL);
+        return -1;
+    };
+    let name_len = eq;
+    if name_len == 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    // Temporarily NUL-terminate the key for setenv, then restore '='.
+    unsafe {
+        string.add(eq).write(0);
+        let rc = setenv(string.cast_const(), string.add(eq.saturating_add(1)).cast_const(), 1);
+        string.add(eq).write(b'='.cast_signed());
+        rc
+    }
 }
 
 /// C `setenv` → nlist `_setenv`.
@@ -2368,6 +2617,11 @@ pub(crate) unsafe extern "C" fn qsort(
     let Some(cmp) = compar else {
         return;
     };
+    let cmp: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int = {
+        let raw = sys::strip_ptrauth_ia(cmp as usize);
+        // SAFETY: stripped IA pointer is the guest comparator (or unchanged).
+        unsafe { core::mem::transmute(raw) }
+    };
     // SAFETY: guest buffer of nel*width; heapsort in place.
     unsafe {
         qsort_heapsort(base.cast::<u8>(), nel, width, cmp);
@@ -2507,6 +2761,24 @@ pub(crate) unsafe extern "C" fn bsearch(
     core::ptr::null_mut()
 }
 
+/// C `getrusage` → nlist `_getrusage` (soft-zero Darwin `struct rusage`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getrusage(_who: c_int, usage: *mut c_void) -> c_int {
+    if !usage.is_null() {
+        unsafe {
+            core::ptr::write_bytes(usage.cast::<u8>(), 0, 144);
+        }
+    }
+    0
+}
+
+/// C `getlogin` → nlist `_getlogin`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getlogin() -> *mut c_char {
+    static mut NAME: [u8; 10] = *b"kakehashi\0";
+    core::ptr::addr_of_mut!(NAME).cast()
+}
+
 /// C `getpwuid` / `getgrgid` → null (no passwd DB).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getpwuid(_uid: u32) -> *mut c_void {
@@ -2515,6 +2787,20 @@ pub(crate) unsafe extern "C" fn getpwuid(_uid: u32) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getgrgid(_gid: u32) -> *mut c_void {
+    core::ptr::null_mut()
+}
+
+/// C `setpwent` → nlist `_setpwent`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setpwent() {}
+
+/// C `endpwent` → nlist `_endpwent`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn endpwent() {}
+
+/// C `getpwent` → nlist `_getpwent` (no passwd DB).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpwent() -> *mut c_void {
     core::ptr::null_mut()
 }
 
@@ -3370,6 +3656,12 @@ pub(crate) static mut opterr: c_int = 1;
 #[allow(non_upper_case_globals)]
 pub(crate) static mut optopt: c_int = 0;
 
+/// C `optreset` → nlist `_optreset` (BSD; non-zero forces a scan restart).
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut optreset: c_int = 0;
+
 /// Position within the current `argv[optind]` option cluster (`-abc`).
 static mut GETOPT_POS: usize = 1;
 
@@ -3431,6 +3723,11 @@ pub(crate) unsafe extern "C" fn getopt(
     }
     // SAFETY: globals mutated only on the guest main thread for CLI tools.
     unsafe {
+        if optreset != 0 {
+            optreset = 0;
+            optind = 1;
+            getopt_reset_scan();
+        }
         if optind < 1 {
             optind = 1;
             getopt_reset_scan();
@@ -3545,4 +3842,431 @@ pub(crate) unsafe extern "C" fn getopt(
         }
         c_int::from(opt_ch)
     }
+}
+
+const PC_NAME_MAX: c_int = 4;
+const PC_PATH_MAX: c_int = 5;
+const PC_PIPE_BUF: c_int = 6;
+
+unsafe fn pathconf_value(name: c_int) -> i64 {
+    match name {
+        PC_NAME_MAX => 255,
+        PC_PATH_MAX => 1024,
+        PC_PIPE_BUF => 512,
+        _ => -1,
+    }
+}
+
+/// C `pathconf` → nlist `_pathconf`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pathconf(_path: *const c_char, name: c_int) -> i64 {
+    unsafe { pathconf_value(name) }
+}
+
+/// C `fpathconf` → nlist `_fpathconf`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fpathconf(_fd: c_int, name: c_int) -> i64 {
+    unsafe { pathconf_value(name) }
+}
+
+/// Opaque blob for `setmode` / `getmode` (not Apple's layout).
+#[repr(C)]
+struct ModeHow {
+    magic: u32,
+    abs: u16,
+    add: u16,
+    sub: u16,
+}
+
+const MODE_MAGIC: u32 = 0x4B48_4D44;
+const S_IRWXU: u16 = 0o700;
+const S_IRWXG: u16 = 0o070;
+const S_IRWXO: u16 = 0o007;
+const S_ISUID: u16 = 0o4000;
+const S_ISGID: u16 = 0o2000;
+const S_ISVTX: u16 = 0o1000;
+
+fn perm_bit(c: u8) -> u16 {
+    match c {
+        b'r' => 0o444,
+        b'w' => 0o222,
+        b'x' | b'X' => 0o111,
+        b's' => S_ISUID | S_ISGID,
+        b't' => S_ISVTX,
+        _ => 0,
+    }
+}
+
+/// C `setmode` → nlist `_setmode`. Parses octal or `u+x` / `a+r` clauses.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setmode(p: *const c_char) -> *mut c_void {
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    let raw = unsafe { malloc(core::mem::size_of::<ModeHow>()) };
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+    let how = raw.cast::<ModeHow>();
+    unsafe {
+        (*how).magic = MODE_MAGIC;
+        (*how).abs = 0xffff;
+        (*how).add = 0;
+        (*how).sub = 0;
+    }
+    let mut s = p;
+    // Octal?
+    let first = unsafe { *s as u8 };
+    if first.is_ascii_digit() {
+        let mut acc: u16 = 0;
+        unsafe {
+            while (*s as u8).is_ascii_digit() {
+                acc = acc.saturating_mul(8).saturating_add(u16::from(*s as u8 - b'0'));
+                s = s.add(1);
+            }
+            (*how).abs = acc;
+        }
+        return raw;
+    }
+    unsafe {
+        (*how).abs = 0xffff;
+        loop {
+            if *s == 0 {
+                break;
+            }
+            if *s as u8 == b',' {
+                s = s.add(1);
+                continue;
+            }
+            let mut who: u16 = 0;
+            loop {
+                match *s as u8 {
+                    b'u' => who |= S_IRWXU | S_ISUID,
+                    b'g' => who |= S_IRWXG | S_ISGID,
+                    b'o' => who |= S_IRWXO,
+                    b'a' => who |= S_IRWXU | S_IRWXG | S_IRWXO,
+                    _ => break,
+                }
+                s = s.add(1);
+            }
+            if who == 0 {
+                who = S_IRWXU | S_IRWXG | S_IRWXO;
+            }
+            let op = *s as u8;
+            if op != b'+' && op != b'-' && op != b'=' {
+                free(raw);
+                return core::ptr::null_mut();
+            }
+            s = s.add(1);
+            let mut bits: u16 = 0;
+            loop {
+                let b = perm_bit(*s as u8);
+                if b == 0 {
+                    break;
+                }
+                bits |= b;
+                s = s.add(1);
+            }
+            bits &= who;
+            match op {
+                b'+' => (*how).add |= bits,
+                b'-' => (*how).sub |= bits,
+                b'=' => {
+                    (*how).sub |= who;
+                    (*how).add |= bits;
+                }
+                _ => {}
+            }
+        }
+    }
+    raw
+}
+
+/// C `getmode` → nlist `_getmode`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getmode(set: *const c_void, mode: u16) -> u16 {
+    if set.is_null() {
+        return mode;
+    }
+    let how = set.cast::<ModeHow>();
+    unsafe {
+        if (*how).magic != MODE_MAGIC {
+            return mode;
+        }
+        let mut m = if (*how).abs == 0xffff {
+            mode
+        } else {
+            (*how).abs
+        };
+        m |= (*how).add;
+        m &= !(*how).sub;
+        m
+    }
+}
+
+/// Darwin / BSD `struct option` (LP64).
+#[repr(C)]
+pub(crate) struct OptionLong {
+    name: *const c_char,
+    has_arg: c_int,
+    flag: *mut c_int,
+    val: c_int,
+}
+
+const NO_ARGUMENT: c_int = 0;
+const REQUIRED_ARGUMENT: c_int = 1;
+/// BSD `optional_argument` (2): `--foo` with no `=` leaves `optarg` null.
+#[allow(dead_code)]
+const OPTIONAL_ARGUMENT: c_int = 2;
+
+unsafe fn cstr_eq_len(opt_name: *const c_char, text: *const c_char, text_len: usize) -> bool {
+    if opt_name.is_null() || text.is_null() {
+        return false;
+    }
+    unsafe {
+        for i in 0..text_len {
+            let c = *opt_name.add(i);
+            if c == 0 || c != *text.add(i) {
+                return false;
+            }
+        }
+        *opt_name.add(text_len) == 0
+    }
+}
+
+unsafe fn cstr_is_prefix(name: *const c_char, prefix: *const c_char, prefix_len: usize) -> bool {
+    if name.is_null() || prefix.is_null() {
+        return false;
+    }
+    unsafe {
+        for i in 0..prefix_len {
+            if *name.add(i) == 0 || *name.add(i) != *prefix.add(i) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+unsafe fn argv_cstr(argv: *const *mut c_char, idx: c_int) -> *mut c_char {
+    unsafe { *argv.add(idx as usize) }
+}
+
+/// Match `--name` / `--name=arg` against `longopts`. Exact match wins;
+/// otherwise a unique prefix. Returns index or `None` if none / ambiguous.
+unsafe fn match_longopt(
+    longopts: *const OptionLong,
+    name: *const c_char,
+    name_len: usize,
+) -> Option<usize> {
+    if longopts.is_null() || name.is_null() {
+        return None;
+    }
+    let mut exact: Option<usize> = None;
+    let mut prefix: Option<usize> = None;
+    let mut ambiguous = false;
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let opt = &*longopts.add(i);
+            if opt.name.is_null() {
+                break;
+            }
+            if cstr_eq_len(opt.name, name, name_len) {
+                exact = Some(i);
+                break;
+            }
+            if cstr_is_prefix(opt.name, name, name_len) {
+                if prefix.is_some() {
+                    ambiguous = true;
+                } else {
+                    prefix = Some(i);
+                }
+            }
+            i = i.saturating_add(1);
+            if i > 512 {
+                break;
+            }
+        }
+    }
+    if exact.is_some() {
+        exact
+    } else if ambiguous {
+        None
+    } else {
+        prefix
+    }
+}
+
+unsafe fn take_long_arg(
+    argc: c_int,
+    argv: *const *mut c_char,
+    inline_arg: *mut c_char,
+    has_arg: c_int,
+    silent: bool,
+    argv0: *mut c_char,
+) -> Result<*mut c_char, c_int> {
+    unsafe {
+        if !inline_arg.is_null() && *inline_arg != 0 {
+            if has_arg == NO_ARGUMENT {
+                if !silent {
+                    getopt_err(argv0, b"option doesn't take an argument -- ", b'-');
+                }
+                return Err(c_int::from(b'?'));
+            }
+            return Ok(inline_arg);
+        }
+        if has_arg == REQUIRED_ARGUMENT {
+            if optind >= argc {
+                if silent {
+                    return Err(c_int::from(b':'));
+                }
+                getopt_err(argv0, b"option requires an argument -- ", b'-');
+                return Err(c_int::from(b'?'));
+            }
+            let a = argv_cstr(argv, optind);
+            optind += 1;
+            Ok(a)
+        } else {
+            Ok(core::ptr::null_mut())
+        }
+    }
+}
+
+unsafe fn finish_long(
+    opt: &OptionLong,
+    arg: *mut c_char,
+    longindex: *mut c_int,
+    idx: usize,
+) -> c_int {
+    unsafe {
+        optarg = arg;
+        if !longindex.is_null() {
+            *longindex = c_int::try_from(idx).unwrap_or(0);
+        }
+        optopt = if opt.flag.is_null() { opt.val } else { 0 };
+        if opt.flag.is_null() {
+            opt.val
+        } else {
+            *opt.flag = opt.val;
+            0
+        }
+    }
+}
+
+/// Shared `getopt_long` / `getopt_long_only`.
+unsafe fn getopt_long_inner(
+    argc: c_int,
+    argv: *const *mut c_char,
+    optstring: *const c_char,
+    longopts: *const OptionLong,
+    longindex: *mut c_int,
+    long_only: bool,
+) -> c_int {
+    if argc < 1 || argv.is_null() || optstring.is_null() {
+        return -1;
+    }
+    unsafe {
+        if optreset != 0 {
+            optreset = 0;
+            optind = 1;
+            getopt_reset_scan();
+        }
+        if optind < 1 {
+            optind = 1;
+            getopt_reset_scan();
+        }
+        if optind >= argc {
+            return -1;
+        }
+        let arg = argv_cstr(argv, optind);
+        if arg.is_null() {
+            return -1;
+        }
+        let b0 = *arg as u8;
+        let b1 = *arg.add(1) as u8;
+        let silent = *optstring as u8 == b':';
+        let a0 = argv_cstr(argv, 0);
+
+        if b0 != b'-' {
+            return -1;
+        }
+        if b1 == 0 {
+            return -1;
+        }
+        if b1 == b'-' && *arg.add(2) == 0 {
+            optind += 1;
+            getopt_reset_scan();
+            return -1;
+        }
+
+        let is_double = b1 == b'-';
+        let try_long = is_double || long_only;
+        if try_long {
+            let name = if is_double { arg.add(2) } else { arg.add(1) };
+            let mut name_len = 0usize;
+            let mut inline_arg: *mut c_char = core::ptr::null_mut();
+            loop {
+                let c = *name.add(name_len);
+                if c == 0 {
+                    break;
+                }
+                if c as u8 == b'=' {
+                    inline_arg = name.add(name_len.saturating_add(1));
+                    break;
+                }
+                name_len = name_len.saturating_add(1);
+                if name_len > 256 {
+                    break;
+                }
+            }
+            // Isolate the name: temporarily not needed — match uses prefix length.
+            if let Some(idx) = match_longopt(longopts, name, name_len) {
+                let opt = &*longopts.add(idx);
+                optind += 1;
+                getopt_reset_scan();
+                match take_long_arg(argc, argv, inline_arg, opt.has_arg, silent, a0) {
+                    Ok(val) => return finish_long(opt, val, longindex, idx),
+                    Err(e) => {
+                        optopt = if opt.flag.is_null() { opt.val } else { 0 };
+                        return e;
+                    }
+                }
+            } else if is_double {
+                optind += 1;
+                getopt_reset_scan();
+                if !silent {
+                    getopt_err(a0, b"unrecognized option -- ", b'-');
+                }
+                return c_int::from(b'?');
+            }
+            // long_only and no long match → short options below.
+        }
+
+        getopt(argc, argv, optstring)
+    }
+}
+
+/// C `getopt_long` → nlist `_getopt_long` (BSD / GNU; man getopt_long(3)).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getopt_long(
+    argc: c_int,
+    argv: *const *mut c_char,
+    optstring: *const c_char,
+    longopts: *const OptionLong,
+    longindex: *mut c_int,
+) -> c_int {
+    unsafe { getopt_long_inner(argc, argv, optstring, longopts, longindex, false) }
+}
+
+/// C `getopt_long_only` → nlist `_getopt_long_only`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getopt_long_only(
+    argc: c_int,
+    argv: *const *mut c_char,
+    optstring: *const c_char,
+    longopts: *const OptionLong,
+    longindex: *mut c_int,
+) -> c_int {
+    unsafe { getopt_long_inner(argc, argv, optstring, longopts, longindex, true) }
 }

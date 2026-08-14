@@ -10,8 +10,11 @@
 use core::ffi::{c_char, c_int, c_void};
 
 use crate::kh_core::heap::{allocate_aligned, free, malloc};
+use crate::kh_core::helpers::KH_HELPER_TLV_COPY;
 use crate::kh_core::process::exit_now;
+use crate::kh_core::sys;
 use crate::kh_core::trace;
+use crate::dylib::libsystem_pthread;
 
 /// Soft `std::exception::what()` function pointer type (Itanium vtable slot).
 type ExceptionWhatFn = unsafe extern "C" fn(*mut c_void) -> *const u8;
@@ -204,10 +207,14 @@ struct TlvDescriptor {
 
 /// Soft per-key block size (covers large clang TLS templates).
 const TLV_BLOCK: usize = 1024 * 1024;
-const TLV_SLOTS: usize = 128;
+/// `(thread × image-key)` slots. Process-global blocks made Rust std abort
+/// with "current thread handle already set during thread spawn".
+const TLV_SLOTS: usize = 256;
 
 #[derive(Clone, Copy)]
 struct TlvSlot {
+    /// `pthread_self` token so each thread has its own template copy.
+    thread: u64,
     /// Grouping key (`descriptor.key`, or desc VA when key is 0).
     key: u64,
     base: *mut u8,
@@ -217,11 +224,34 @@ struct TlvSlot {
 
 // SAFETY: freestanding single-writer soft table for soft TLS.
 static mut TLV_TABLE: [TlvSlot; TLV_SLOTS] = [TlvSlot {
+    thread: 0,
     key: 0,
     base: core::ptr::null_mut(),
     size: 0,
 }; TLV_SLOTS];
 static mut TLV_USED: usize = 0;
+
+fn tlv_thread_token() -> u64 {
+    // Prefer TPIDR (unique GuestTls VA per thread). `pthread_self` can still
+    // fall back to MAIN_SELF if TSD is not visible yet, which aliases TLV
+    // and makes Tokio think main already entered the runtime.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let tpidr: u64;
+        // SAFETY: read of TPIDR_EL0 only.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, tpidr_el0",
+                out(reg) tpidr,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        if tpidr != 0 {
+            return tpidr;
+        }
+    }
+    u64::try_from(unsafe { libsystem_pthread::pthread_self() }.addr()).unwrap_or(1)
+}
 
 /// Real work for TLV; called from a register-preserving trampoline.
 ///
@@ -244,22 +274,21 @@ pub unsafe extern "C" fn kh_tlv_bootstrap_impl(desc: *mut c_void) -> *mut c_void
         trace::force_note(b"[kh-libsystem] tlv_bootstrap offset beyond soft block\n");
         return core::ptr::null_mut();
     }
-    let group = if d.key != 0 {
-        d.key
-    } else {
-        u64::try_from(desc.addr()).unwrap_or(0)
-    };
+    let desc_va = u64::try_from(desc.addr()).unwrap_or(0);
+    let group = if d.key != 0 { d.key } else { desc_va };
+    let thread = tlv_thread_token();
 
     let used = unsafe { TLV_USED }.min(TLV_SLOTS);
     let table = core::ptr::addr_of!(TLV_TABLE);
     for slot in unsafe { (*table).iter().take(used) } {
-        if slot.key == group && !slot.base.is_null() && off < slot.size {
+        if slot.thread == thread && slot.key == group && !slot.base.is_null() && off < slot.size {
             let addr = slot.base.addr().saturating_add(off);
             return core::ptr::with_exposed_provenance_mut(addr);
         }
     }
 
-    // One large zeroed block per image key (offsets share the template).
+    // One block per (thread, image key). Copy `__thread_data` so niche
+    // enums (Tokio `EnterRuntime`) are not zero → wrongly `Entered`.
     let base = unsafe { malloc(TLV_BLOCK) }.cast::<u8>();
     if base.is_null() {
         trace::force_note(b"[kh-libsystem] tlv_bootstrap OOM\n");
@@ -267,12 +296,20 @@ pub unsafe extern "C" fn kh_tlv_bootstrap_impl(desc: *mut c_void) -> *mut c_void
     }
     unsafe {
         core::ptr::write_bytes(base, 0, TLV_BLOCK);
+        let dest_va = u64::try_from(base.addr()).unwrap_or(0);
+        let _ = sys::helper3(
+            KH_HELPER_TLV_COPY,
+            desc_va,
+            dest_va,
+            u64::try_from(TLV_BLOCK).unwrap_or(0),
+        );
     }
     let idx = unsafe { TLV_USED };
     if idx < TLV_SLOTS {
         unsafe {
             if let Some(slot) = (*core::ptr::addr_of_mut!(TLV_TABLE)).get_mut(idx) {
                 *slot = TlvSlot {
+                    thread,
                     key: group,
                     base,
                     size: TLV_BLOCK,
@@ -417,6 +454,19 @@ pub(crate) unsafe extern "C" fn cxa_guard_abort(guard: *mut u64) {
     let g = unsafe { &mut *guard };
     *g = 0;
     trace::note(b"[kh-libsystem] ___cxa_guard_abort\n");
+}
+
+/// `__tlv_atexit` → nlist `__tlv_atexit` (no TLS dtor list yet).
+///
+/// Rust std registers thread-local destructors at startup. Soft success is
+/// enough for single-shot CLIs (`rustup-init`); we do not run `dtor` at exit.
+#[unsafe(export_name = "_tlv_atexit")]
+pub(crate) unsafe extern "C" fn tlv_atexit(
+    _dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+    _obj: *mut c_void,
+    _mkey: *mut c_void,
+) -> c_int {
+    0
 }
 
 /// `___cxa_atexit` → nlist `___cxa_atexit` (no dtor registration yet).

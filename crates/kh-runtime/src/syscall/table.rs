@@ -15,6 +15,8 @@ pub enum BsdSyscall {
     Execve,
     /// `dup2`.
     Dup2,
+    /// `ioctl`.
+    Ioctl,
     /// `setsid`.
     Setsid,
     /// `setpgid`.
@@ -172,6 +174,7 @@ impl BsdSyscall {
             Self::Wait4 => "wait4",
             Self::Execve => "execve",
             Self::Dup2 => "dup2",
+            Self::Ioctl => "ioctl",
             Self::Setsid => "setsid",
             Self::Setpgid => "setpgid",
             Self::Getpgrp => "getpgrp",
@@ -262,6 +265,7 @@ impl BsdSyscall {
             Self::Execve => 59,
             Self::Vfork => 66,
             Self::Dup2 => 90,
+            Self::Ioctl => 54,
             Self::Setsid => 147,
             Self::Setpgid => 82,
             Self::Getpgrp => 81,
@@ -367,6 +371,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         42 | 405 => Some(BsdSyscall::Pipe), // pipe / nocancel-ish
         46 => Some(BsdSyscall::Sigaction),
         48 => Some(BsdSyscall::Sigprocmask),
+        54 | 423 => Some(BsdSyscall::Ioctl), // ioctl / ioctl_nocancel
         57 => Some(BsdSyscall::Symlink),
         58 => Some(BsdSyscall::Readlink),
         59 => Some(BsdSyscall::Execve),
@@ -454,6 +459,7 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (65, "msync"),
         (73, "munmap"),
         (74, "mprotect"),
+        (54, "ioctl"),
         (92, "fcntl"),
         (116, "gettimeofday"),
         (197, "mmap"),

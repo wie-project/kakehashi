@@ -880,6 +880,73 @@ pub(crate) unsafe extern "C" fn freeaddrinfo(res: *mut c_void) {
     }
 }
 
+/// C `si_destination_compare` → nlist `_si_destination_compare`.
+///
+/// Apple libinfo export (re-exported by libSystem). Public headers do not
+/// document the arity; callers use either two `sockaddr *` (qsort) or
+/// `(sa1, salen1, sa2, salen2)`. A socklen is never a userland pointer, so
+/// we pick the pair from the registers.
+///
+/// Returns `<0` / `0` / `>0` like `memcmp` (family, then address bytes).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn si_destination_compare(
+    sa1: *const u8,
+    a: u64,
+    sa2_or_unused: *const u8,
+    _b: u64,
+) -> c_int {
+    let sa2 = if looks_like_guest_ptr(a) {
+        core::ptr::with_exposed_provenance::<u8>(usize::try_from(a).unwrap_or(0))
+    } else {
+        sa2_or_unused
+    };
+    unsafe { sockaddr_cmp(sa1, sa2) }
+}
+
+fn looks_like_guest_ptr(x: u64) -> bool {
+    // socklen_t for inet/inet6 is 16..28; sockaddr_un is ≤ 106.
+    x > 256 && x < (1_u64 << 48)
+}
+
+unsafe fn sockaddr_cmp(a: *const u8, b: *const u8) -> c_int {
+    if a.is_null() || b.is_null() {
+        return if a.is_null() && b.is_null() {
+            0
+        } else if a.is_null() {
+            -1
+        } else {
+            1
+        };
+    }
+    // Darwin `sockaddr`: sa_len, sa_family, sa_data[].
+    let (fa, la) = unsafe { sockaddr_fam_len(a) };
+    let (fb, lb) = unsafe { sockaddr_fam_len(b) };
+    if fa != fb {
+        return c_int::from(i16::from(fa).saturating_sub(i16::from(fb)));
+    }
+    let n = usize::from(la.min(lb)).max(2);
+    unsafe {
+        for i in 0..n {
+            let ca = *a.add(i);
+            let cb = *b.add(i);
+            if ca != cb {
+                return c_int::from(i16::from(ca).saturating_sub(i16::from(cb)));
+            }
+        }
+    }
+    c_int::from(i16::from(la).saturating_sub(i16::from(lb)))
+}
+
+unsafe fn sockaddr_fam_len(sa: *const u8) -> (u8, u8) {
+    unsafe {
+        let slen = *sa;
+        let fam = *sa.add(1);
+        let fallback = if fam == 30 { 28 } else { 16 };
+        let len = if slen == 0 { fallback } else { slen };
+        (fam, len)
+    }
+}
+
 /// C `gai_strerror` (static strings).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn gai_strerror(errcode: c_int) -> *const c_char {

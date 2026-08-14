@@ -23,7 +23,7 @@ use crate::kh_core::sys::{
     SYS_MUNMAP,
 };
 use crate::kh_core::trace;
-use crate::{KH_HELPER_PARK, KH_HELPER_WAKE};
+use crate::{KH_HELPER_MAIN_STACK, KH_HELPER_PARK, KH_HELPER_WAKE};
 
 const EAGAIN: i32 = 35;
 const EINVAL: i32 = 22;
@@ -1149,27 +1149,73 @@ pub(crate) unsafe extern "C" fn pthread_attr_setdetachstate(
     0
 }
 
-// Soft main-stack region for `pthread_get_stack{addr,size}_np` (Rust std / libstd
-// init under freestanding). Addr is the **top** of stack (Darwin convention).
+// Fallback main-stack slab when the runtime has not published the real stack
+// (unit tests / not-yet-wired helper). Addr is the **top** (Darwin convention).
 const SOFT_STACK_SIZE: usize = 8 * 1024 * 1024;
 #[repr(C, align(16))]
 struct SoftStack([u8; SOFT_STACK_SIZE]);
 static mut SOFT_STACK: SoftStack = SoftStack([0; SOFT_STACK_SIZE]);
 
+#[repr(C)]
+struct MainStackInfo {
+    top: u64,
+    size: u64,
+}
+
+fn published_main_stack() -> Option<(usize, usize)> {
+    let mut info = MainStackInfo { top: 0, size: 0 };
+    let va = u64::try_from(core::ptr::from_mut(&mut info).addr()).unwrap_or(0);
+    let rc = unsafe { sys::helper1(KH_HELPER_MAIN_STACK, va) };
+    if rc <= 0 || info.top == 0 || info.size == 0 {
+        return None;
+    }
+    let top = usize::try_from(info.top).ok()?;
+    let size = usize::try_from(info.size).ok()?;
+    Some((top, size))
+}
+
+fn worker_stack(thread: *mut c_void) -> Option<(*mut u8, usize)> {
+    if thread.is_null() {
+        return None;
+    }
+    // Main-thread token is a u64, not a KhThread.
+    if core::ptr::eq(thread.cast::<u64>(), core::ptr::addr_of!(MAIN_SELF)) {
+        return None;
+    }
+    let t = thread.cast::<KhThread>();
+    // SAFETY: only dereference when magic matches our create block.
+    unsafe {
+        if (*t).magic != MAGIC || (*t).stack.is_null() || (*t).stack_size == 0 {
+            return None;
+        }
+        Some(((*t).stack, (*t).stack_size))
+    }
+}
+
+fn stack_top_size(thread: *mut c_void) -> (*mut c_void, usize) {
+    if let Some((base, size)) = worker_stack(thread) {
+        return (unsafe { base.add(size).cast() }, size);
+    }
+    if let Some((top, size)) = published_main_stack() {
+        return (core::ptr::with_exposed_provenance_mut::<u8>(top).cast(), size);
+    }
+    // SAFETY: static SoftStack fallback; only used when helper is unset.
+    let base = unsafe { core::ptr::addr_of_mut!(SOFT_STACK.0).cast::<u8>() };
+    (unsafe { base.add(SOFT_STACK_SIZE).cast() }, SOFT_STACK_SIZE)
+}
+
 /// C `pthread_get_stackaddr_np` → nlist `_pthread_get_stackaddr_np`.
 ///
-/// Returns the high address of the soft main stack (grows down).
+/// Returns the high address of the thread stack (grows down).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn pthread_get_stackaddr_np(_thread: *mut c_void) -> *mut c_void {
-    // SAFETY: static mut SoftStack; single main-thread soft path for Rust std.
-    let base = unsafe { core::ptr::addr_of_mut!(SOFT_STACK.0).cast::<u8>() };
-    unsafe { base.add(SOFT_STACK_SIZE).cast() }
+pub(crate) unsafe extern "C" fn pthread_get_stackaddr_np(thread: *mut c_void) -> *mut c_void {
+    stack_top_size(thread).0
 }
 
 /// C `pthread_get_stacksize_np` → nlist `_pthread_get_stacksize_np`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn pthread_get_stacksize_np(_thread: *mut c_void) -> usize {
-    SOFT_STACK_SIZE
+pub(crate) unsafe extern "C" fn pthread_get_stacksize_np(thread: *mut c_void) -> usize {
+    stack_top_size(thread).1
 }
 
 /// Darwin `pthread_setname_np` (current thread only) → nlist `_pthread_setname_np`.

@@ -744,6 +744,9 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
         // Faults go through our handler → `_exit`; disable dumps as belt-and-braces.
         disable_core_dumps();
 
+        // `$*` / bad guest SP used to double-fault the logger (no SA_ONSTACK).
+        install_fault_alt_stack();
+
         // SAFETY: process-wide SIGTRAP / fault handlers with SA_SIGINFO.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
@@ -760,7 +763,7 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
 
             // Guest faults: print PC/addr so `kh run` diagnoses unbound GOT / bad heap.
             let mut fault: libc::sigaction = std::mem::zeroed();
-            fault.sa_flags = libc::SA_SIGINFO;
+            fault.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             #[allow(unknown_lints, clippy::as_conversions, function_casts_as_integer)]
             {
                 fault.sa_sigaction = guest_fault_sigaction as *const () as usize;
@@ -775,6 +778,33 @@ pub fn install_trap_handlers(config: &TrapConfig) -> Result<(), TrapError> {
         }
         reset_trap_state();
         Ok(())
+    }
+}
+
+/// Host `sigaltstack` so a guest fault with a dead SP can still log PC/addr.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn install_fault_alt_stack() {
+    const LEN: usize = 64 * 1024;
+    // SAFETY: anonymous RW mapping, process-lifetime, only used as sigaltstack.
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            return;
+        }
+        let mut ss: libc::stack_t = std::mem::zeroed();
+        ss.ss_sp = ptr;
+        ss.ss_size = LEN;
+        ss.ss_flags = 0;
+        if libc::sigaltstack(std::ptr::addr_of!(ss), std::ptr::null_mut()) != 0 {
+            let _ = libc::munmap(ptr, LEN);
+        }
     }
 }
 

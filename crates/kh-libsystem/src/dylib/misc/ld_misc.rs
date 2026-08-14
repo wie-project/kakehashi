@@ -1,7 +1,6 @@
 //! Misc ld-classic soft symbols.
 
 #![allow(unused_imports)]
-
 #![allow(
     static_mut_refs,
     non_snake_case,
@@ -24,9 +23,9 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
+use crate::dylib::libsystem_c::stdio::{memcpy, strlen};
 use crate::kh_core::errno;
 use crate::kh_core::heap::malloc;
-use crate::dylib::libsystem_c::stdio::{memcpy, strlen};
 
 const EINVAL: i32 = 22;
 
@@ -242,6 +241,10 @@ pub(crate) unsafe extern "C" fn qsort_r(
     let Some(cmp) = compar else {
         return;
     };
+    let cmp: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void) -> c_int = {
+        let raw = crate::kh_core::sys::strip_ptrauth_ia(cmp as usize);
+        unsafe { core::mem::transmute(raw) }
+    };
     // Simple insertion sort with thunk.
     unsafe {
         let bytes = base.cast::<u8>();
@@ -300,4 +303,3 @@ pub(crate) unsafe extern "C" fn host_statistics(
     }
     0
 }
-

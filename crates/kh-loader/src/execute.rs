@@ -136,6 +136,7 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     let mut argv_owned = Vec::with_capacity(opts.guest_args.len().saturating_add(1));
     argv_owned.push(argv0);
     argv_owned.extend(opts.guest_args.iter().cloned());
+    proc_state::set_guest_argv(argv_owned.clone());
     let argv_refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
     // Minimal macOS-like environment so guests see a real PATH under the bottle.
     // HOME bridges the host home via `/Volumes/linux…` so host
@@ -158,6 +159,12 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         // (`/var/folders/…/T/`, ~49 chars). Soft `/tmp` made clang `-flto`
         // `-object_path_lto` paths too short for freestanding LTO materialize.
         "TMPDIR=/var/folders/xx/kakehashi_default_user_temp000/T/".to_owned(),
+        // Guest HOME is the host home via `/Volumes/linux…`. Non-interactive
+        // bash still honours `BASH_ENV` / posix `ENV`; pointing them at
+        // `/dev/null` stops Linux `~/.bashrc` (`return` → exit 1) from running
+        // as a Darwin startup file.
+        "BASH_ENV=/dev/null".to_owned(),
+        "ENV=/dev/null".to_owned(),
     ];
     // Apple clang without a working `xcrun` does not auto-pick
     // `…/SDKs/MacOSX.sdk` (see `clang -v`: only CLT usr/include). Point the
@@ -206,6 +213,9 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         address_space.register_borrowed(&stack);
         drop(registry_install(address_space));
     });
+    // Darwin `pthread_get_stackaddr_np` must report this mapping so Rust std
+    // can MAP_FIXED a PROT_NONE guard at the low end (not a fake BSS slab).
+    proc_state::set_main_stack(stack.guest_addr, u64::try_from(stack.host_len()).unwrap_or(0));
 
     // Wire freestanding libSystem → `kh_hypercall_entry` (sole production BSD path).
     // Residual Darwin `svc` is always rewritten to `brk` below;
@@ -344,7 +354,46 @@ fn register_dyld_images(session: &LoadSession) {
             .iter()
             .map(|e| (e.name.clone(), e.value.wrapping_add(slide)));
         kh_runtime::dyld_register_image(img.path.clone(), img.install_name.clone(), exports);
+        register_image_tlv_template(img, slide);
     }
+}
+
+fn register_image_tlv_template(img: &crate::session::ProcessImage, slide: u64) {
+    let Some(macho) = img.image.as_ref() else {
+        return;
+    };
+    let mut vars_lo = 0_u64;
+    let mut vars_len = 0_u64;
+    let mut data_lo = 0_u64;
+    let mut data_len = 0_u64;
+    let mut bss_len = 0_u64;
+    for seg in &macho.segments {
+        for s in &seg.sections {
+            let va = s.addr.wrapping_add(slide);
+            match s.name.as_str() {
+                "__thread_vars" => {
+                    vars_lo = va;
+                    vars_len = s.size;
+                }
+                "__thread_data" => {
+                    data_lo = va;
+                    data_len = s.size;
+                }
+                "__thread_bss" => bss_len = s.size,
+                _ => {}
+            }
+        }
+    }
+    if vars_len == 0 {
+        return;
+    }
+    kh_runtime::process::register_tlv_template(kh_runtime::process::TlvTemplate {
+        vars_lo,
+        vars_hi: vars_lo.saturating_add(vars_len),
+        data_lo,
+        data_len,
+        bss_len,
+    });
 }
 
 /// Guest VA of a freestanding `libSystem` export (nlist + slide), if present.

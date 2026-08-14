@@ -359,11 +359,66 @@ pub fn normalize_stdio_pipes_blocking() {
 /// Bottle root published for path translation (set once per run; rare updates).
 static BOTTLE_ROOT: RwLock<Option<Arc<PathBuf>>> = RwLock::new(None);
 
+/// Guest `argv` for `_NSGetArgc` / `_NSGetArgv` (Rust `std::env::args` on Darwin).
+static GUEST_ARGV: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
 /// Guest absolute path of the main executable (`_NSGetExecutablePath`).
 ///
 /// Set at `kh run` / nested re-exec start. Soft-git fallback lived in freestanding
 /// libSystem; clang spawn needs the real binary (not a hard-coded git path).
 static GUEST_EXECUTABLE: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// Darwin TLV template for one mapped image (`__thread_vars` + data/bss).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlvTemplate {
+    /// Inclusive start of `__thread_vars`.
+    pub vars_lo: u64,
+    /// Exclusive end of `__thread_vars`.
+    pub vars_hi: u64,
+    /// Start of `__thread_data` (initial values).
+    pub data_lo: u64,
+    /// Bytes of initialized TLS.
+    pub data_len: u64,
+    /// Bytes of `__thread_bss` (stay zero).
+    pub bss_len: u64,
+}
+
+static TLV_TEMPLATES: RwLock<Vec<TlvTemplate>> = RwLock::new(Vec::new());
+
+/// Record one image's Darwin TLV template (call after slide is known).
+pub fn register_tlv_template(tmpl: TlvTemplate) {
+    if tmpl.vars_hi <= tmpl.vars_lo {
+        return;
+    }
+    match TLV_TEMPLATES.write() {
+        Ok(mut g) => g.push(tmpl),
+        Err(p) => p.into_inner().push(tmpl),
+    }
+}
+
+/// Template whose `__thread_vars` range contains `desc_va`.
+#[must_use]
+pub fn tlv_template_for_desc(desc_va: u64) -> Option<TlvTemplate> {
+    let g = match TLV_TEMPLATES.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.iter()
+        .copied()
+        .find(|t| desc_va >= t.vars_lo && desc_va < t.vars_hi)
+}
+
+fn clear_tlv_templates() {
+    match TLV_TEMPLATES.write() {
+        Ok(mut g) => g.clear(),
+        Err(p) => p.into_inner().clear(),
+    }
+}
+
+/// Main guest stack low address (identity VA). `0` = unset.
+static MAIN_STACK_BASE: AtomicU64 = AtomicU64::new(0);
+/// Main guest stack length in bytes. `0` = unset.
+static MAIN_STACK_LEN: AtomicU64 = AtomicU64::new(0);
 
 /// Open `O_DIRECTORY` fd for the bottle root (`-1` = none).
 ///
@@ -438,6 +493,9 @@ impl ProcessState {
         MAX_SYSCALLS.store(max, Ordering::Relaxed);
         SYSCALL_COUNT.store(0, Ordering::Relaxed);
         LIVE_CHILDREN.store(0, Ordering::Relaxed);
+        MAIN_STACK_BASE.store(0, Ordering::Relaxed);
+        MAIN_STACK_LEN.store(0, Ordering::Relaxed);
+        clear_tlv_templates();
         crate::thread::reset_thread_runtime();
     }
 
@@ -599,6 +657,23 @@ pub fn with_bottle_root<R>(f: impl FnOnce(Option<&Path>) -> R) -> R {
     }
 }
 
+/// Store guest argv (including argv0) for `_NSGetArgc` / `_NSGetArgv`.
+pub fn set_guest_argv(argv: Vec<String>) {
+    match GUEST_ARGV.write() {
+        Ok(mut g) => *g = argv,
+        Err(p) => *p.into_inner() = argv,
+    }
+}
+
+/// Snapshot of guest argv for this run.
+#[must_use]
+pub fn guest_argv() -> Vec<String> {
+    match GUEST_ARGV.read() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
+}
+
 /// Records the guest-visible main executable path for `_NSGetExecutablePath`.
 pub fn set_guest_executable_path(path: Option<String>) {
     let next = path
@@ -611,6 +686,24 @@ pub fn set_guest_executable_path(path: Option<String>) {
         Err(poisoned) => {
             *poisoned.into_inner() = next;
         }
+    }
+}
+
+/// Records the main guest stack (low address + length) for `pthread_get_stack*_np`.
+pub fn set_main_stack(base: u64, len: u64) {
+    MAIN_STACK_BASE.store(base, Ordering::Release);
+    MAIN_STACK_LEN.store(len, Ordering::Release);
+}
+
+/// Main stack low address and length, when published for this run.
+#[must_use]
+pub fn main_stack() -> Option<(u64, u64)> {
+    let base = MAIN_STACK_BASE.load(Ordering::Acquire);
+    let len = MAIN_STACK_LEN.load(Ordering::Acquire);
+    if base == 0 || len == 0 {
+        None
+    } else {
+        Some((base, len))
     }
 }
 

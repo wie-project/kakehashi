@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[command(long_about = "\
 Userspace macOS translation layer for Linux ARM64 (no JIT).\n\
 \n\
-Commands: run | bottle | install.\n\
+Commands: run | bottle | install | env.\n\
 Env: KAKEHASHI_LOG, KAKEHASHI_ROOT, KAKEHASHI_CONFIG_DIR, KAKEHASHI_DATA_DIR,\n\
      KAKEHASHI_CACHE_DIR, KAKEHASHI_FORCE_DOWNLOAD,\n\
      KAKEHASHI_LIBSYSTEM, KAKEHASHI_7ZZ, KAKEHASHI_CURL,\n\
@@ -71,6 +71,10 @@ enum Command {
         #[command(subcommand)]
         action: BottleAction,
     },
+
+    /// Print `export PATH=…` (optional). First `kh` already installs this once
+    /// into `~/.profile` / `~/.bashrc` / `~/.zshrc`.
+    Env,
 
     /// Install an optional guest tool into the bottle at a real macOS path.
     ///
@@ -158,6 +162,13 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    drop(commands::env::ensure());
+
+    if let Some(name) = commands::env::invoked_wrapper_name() {
+        init_tracing(0);
+        return commands::run::run_wrapper(&name);
+    }
+
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -181,7 +192,9 @@ fn run() -> Result<()> {
             dry_load,
             guest_args: &guest_args,
             json: cli.json,
+            passthrough_exit: false,
         }),
+        Command::Env => commands::env::run(cli.json),
         Command::Install { package } => {
             commands::install::require_package(&package)?;
             commands::install::run(&commands::install::InstallArgs {

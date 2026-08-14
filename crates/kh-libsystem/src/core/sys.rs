@@ -14,6 +14,8 @@ pub(crate) const SYS_OPEN: u32 = 5;
 pub(crate) const SYS_CLOSE: u32 = 6;
 /// BSD `wait4` (also implements `waitpid`).
 pub(crate) const SYS_WAIT4: u32 = 7;
+/// BSD `ioctl`.
+pub(crate) const SYS_IOCTL: u32 = 54;
 /// BSD `fcntl`.
 pub(crate) const SYS_FCNTL: u32 = 92;
 /// BSD `dup2`.
@@ -450,4 +452,30 @@ pub(crate) unsafe fn helper3(number: u32, a0: u64, a1: u64, a2: u64) -> isize {
 pub(crate) unsafe fn helper0(number: u32) -> isize {
     // SAFETY: forwarded to syscall0.
     unsafe { syscall0(number) }
+}
+
+/// Strip an instruction-pointer PAC signature (`XPACI`).
+///
+/// arm64e guests (macOS `/bin/bash`) pass signed function pointers into
+/// freestanding `qsort`. Linux `blr` does not authenticate; the signed VA
+/// faults. No-op on a plain pointer.
+#[inline]
+pub(crate) fn strip_ptrauth_ia(ptr: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut p = ptr;
+        // SAFETY: XPACI only rewrites the destination register.
+        unsafe {
+            core::arch::asm!(
+                "xpaci {p}",
+                p = inout(reg) p,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        p
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        ptr
+    }
 }

@@ -1,7 +1,6 @@
 //! CoreAnalytics + libxar soft stubs (ld / bitcode paths).
 
 #![allow(unused_imports)]
-
 #![allow(
     static_mut_refs,
     non_snake_case,
@@ -98,4 +97,3 @@ soft_null!(xar_subdoc_new, _x: *mut c_void, _name: *const c_char);
 pub(crate) unsafe extern "C" fn xar_subdoc_name(_s: *mut c_void) -> *const c_char {
     core::ptr::null()
 }
-

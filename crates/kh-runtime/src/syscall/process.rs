@@ -69,9 +69,8 @@ pub(crate) fn handle_wait4(args: SyscallArgs) -> SyscallResult {
 /// `execve` — path `x0`, argv `x1`, envp `x2`.
 ///
 /// Mach-O guests are re-executed as `kh run <host-path> -- <args…>` so the
-/// child stays inside the translator. Scripts with a shebang use the host
-/// interpreter when it is a well-known shell, otherwise `kh run` the bottle
-/// interpreter.
+/// child stays inside the translator. Scripts with a shebang use the bottle
+/// interpreter when it exists as Mach-O; otherwise the host interpreter.
 #[allow(unsafe_code)]
 pub(crate) fn handle_execve(args: SyscallArgs) -> SyscallResult {
     let name = "execve";
@@ -535,11 +534,18 @@ fn try_exec_script(host_path: &Path, argv: &[String], envp: &[String]) -> Option
     Some(unsafe { host::execve_host(path0.as_c_str(), &argv_ptrs, &env_ptrs) })
 }
 
+/// Resolve a shebang interpreter to a host path.
+///
+/// Prefer the bottle file when it exists so `#!/bin/sh` stays Darwin `sh`
+/// under `kh`. Fall back to the guest path as a host path (no bottle, or
+/// the prefix was not copied).
 fn map_interpreter(guest: &str) -> PathBuf {
-    match guest {
-        "/bin/sh" | "/bin/bash" | "/bin/zsh" | "/usr/bin/env" => PathBuf::from(guest),
-        other => bottle::translate_path(other).unwrap_or_else(|_| PathBuf::from(other)),
+    if let Ok(translated) = bottle::translate_path(guest)
+        && translated.is_file()
+    {
+        return translated;
     }
+    PathBuf::from(guest)
 }
 
 fn reexec_direct(host_path: &Path, argv: &[String], envp: &[String]) -> i32 {
@@ -693,6 +699,38 @@ mod bridge_env_tests {
         assert_eq!(
             guest_bridge_value_to_host("/Volumes/linux"),
             Some("/".into())
+        );
+    }
+
+    #[test]
+    fn map_interpreter_prefers_bottle_file() {
+        use super::map_interpreter;
+        let _g = crate::process::test_lock();
+        let tmp = std::env::temp_dir().join(format!(
+            "kh-interp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        drop(std::fs::remove_dir_all(&tmp));
+        std::fs::create_dir_all(tmp.join("bin")).expect("mkdir");
+        let sh = tmp.join("bin/sh");
+        std::fs::write(&sh, b"not-a-real-sh").expect("write sh");
+        crate::bottle::set_bottle_root(Some(tmp.clone()));
+        assert_eq!(map_interpreter("/bin/sh"), sh);
+        crate::bottle::set_bottle_root(None);
+        drop(std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
+    fn map_interpreter_falls_back_to_guest_path() {
+        use super::map_interpreter;
+        let _g = crate::process::test_lock();
+        crate::bottle::set_bottle_root(None);
+        assert_eq!(
+            map_interpreter("/bin/sh"),
+            std::path::PathBuf::from("/bin/sh")
         );
     }
 

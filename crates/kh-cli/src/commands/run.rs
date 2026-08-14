@@ -30,10 +30,25 @@ pub(crate) struct RunArgs<'a> {
     pub dry_load: bool,
     pub guest_args: &'a [String],
     pub json: bool,
+    /// When true, any guest/host exit code is propagated (PATH wrappers).
+    pub passthrough_exit: bool,
 }
 
 /// Runs the run command.
 pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
+    finish_exit(args, execute(args)?)
+}
+
+/// Propagate `code` or enforce `--expect-code`.
+fn finish_exit(args: &RunArgs<'_>, code: i32) -> Result<()> {
+    if !args.passthrough_exit && code != args.expect_code {
+        anyhow::bail!("guest exit code {code} != expected {}", args.expect_code);
+    }
+    std::process::exit(code);
+}
+
+/// Load and run the guest; returns its exit code (does not `_exit`).
+pub(crate) fn execute(args: &RunArgs<'_>) -> Result<i32> {
     let guest = match args.guest_page_size {
         Some(bytes) => GuestPageSize::try_explicit(bytes).ok_or_else(|| {
             anyhow::anyhow!("invalid --guest-page-size {bytes} (expected 4096 or 16384)")
@@ -58,7 +73,8 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
     let host_open = resolve_host_open_path(&program, root.as_deref());
 
     if args.dry_load {
-        return dry_load(args, guest, root, &host_open);
+        dry_load(args, guest, root, &host_open)?;
+        return Ok(0);
     }
 
     if !host_open.is_file() {
@@ -78,16 +94,20 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
     // Mach-O. Nested guest `execve` already re-execs them on the host; top-level
     // `kh run` should do the same instead of failing with "Invalid magic".
     if !is_macho_file(&host_open) {
+        if let Some(script) = parse_shebang(&host_open) {
+            return run_shebang(&script, &program, &host_open, args, root.as_deref());
+        }
         return run_host_native(&host_open, &program, args);
     }
 
     kh_runtime::clear_trace_on_exit();
     kh_runtime::set_expect_code(args.expect_code);
 
+    let guest_args = guest_args_for(&program, args.guest_args);
     let opts = RunOptions {
         root,
         guest_page_size: guest,
-        guest_args: args.guest_args.to_vec(),
+        guest_args,
         // Plain `kh run` must not record trap events — max_syscalls is 50M+ and
         // each event is a String + Mutex push (catastrophic on archive I/O).
         max_events: 0,
@@ -98,10 +118,7 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
     match run_micro(&host_open, &opts) {
         Ok(result) => {
             if let Some(code) = result.exit_code {
-                if code != args.expect_code {
-                    anyhow::bail!("guest exit code {code} != expected {}", args.expect_code);
-                }
-                std::process::exit(code);
+                return Ok(code);
             }
             anyhow::bail!(
                 "guest returned without exit (entry={:#x}, sp={:#x}, patched_svc={})",
@@ -112,6 +129,103 @@ pub(crate) fn run(args: &RunArgs<'_>) -> Result<()> {
         }
         Err(err) => Err(map_live_exec_error(err)).context("micro run failed"),
     }
+}
+
+/// Shebang line: interpreter + optional one argument (`#!/usr/bin/env bash`).
+struct Shebang {
+    interp: String,
+    interp_arg: Option<String>,
+}
+
+/// Read `#! interpreter [arg]` from the start of `path`.
+fn parse_shebang(path: &Path) -> Option<Shebang> {
+    let mut f = File::open(path).ok()?;
+    let mut head = [0_u8; 256];
+    let n = f.read(&mut head).ok()?;
+    let bytes = head.get(..n)?;
+    if bytes.first().copied() != Some(b'#') || bytes.get(1).copied() != Some(b'!') {
+        return None;
+    }
+    let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line = bytes.get(2..line_end)?;
+    let line = core::str::from_utf8(line).ok()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let interp = parts.next()?.to_owned();
+    let interp_arg = parts.next().map(str::to_owned);
+    Some(Shebang { interp, interp_arg })
+}
+
+/// Guest-visible path for a host script so Darwin `open` hits `/Volumes/linux…`.
+fn guest_script_path(host_open: &Path, program: &Path, bottle: Option<&Path>) -> String {
+    let p = program.to_string_lossy();
+    if p.starts_with("/Volumes/linux") {
+        return p.into_owned();
+    }
+    if p.starts_with('/')
+        && let Some(root) = bottle
+    {
+        let under = guest_path_to_host(root, program);
+        if under.is_file() {
+            return p.into_owned();
+        }
+    }
+    let abs = std::fs::canonicalize(host_open).unwrap_or_else(|_| host_open.to_path_buf());
+    let s = abs.to_string_lossy();
+    if s.starts_with('/') {
+        format!("/Volumes/linux{s}")
+    } else {
+        s.into_owned()
+    }
+}
+
+/// Top-level `kh run ./configure`: honour `#!` like nested `execve`.
+///
+/// A script is not Mach-O; the previous path exec'd it on the host, so Wine
+/// `./configure` saw `aarch64-unknown-linux-gnu` and the host `gcc`.
+fn run_shebang(
+    script: &Shebang,
+    program: &Path,
+    host_open: &Path,
+    args: &RunArgs<'_>,
+    bottle: Option<&Path>,
+) -> Result<i32> {
+    let interp_host = if let Some(root) = bottle {
+        let under = guest_path_to_host(root, Path::new(&script.interp));
+        if under.is_file() {
+            under
+        } else {
+            PathBuf::from(&script.interp)
+        }
+    } else {
+        PathBuf::from(&script.interp)
+    };
+
+    if !is_macho_file(&interp_host) {
+        return run_host_native(host_open, program, args);
+    }
+
+    let script_guest = guest_script_path(host_open, program, bottle);
+    let mut nested = Vec::with_capacity(args.guest_args.len().saturating_add(3));
+    if let Some(a) = script.interp_arg.as_deref() {
+        nested.push(a.to_owned());
+    }
+    nested.push(script_guest);
+    nested.extend(args.guest_args.iter().cloned());
+
+    execute(&RunArgs {
+        path: Path::new(&script.interp),
+        root: args.root,
+        max_syscalls: args.max_syscalls,
+        expect_code: args.expect_code,
+        guest_page_size: args.guest_page_size,
+        dry_load: false,
+        guest_args: &nested,
+        json: args.json,
+        passthrough_exit: args.passthrough_exit,
+    })
 }
 
 /// Thin/fat Mach-O magic (same set as nested `execve` classification).
@@ -136,7 +250,7 @@ fn is_macho_file(path: &Path) -> bool {
 ///
 /// Mirrors nested `reexec_direct`: the process is native Linux. Exit code is
 /// checked against `--expect-code` like a guest run.
-fn run_host_native(host_open: &Path, program: &Path, args: &RunArgs<'_>) -> Result<()> {
+fn run_host_native(host_open: &Path, program: &Path, args: &RunArgs<'_>) -> Result<i32> {
     // Prefer the real host path after symlink resolution so argv0 is a path
     // the kernel can exec (bottle `bin/rm` → `…/Volumes/linux/bin/rm` → `/bin/rm`).
     let exec_path = std::fs::canonicalize(host_open).unwrap_or_else(|_| host_open.to_path_buf());
@@ -170,14 +284,52 @@ fn run_host_native(host_open: &Path, program: &Path, args: &RunArgs<'_>) -> Resu
         }
     });
 
-    if code != args.expect_code {
+    if !args.passthrough_exit && code != args.expect_code {
         anyhow::bail!(
             "host exit code {code} != expected {} ({})",
             args.expect_code,
             program.display()
         );
     }
-    std::process::exit(code);
+    Ok(code)
+}
+
+/// `argv0` was a host-bin symlink (`sh`, `curl`, …): run that bottle program.
+pub(crate) fn run_wrapper(name: &str) -> Result<()> {
+    let guest_args: Vec<String> = std::env::args().skip(1).collect();
+    run(&RunArgs {
+        path: Path::new(name),
+        root: None,
+        max_syscalls: 50_000_000,
+        expect_code: 0,
+        guest_page_size: None,
+        dry_load: false,
+        guest_args: &guest_args,
+        json: false,
+        passthrough_exit: true,
+    })
+}
+
+/// Skip Linux `~/.bashrc` when the guest is bottle `sh`/`bash`.
+///
+/// Guest `HOME` is the host home (`/Volumes/linux…`). Apple bash 3.2 then
+/// runs Ubuntu `~/.profile` / `~/.bashrc`; a non-interactive `return` from
+/// that file exits 1 and never reaches `-c`.
+fn guest_args_for(program: &Path, args: &[String]) -> Vec<String> {
+    let Some(base) = program.file_name().and_then(|s| s.to_str()) else {
+        return args.to_vec();
+    };
+    if !matches!(base, "sh" | "bash") {
+        return args.to_vec();
+    }
+    if args.iter().any(|a| a == "--norc" || a == "--noprofile") {
+        return args.to_vec();
+    }
+    let mut v = Vec::with_capacity(args.len().saturating_add(2));
+    v.push("--norc".to_owned());
+    v.push("--noprofile".to_owned());
+    v.extend(args.iter().cloned());
+    v
 }
 
 /// Host filesystem path used to open/map the Mach-O.
@@ -318,4 +470,74 @@ fn dry_load(
     }
     drop(out.flush());
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::{guest_args_for, guest_script_path, parse_shebang};
+    use std::io::Write;
+    use std::path::Path;
+
+    #[test]
+    fn sh_gets_norc_noprofile() {
+        let args = guest_args_for(Path::new("/bin/sh"), &["-c".into(), "uname".into()]);
+        assert_eq!(args, ["--norc", "--noprofile", "-c", "uname"]);
+    }
+
+    #[test]
+    fn curl_args_are_untouched() {
+        let args = guest_args_for(Path::new("curl"), &["-sSf".into(), "https://x".into()]);
+        assert_eq!(args, ["-sSf", "https://x"]);
+    }
+
+    #[test]
+    fn explicit_norc_is_kept() {
+        let args = guest_args_for(Path::new("bash"), &["--norc".into(), "-c".into(), "x".into()]);
+        assert_eq!(args, ["--norc", "-c", "x"]);
+    }
+
+    #[test]
+    fn parse_shebang_sh_and_env() {
+        let dir = std::env::temp_dir().join(format!(
+            "kh-shebang-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sh = dir.join("configure");
+        std::fs::write(&sh, b"#!/bin/sh\necho hi\n").expect("write");
+        let parsed = parse_shebang(&sh).expect("shebang");
+        assert_eq!(parsed.interp, "/bin/sh");
+        assert!(parsed.interp_arg.is_none());
+        let envp = dir.join("envsh");
+        std::fs::write(&envp, b"#!/usr/bin/env bash\n").expect("write env");
+        let parsed = parse_shebang(&envp).expect("env shebang");
+        assert_eq!(parsed.interp, "/usr/bin/env");
+        assert_eq!(parsed.interp_arg.as_deref(), Some("bash"));
+        let machoish = dir.join("bin");
+        let mut f = std::fs::File::create(&machoish).expect("create");
+        f.write_all(&[0xcf, 0xfa, 0xed, 0xfe]).expect("magic");
+        assert!(parse_shebang(&machoish).is_none());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn guest_script_path_bridges_host_abs() {
+        let p = guest_script_path(Path::new("/tmp"), Path::new("./configure"), None);
+        assert!(
+            p.starts_with("/Volumes/linux/"),
+            "expected linux bridge, got {p}"
+        );
+        assert_eq!(
+            guest_script_path(
+                Path::new("/tmp"),
+                Path::new("/Volumes/linux/home/x/configure"),
+                None
+            ),
+            "/Volumes/linux/home/x/configure"
+        );
+    }
 }

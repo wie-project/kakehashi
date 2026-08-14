@@ -7,6 +7,7 @@
 //! Modules:
 //! - [`table`] — numbers / names
 //! - [`fd`] — FD table, open/close/dup/lseek/fcntl/openat
+//! - [`ioctl`] — tty / termios / FIONREAD
 //! - [`io`] — read/write
 //! - [`fs`] — access/stat/fstat
 //! - [`mem_sys`] — mmap/mprotect/munmap/msync
@@ -24,6 +25,7 @@ mod common;
 mod fd;
 mod fs;
 mod helpers;
+mod ioctl;
 mod io;
 mod mem_sys;
 mod net;
@@ -38,7 +40,8 @@ use crate::process as proc_state;
 use crate::trap::TrapOutcome;
 
 pub use common::{
-    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, EPERM, SyscallArgs, SyscallResult,
+    EBADF, EEXIST, EFAULT, EINVAL, ENOENT, ENOMEM, ENOSYS, ENOTTY, EPERM, SyscallArgs,
+    SyscallResult,
 };
 pub use process::otool_classic_wants_llvm_disasm;
 pub use table::{BsdSyscall, known_syscalls, lookup, name_of};
@@ -120,6 +123,7 @@ fn dispatch_inner(args: SyscallArgs) -> SyscallResult {
         Some(BsdSyscall::Dup) => fd::handle_dup(args),
         Some(BsdSyscall::Dup2) => fd::handle_dup2(args),
         Some(BsdSyscall::Fcntl) => fd::handle_fcntl(args),
+        Some(BsdSyscall::Ioctl) => ioctl::handle_ioctl(args),
         Some(BsdSyscall::Lseek) => fd::handle_lseek(args),
         Some(BsdSyscall::Pread) => io::handle_pread(args),
         Some(BsdSyscall::Pwrite) => io::handle_pwrite(args),
@@ -226,7 +230,9 @@ fn log_unknown_syscall(args: SyscallArgs) {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::common::{guest_read_i32, guest_read_u64, guest_slice, guest_write};
-    use super::mem_sys::{DARWIN_MAP_ANON, DARWIN_MAP_PRIVATE, DARWIN_MAP_SHARED, host_page_size};
+    use super::mem_sys::{
+        DARWIN_MAP_ANON, DARWIN_MAP_FIXED, DARWIN_MAP_PRIVATE, DARWIN_MAP_SHARED, host_page_size,
+    };
     use super::*;
     use crate::mem::{
         HostPageSize, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, map_stack, register_borrowed,
@@ -274,6 +280,8 @@ mod tests {
         assert_eq!(lookup(48), Some(BsdSyscall::Sigprocmask));
         assert_eq!(lookup(65), Some(BsdSyscall::Msync));
         assert_eq!(lookup(92), Some(BsdSyscall::Fcntl));
+        assert_eq!(lookup(54), Some(BsdSyscall::Ioctl));
+        assert_eq!(lookup(423), Some(BsdSyscall::Ioctl));
         assert_eq!(lookup(116), Some(BsdSyscall::Gettimeofday));
         assert_eq!(lookup(199), Some(BsdSyscall::Lseek));
         assert_eq!(lookup(202), Some(BsdSyscall::Sysctl));
@@ -409,6 +417,73 @@ mod tests {
             x6: 0,
         });
         assert!(!r3.error);
+        registry_clear();
+    }
+
+    #[test]
+    fn mmap_fixed_replaces_and_keeps_prot_none() {
+        let _g = lock_syscalls();
+        reset_syscall_state(256);
+        registry_clear();
+        let page = host_page_size();
+        let page_u = u64::try_from(page).unwrap_or(4096);
+        let first = dispatch(SyscallArgs {
+            pc: 0,
+            number: 197,
+            x0: 0,
+            x1: page_u,
+            x2: u64::from(VM_PROT_READ | VM_PROT_WRITE),
+            x3: DARWIN_MAP_ANON | DARWIN_MAP_PRIVATE,
+            x4: u64::MAX,
+            x5: 0,
+            x6: 0,
+        });
+        assert!(!first.error, "first mmap: {:?}", first.retval);
+        let addr = first.retval.expect("addr");
+
+        // Overlay the same page (Rust std stack-guard pattern).
+        let overlay = dispatch(SyscallArgs {
+            pc: 0,
+            number: 197,
+            x0: addr,
+            x1: page_u,
+            x2: u64::from(VM_PROT_READ | VM_PROT_WRITE),
+            x3: DARWIN_MAP_ANON | DARWIN_MAP_PRIVATE | DARWIN_MAP_FIXED,
+            x4: u64::MAX,
+            x5: 0,
+            x6: 0,
+        });
+        assert!(!overlay.error, "MAP_FIXED overlay: {:?}", overlay.retval);
+        assert_eq!(overlay.retval, Some(addr));
+
+        let none = dispatch(SyscallArgs {
+            pc: 0,
+            number: 197,
+            x0: addr,
+            x1: page_u,
+            x2: 0,
+            x3: DARWIN_MAP_ANON | DARWIN_MAP_PRIVATE | DARWIN_MAP_FIXED,
+            x4: u64::MAX,
+            x5: 0,
+            x6: 0,
+        });
+        assert!(!none.error, "PROT_NONE MAP_FIXED: {:?}", none.retval);
+        assert_eq!(none.retval, Some(addr));
+        let cover = crate::mem::registry_find(addr, page).expect("cover");
+        assert_eq!(cover.prot, 0, "PROT_NONE must stay 0");
+        assert!(!crate::mem::registry_check_range(addr, 8, true));
+
+        let _ = dispatch(SyscallArgs {
+            pc: 0,
+            number: 73,
+            x0: addr,
+            x1: page_u,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x6: 0,
+        });
         registry_clear();
     }
 

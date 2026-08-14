@@ -28,6 +28,22 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, nbyte: usize) -> i
     ret
 }
 
+/// C `fmtcheck` → nlist `_fmtcheck` (BSD; Apple `printf` builtin / err(3)).
+///
+/// Public contract: return `fmt_suspect` when it is a usable format string,
+/// otherwise `fmt_default`. Soft: non-null suspect is accepted (no format walk).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fmtcheck(
+    fmt_suspect: *const c_char,
+    fmt_default: *const c_char,
+) -> *const c_char {
+    if fmt_suspect.is_null() {
+        fmt_default
+    } else {
+        fmt_suspect
+    }
+}
+
 /// C `puts` → nlist `_puts`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn puts(s: *const c_char) -> c_int {
@@ -474,6 +490,17 @@ pub(crate) unsafe extern "C" fn ferror(stream: *mut c_void) -> c_int {
         return 0;
     }
     unsafe { i32::from(((*as_file(stream)).flags & FILE_ERR) != 0) }
+}
+
+/// C `clearerr` → nlist `_clearerr`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn clearerr(stream: *mut c_void) {
+    if stream.is_null() {
+        return;
+    }
+    unsafe {
+        (*as_file(stream)).flags &= !(FILE_EOF | FILE_ERR);
+    }
 }
 
 /// C `fflush` → nlist `_fflush` (no buffering).

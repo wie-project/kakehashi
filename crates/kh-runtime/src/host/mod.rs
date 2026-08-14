@@ -752,6 +752,141 @@ pub fn fsync_fd(fd: RawFd) -> Option<()> {
     if rc == 0 { Some(()) } else { None }
 }
 
+/// Host `isatty(3)`.
+#[must_use]
+pub fn isatty(fd: RawFd) -> bool {
+    // SAFETY: live fd; `isatty` only inspects the file kind.
+    unsafe { libc::isatty(fd) != 0 }
+}
+
+/// Host `tcgetattr`.
+pub fn tcgetattr(fd: RawFd) -> Result<libc::termios, i32> {
+    // SAFETY: live fd; stack `termios` is valid for the call.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::tcgetattr(fd, std::ptr::addr_of_mut!(t)) };
+    if rc == 0 {
+        Ok(t)
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `tcsetattr`.
+pub fn tcsetattr(fd: RawFd, actions: libc::c_int, termios: &libc::termios) -> Result<(), i32> {
+    // SAFETY: live fd; `termios` lives for the call.
+    let rc = unsafe { libc::tcsetattr(fd, actions, std::ptr::from_ref(termios)) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `tcdrain`.
+pub fn tcdrain(fd: RawFd) -> Result<(), i32> {
+    // SAFETY: live fd.
+    let rc = unsafe { libc::tcdrain(fd) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `tcflush`.
+pub fn tcflush(fd: RawFd, queue: libc::c_int) -> Result<(), i32> {
+    // SAFETY: live fd; `queue` is a `TC*FLUSH` constant.
+    let rc = unsafe { libc::tcflush(fd, queue) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host window size via `TIOCGWINSZ`.
+pub fn tiocgwinsz(fd: RawFd) -> Result<libc::winsize, i32> {
+    // SAFETY: live fd; stack `winsize` is valid for the call.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, std::ptr::addr_of_mut!(ws)) };
+    if rc == 0 {
+        Ok(ws)
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `TIOCSWINSZ`.
+pub fn tiocswinsz(fd: RawFd, ws: &libc::winsize) -> Result<(), i32> {
+    // SAFETY: live fd; `ws` lives for the call.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, std::ptr::from_ref(ws)) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host ioctl that writes an `int` (`TIOCGPGRP`, `FIONREAD`, …).
+pub fn ioctl_get_int(fd: RawFd, request: libc::c_ulong) -> Result<i32, i32> {
+    // SAFETY: live fd; stack `int` matches the ioctl ABI.
+    let mut v: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(fd, request, std::ptr::addr_of_mut!(v)) };
+    if rc == 0 {
+        Ok(v)
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host ioctl that reads an `int` (`TIOCSPGRP`, `FIONBIO`, …).
+pub fn ioctl_set_int(fd: RawFd, request: libc::c_ulong, value: i32) -> Result<(), i32> {
+    let mut v = value;
+    // SAFETY: live fd; stack `int` matches the ioctl ABI.
+    let rc = unsafe { libc::ioctl(fd, request, std::ptr::addr_of_mut!(v)) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `cfgetispeed`.
+#[must_use]
+pub fn cfgetispeed(termios: &libc::termios) -> libc::speed_t {
+    // SAFETY: `termios` is a filled host structure.
+    unsafe { libc::cfgetispeed(termios) }
+}
+
+/// Host `cfgetospeed`.
+#[must_use]
+pub fn cfgetospeed(termios: &libc::termios) -> libc::speed_t {
+    // SAFETY: `termios` is a filled host structure.
+    unsafe { libc::cfgetospeed(termios) }
+}
+
+/// Host `cfsetispeed`.
+pub fn cfsetispeed(termios: &mut libc::termios, speed: libc::speed_t) -> Result<(), i32> {
+    // SAFETY: `termios` is a valid host structure.
+    let rc = unsafe { libc::cfsetispeed(termios, speed) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
+/// Host `cfsetospeed`.
+pub fn cfsetospeed(termios: &mut libc::termios, speed: libc::speed_t) -> Result<(), i32> {
+    // SAFETY: `termios` is a valid host structure.
+    let rc = unsafe { libc::cfsetospeed(termios, speed) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}
+
 /// `readlink(path)` into `buf` (no trailing NUL). Returns bytes written or host errno.
 pub fn readlink_path(path: &std::ffi::CStr, buf: &mut [u8]) -> Result<usize, i32> {
     if buf.is_empty() {

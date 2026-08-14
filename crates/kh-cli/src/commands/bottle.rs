@@ -173,6 +173,9 @@ fn print_create_result(
         println!("    /sbin    → {}/sbin/", created.path.display());
         println!("    /usr/bin → {}/usr/bin/", created.path.display());
     }
+    drop(super::env::ensure());
+    let mut out = io::stdout().lock();
+    drop(super::env::write_hint(&mut out));
 }
 
 fn origin_str(o: LibsystemOrigin) -> &'static str {

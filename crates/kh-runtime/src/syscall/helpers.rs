@@ -282,6 +282,25 @@ pub(crate) const KH_HELPER_DLSYM: u32 = KH_HELPER_BASE | 0x14;
 /// Returns child pid on success (carry clear).
 pub(crate) const KH_HELPER_SPAWN: u32 = KH_HELPER_BASE | 0x15;
 
+/// Main guest stack for `pthread_get_stackaddr_np` / `pthread_get_stacksize_np`.
+///
+/// `x0` = out VA of two `u64` LE words: `[top, size]`. Darwin stackaddr is the
+/// high end (grows down). Returns `1` when published, `0` when unset.
+pub(crate) const KH_HELPER_MAIN_STACK: u32 = KH_HELPER_BASE | 0x16;
+
+/// Copy a Darwin TLV template for `desc` into a guest buffer.
+///
+/// `x0` = tlv_descriptor VA, `x1` = out VA, `x2` = capacity.
+/// Writes `__thread_data` then zeros through `data_len+bss_len`.
+/// Returns the template size (0 if `desc` is not in a registered image).
+pub(crate) const KH_HELPER_TLV_COPY: u32 = KH_HELPER_BASE | 0x17;
+
+/// Packed guest argv for `_NSGetArgc` / `_NSGetArgv`.
+///
+/// `x0` = out VA, `x1` = capacity. Layout: `u32 argc` then `argc` NUL-terminated
+/// strings. Returns total bytes written (incl. NULs and the count), or 0.
+pub(crate) const KH_HELPER_ARGV: u32 = KH_HELPER_BASE | 0x18;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
 const GAI_REC: usize = 40;
@@ -319,6 +338,9 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_DLOPEN => handle_dlopen(args),
         KH_HELPER_DLSYM => handle_dlsym(args),
         KH_HELPER_SPAWN => super::process::handle_spawn_helper(args),
+        KH_HELPER_MAIN_STACK => handle_main_stack(args),
+        KH_HELPER_TLV_COPY => handle_tlv_copy(args),
+        KH_HELPER_ARGV => handle_argv(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
 }
@@ -892,6 +914,74 @@ fn handle_guest_home(args: SyscallArgs) -> SyscallResult {
     }
     guest_write(ptr, &out);
     SyscallResult::ok(name, u64::try_from(out.len()).unwrap_or(0))
+}
+
+fn handle_argv(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_argv";
+    let out = args.x0;
+    let Ok(cap) = usize::try_from(args.x1) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let argv = crate::process::guest_argv();
+    let mut buf = Vec::new();
+    let argc = u32::try_from(argv.len()).unwrap_or(0);
+    buf.extend_from_slice(&argc.to_ne_bytes());
+    for a in &argv {
+        buf.extend_from_slice(a.as_bytes());
+        buf.push(0);
+    }
+    if out == 0 || cap < buf.len() || !registry_check_range(out, buf.len(), true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    guest_write(out, &buf);
+    SyscallResult::ok(name, u64::try_from(buf.len()).unwrap_or(0))
+}
+
+fn handle_tlv_copy(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_tlv_copy";
+    let desc = args.x0;
+    let out = args.x1;
+    let Ok(cap) = usize::try_from(args.x2) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    let Some(tmpl) = crate::process::tlv_template_for_desc(desc) else {
+        return SyscallResult::ok(name, 0);
+    };
+    let total = tmpl.data_len.saturating_add(tmpl.bss_len);
+    let Ok(need) = usize::try_from(total) else {
+        return SyscallResult::err(name, EINVAL);
+    };
+    if out == 0 || cap < need || !registry_check_range(out, need, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let mut buf = vec![0_u8; need];
+    let data_n = usize::try_from(tmpl.data_len).unwrap_or(0);
+    if data_n > 0 && tmpl.data_lo != 0 && registry_check_range(tmpl.data_lo, data_n, false) {
+        let src = guest_slice(tmpl.data_lo, data_n);
+        if let Some(dst) = buf.get_mut(..data_n) {
+            dst.copy_from_slice(src);
+        }
+    }
+    guest_write(out, &buf);
+    SyscallResult::ok(name, total)
+}
+
+fn handle_main_stack(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_main_stack";
+    let ptr = args.x0;
+    // Two u64: top, size.
+    if ptr == 0 || !registry_check_range(ptr, 16, true) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let Some((base, len)) = crate::process::main_stack() else {
+        return SyscallResult::ok(name, 0);
+    };
+    let top = base.saturating_add(len);
+    let mut out = [0_u8; 16];
+    out[..8].copy_from_slice(&top.to_ne_bytes());
+    out[8..].copy_from_slice(&len.to_ne_bytes());
+    guest_write(ptr, &out);
+    SyscallResult::ok(name, 1)
 }
 
 fn handle_executable_path(args: SyscallArgs) -> SyscallResult {
@@ -1628,6 +1718,9 @@ mod tests {
         assert!(is_helper(KH_HELPER_VERIFY_CERT));
         assert!(is_helper(KH_HELPER_GUEST_HOME));
         assert!(is_helper(KH_HELPER_HEAP_STATS_ON));
+        assert!(is_helper(KH_HELPER_MAIN_STACK));
+        assert!(is_helper(KH_HELPER_TLV_COPY));
+        assert!(is_helper(KH_HELPER_ARGV));
         assert!(!is_helper(4)); // write
         assert!(!is_helper(1)); // exit
     }

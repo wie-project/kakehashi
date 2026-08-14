@@ -16,6 +16,7 @@ fn main() {
         "src/dylib/libsystem_c/c/printf_fmt.c",
         "src/dylib/libsystem_c/c/fcntl_varargs.c",
         "src/dylib/libsystem_c/c/open_varargs.c",
+        "src/dylib/libsystem_c/c/ioctl_varargs.c",
         "src/dylib/libcurl/c/curl_varargs.c",
     ];
     for f in c_files {
@@ -35,6 +36,7 @@ fn main() {
         .flag("-fno-builtin-snprintf")
         .flag("-fno-builtin-vsnprintf")
         .flag("-fno-builtin-fcntl")
+        .flag("-fno-builtin-ioctl")
         .flag("-fno-stack-protector")
         .warnings(false)
         .compile("kh_printf_fmt");
@@ -75,6 +77,7 @@ fn main() {
         "_curl_easy_setopt",
         "_curl_easy_getinfo",
         "_fcntl",
+        "_ioctl",
         "_open",
         "_openat",
     ] {

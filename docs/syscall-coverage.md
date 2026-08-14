@@ -31,6 +31,7 @@ States: **done** (dispatched / wrapped), **stub** (soft), **missing** (neither).
 | 46 | `sigaction` | yes | done |
 | 47 | `getgid` | yes | done |
 | 48 | `sigprocmask` | yes | done |
+| 54 | `ioctl` | yes | done (tty / termios / FION*) |
 | 57 | `symlink` | yes | done |
 | 58 | `readlink` | yes | done |
 | 59 | `execve` | yes | done |
@@ -83,6 +84,7 @@ States: **done** (dispatched / wrapped), **stub** (soft), **missing** (neither).
 | 27 | `SYS_RECVMSG` | thin wrap; check runtime |
 | 28 | `SYS_SENDMSG` | thin wrap; check runtime |
 | 37 | `SYS_KILL` | thin wrap; check runtime |
+| 54 | `SYS_IOCTL` | tty / termios / FION* via runtime |
 | 81 | `SYS_GETPGRP` | thin wrap; check runtime |
 | 82 | `SYS_SETPGID` | thin wrap; check runtime |
 | 135 | `SYS_SOCKETPAIR` | thin wrap; check runtime |

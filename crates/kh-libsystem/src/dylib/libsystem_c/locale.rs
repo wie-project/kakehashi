@@ -3,7 +3,7 @@
 //! Driven by curl probe G1: `unresolved symbol __DefaultRuneLocale` before any
 //! BSD syscall. ASCII-only; enough for ctype macros and `setlocale("C")` guests.
 
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_void};
 
 /// Cached rune table width (`_CACHED_RUNES` in Darwin `runetype.h`).
 const CACHED_RUNES: usize = 256;
@@ -230,10 +230,144 @@ pub(crate) unsafe extern "C" fn __maskrune(c: c_int, f: usize) -> c_int {
     c_int::from((bits & f) != 0)
 }
 
+/// Darwin `__mb_cur_max` → nlist `___mb_cur_max` (**data**).
+///
+/// Apple bash 3.2 does `MB_CUR_MAX` as `ldr` from this int, then `alloca`.
+/// Exporting a function here made it load the first insn as the size and
+/// drop SP into unmapped memory (`$*` / `main "$@"` → SIGSEGV).
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub(crate) static mut __mb_cur_max: c_int = 1;
+
 /// Darwin `___mb_cur_max_l` → nlist `____mb_cur_max_l` (always 1 for "C").
 #[unsafe(export_name = "___mb_cur_max_l")]
 pub(crate) unsafe extern "C" fn ___mb_cur_max_l(_locale: *mut core::ffi::c_void) -> c_int {
     1
+}
+
+/// Darwin `___mb_cur_max` → nlist `____mb_cur_max` (callers that use a fn).
+#[unsafe(export_name = "___mb_cur_max")]
+pub(crate) unsafe extern "C" fn ___mb_cur_max() -> c_int {
+    1
+}
+
+/// C `mblen` → nlist `_mblen` ("C" locale: one byte per character).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mblen(s: *const c_char, n: usize) -> c_int {
+    if s.is_null() {
+        return 0;
+    }
+    if n == 0 {
+        return -1;
+    }
+    // SAFETY: caller provided at least one readable byte when n > 0.
+    i32::from(unsafe { s.read() } != 0)
+}
+
+/// Darwin `wchar_t` for locale conversion (32-bit).
+type Wchar = i32;
+
+/// C `mbrtowc` → nlist `_mbrtowc` ("C" locale).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mbrtowc(
+    pwc: *mut Wchar,
+    s: *const c_char,
+    n: usize,
+    _ps: *mut c_void,
+) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    if n == 0 {
+        return usize::MAX;
+    }
+    let b = unsafe { s.read() };
+    if !pwc.is_null() {
+        unsafe {
+            pwc.write(i32::from(b.cast_unsigned()));
+        }
+    }
+    usize::from(b != 0)
+}
+
+/// C `mbrlen` → nlist `_mbrlen`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mbrlen(s: *const c_char, n: usize, ps: *mut c_void) -> usize {
+    unsafe { mbrtowc(core::ptr::null_mut(), s, n, ps) }
+}
+
+/// C `mbsinit` → nlist `_mbsinit` (initial `mbstate_t` or null).
+///
+/// Darwin `__mbstate_t` is a 128-byte union; the live conversion state lives in
+/// the first 8 bytes. Bash word-splits `"$@"` through this (empty `"$@"` as a
+/// function argument used to jump an unbound stub → host SIGSEGV).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mbsinit(ps: *const c_void) -> c_int {
+    if ps.is_null() {
+        return 1;
+    }
+    // SAFETY: caller passed a real `mbstate_t` (or null, handled above).
+    let word = unsafe { ps.cast::<u64>().read() };
+    i32::from(word == 0)
+}
+
+/// C `btowc` → nlist `_btowc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn btowc(c: c_int) -> Wchar {
+    if c == -1 || !(0..=255).contains(&c) {
+        return -1;
+    }
+    c
+}
+
+/// C `wctob` → nlist `_wctob`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wctob(c: Wchar) -> c_int {
+    if (0..=127).contains(&c) {
+        c
+    } else {
+        -1
+    }
+}
+
+/// C `wcrtomb` → nlist `_wcrtomb` ("C" locale).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcrtomb(s: *mut c_char, wc: Wchar, _ps: *mut c_void) -> usize {
+    if s.is_null() {
+        return 1;
+    }
+    let Some(b) = u8::try_from(wc).ok() else {
+        return usize::MAX;
+    };
+    unsafe {
+        s.write(b.cast_signed());
+    }
+    1
+}
+
+/// C `mbsrtowcs` → nlist `_mbsrtowcs`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mbsrtowcs(
+    dst: *mut Wchar,
+    src: *mut *const c_char,
+    len: usize,
+    _ps: *mut c_void,
+) -> usize {
+    if src.is_null() {
+        return usize::MAX;
+    }
+    let s = unsafe { src.read() };
+    if s.is_null() {
+        return 0;
+    }
+    let n = unsafe { super::string::mbstowcs(dst, s, len) };
+    if !dst.is_null() && n < len {
+        unsafe {
+            src.write(core::ptr::null());
+        }
+    }
+    n
 }
 
 // Darwin `nl_item` values from public `<langinfo.h>` / `<_langinfo.h>`.

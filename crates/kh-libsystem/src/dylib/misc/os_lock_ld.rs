@@ -34,4 +34,3 @@ pub(crate) unsafe extern "C" fn os_lock_lock(_lock: *mut c_void) {}
 /// `os_lock_unlock` — soft no-op.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn os_lock_unlock(_lock: *mut c_void) {}
-

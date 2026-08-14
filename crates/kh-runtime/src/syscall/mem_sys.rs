@@ -2,8 +2,8 @@
 
 use crate::host;
 use crate::mem::{
-    RemoveOutcome, VM_PROT_READ, VM_PROT_WRITE, darwin_to_host_prot, register_owned, registry_find,
-    registry_remove, registry_update_prot,
+    RemoveOutcome, darwin_to_host_prot, register_owned, registry_find, registry_remove,
+    registry_update_prot,
 };
 
 use super::common::{
@@ -80,12 +80,17 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         if page_u64 != 0 && !addr.is_multiple_of(page_u64) {
             return SyscallResult::err(name, EINVAL);
         }
-        host_flags |= host::fixed_map_flag();
+        // Darwin MAP_FIXED replaces any mapping already at `addr` (Rust std
+        // installs the main-thread stack overflow guard this way). Linux
+        // MAP_FIXED_NOREPLACE is only for image preferred-base placement.
+        host_flags |= libc::MAP_FIXED;
         Some(addr)
     } else {
         None
     };
 
+    // Always create RW then mprotect down (incl. PROT_NONE). Some hosts reject
+    // a less-restrictive mprotect than the original mmap prot.
     let map_prot = libc::PROT_READ | libc::PROT_WRITE;
     let off = if is_anon { 0 } else { offset };
     let Some(base) = host::mmap(fixed_addr, map_len, map_prot, host_flags, host_fd, off) else {
@@ -97,11 +102,9 @@ pub(crate) fn handle_mmap(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, ENOMEM);
     }
 
-    let final_prot = if prot == 0 {
-        VM_PROT_READ | VM_PROT_WRITE
-    } else {
-        prot
-    };
+    // Keep PROT_NONE (0). Upgrading it to RW made Darwin Rust std's guard page
+    // look like heap and still left MAP_FIXED overlays untracked as NONE.
+    let final_prot = prot;
     let host_prot = darwin_to_host_prot(final_prot);
     // mmap used PROT_READ|PROT_WRITE; skip a no-op mprotect when the guest
     // asked for the same (hot freestanding heap path — roadmap A5).

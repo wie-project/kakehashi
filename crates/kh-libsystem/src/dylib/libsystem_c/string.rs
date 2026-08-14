@@ -121,6 +121,47 @@ pub(crate) unsafe extern "C" fn strcmp(s1: *const c_char, s2: *const c_char) -> 
     }
 }
 
+/// C `strcoll` → nlist `_strcoll` ("C" locale = `strcmp`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strcoll(s1: *const c_char, s2: *const c_char) -> c_int {
+    unsafe { strcmp(s1, s2) }
+}
+
+/// C `strsep` → nlist `_strsep`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn strsep(
+    stringp: *mut *mut c_char,
+    delim: *const c_char,
+) -> *mut c_char {
+    if stringp.is_null() || delim.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let start = *stringp;
+        if start.is_null() {
+            return core::ptr::null_mut();
+        }
+        let mut p = start;
+        loop {
+            let c = *p;
+            if c == 0 {
+                *stringp = core::ptr::null_mut();
+                return start;
+            }
+            let mut d = delim;
+            while *d != 0 {
+                if *d == c {
+                    *p = 0;
+                    *stringp = p.add(1);
+                    return start;
+                }
+                d = d.add(1);
+            }
+            p = p.add(1);
+        }
+    }
+}
+
 /// C `strstr` → nlist `_strstr`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn strstr(
@@ -1243,6 +1284,26 @@ pub(crate) unsafe extern "C" fn __strlcpy_chk(
     _dstlen: usize,
 ) -> usize {
     unsafe { crate::dylib::libsystem_c::posix::strlcpy(dst, src, size) }
+}
+
+/// C `stpcpy` → nlist `_stpcpy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn stpcpy(dst: *mut c_char, src: *const c_char) -> *mut c_char {
+    let end = unsafe { strcpy(dst, src) };
+    if end.is_null() {
+        return end;
+    }
+    end.wrapping_add(unsafe { crate::dylib::libsystem_c::stdio::strlen(end) })
+}
+
+/// `___stpcpy_chk` → nlist `___stpcpy_chk`.
+#[unsafe(export_name = "__stpcpy_chk")]
+pub(crate) unsafe extern "C" fn __stpcpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    _dstlen: usize,
+) -> *mut c_char {
+    unsafe { stpcpy(dst, src) }
 }
 
 /// `___strcpy_chk` → nlist `___strcpy_chk`.
