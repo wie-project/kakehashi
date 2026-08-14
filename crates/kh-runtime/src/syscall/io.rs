@@ -9,6 +9,34 @@ use super::fd::{guest_to_host_fd, read_host_fd, write_host_fd};
 
 /// Darwin `EAGAIN`.
 const DARWIN_EAGAIN: i64 = 35;
+/// Darwin `EINTR`.
+const DARWIN_EINTR: i64 = 4;
+/// Darwin `EPIPE`.
+const DARWIN_EPIPE: i64 = 32;
+/// Darwin `ENOSPC`.
+const DARWIN_ENOSPC: i64 = 28;
+/// Darwin `ECONNRESET`.
+const DARWIN_ECONNRESET: i64 = 54;
+
+/// Host `write`/`read` errno → Darwin (do not collapse `EPIPE` to `EPERM`).
+fn host_io_errno(os: i32) -> i64 {
+    if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
+        return DARWIN_EAGAIN;
+    }
+    if os == libc::EINTR {
+        return DARWIN_EINTR;
+    }
+    if os == libc::EPIPE {
+        return DARWIN_EPIPE;
+    }
+    if os == libc::ENOSPC {
+        return DARWIN_ENOSPC;
+    }
+    if os == libc::ECONNRESET {
+        return DARWIN_ECONNRESET;
+    }
+    EPERM
+}
 
 /// `write`.
 pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
@@ -47,8 +75,12 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
                 {
                     return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
-                tracing::warn!(gfd, error = %e, "tls write fail");
-                SyscallResult::err(name, EPERM)
+                if os == libc::EPIPE {
+                    tracing::debug!(gfd, "tls write EPIPE");
+                } else {
+                    tracing::warn!(gfd, error = %e, "tls write fail");
+                }
+                SyscallResult::err(name, host_io_errno(os))
             }
         };
     }
@@ -67,8 +99,12 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
                     }
                     return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
-                tracing::warn!(gfd, error = %e, "write fail");
-                return SyscallResult::err(name, EPERM);
+                if os == libc::EPIPE {
+                    tracing::debug!(gfd, "write EPIPE");
+                } else {
+                    tracing::warn!(gfd, error = %e, "write fail");
+                }
+                return SyscallResult::err(name, host_io_errno(os));
             }
         }
     }
@@ -97,10 +133,10 @@ pub(crate) fn handle_pread(args: SyscallArgs) -> SyscallResult {
     if n < 0 {
         let os = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
-            return SyscallResult::err(name, 35);
+            return SyscallResult::err(name, DARWIN_EAGAIN);
         }
         tracing::warn!(os, "pread fail");
-        return SyscallResult::err(name, EPERM);
+        return SyscallResult::err(name, host_io_errno(os));
     }
     SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
 }
@@ -125,8 +161,9 @@ pub(crate) fn handle_pwrite(args: SyscallArgs) -> SyscallResult {
     let slice = guest_slice(args.x1, len);
     let n = unsafe { libc::pwrite(host_fd, slice.as_ptr().cast(), len, offset) };
     if n < 0 {
-        tracing::warn!("pwrite fail");
-        return SyscallResult::err(name, EPERM);
+        let os = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        tracing::warn!(os, "pwrite fail");
+        return SyscallResult::err(name, host_io_errno(os));
     }
     SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
 }
@@ -170,7 +207,7 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
                     return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
                 tracing::warn!(gfd, error = %e, "tls read fail");
-                SyscallResult::err(name, EPERM)
+                SyscallResult::err(name, host_io_errno(os))
             }
         };
     }
@@ -197,8 +234,12 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
                     tracing::debug!(gfd, "read EAGAIN");
                     return SyscallResult::err(name, DARWIN_EAGAIN);
                 }
-                tracing::warn!(gfd, os, "read fail");
-                return SyscallResult::err(name, EPERM);
+                if os == libc::EPIPE {
+                    tracing::debug!(gfd, "read EPIPE");
+                } else {
+                    tracing::warn!(gfd, os, "read fail");
+                }
+                return SyscallResult::err(name, host_io_errno(os));
             }
         }
     }

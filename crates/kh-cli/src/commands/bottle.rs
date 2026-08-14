@@ -122,6 +122,7 @@ fn print_create_result(
                 "path": created.path.display().to_string(),
                 "libsystem": libsystem,
                 "prefix_macos": bottle::bottle_has_macos_prefix(&created.path),
+                "zsh_modules": bottle::bottle_has_zsh_modules(&created.path),
             })
         );
         return;
@@ -172,6 +173,19 @@ fn print_create_result(
         println!("    /bin     → {}/bin/", created.path.display());
         println!("    /sbin    → {}/sbin/", created.path.display());
         println!("    /usr/bin → {}/usr/bin/", created.path.display());
+    }
+    if bottle::bottle_has_zsh_modules(&created.path) {
+        println!(
+            "  zsh:       modules present ({}/<ver>/zsh/zle.so)",
+            bottle::GUEST_ZSH_MODULES_REL
+        );
+    } else {
+        println!("  zsh:       modules missing — copy /usr/lib/zsh for interactive zsh");
+        println!(
+            "    /usr/lib/zsh → {}/{}/",
+            created.path.display(),
+            bottle::GUEST_ZSH_MODULES_REL
+        );
     }
     drop(super::env::ensure());
     let mut out = io::stdout().lock();
@@ -242,6 +256,7 @@ fn print_path(json: bool) -> Result<()> {
                     "libcxx_alias": st.libcxx_alias,
                     "libcurl_alias": st.libcurl_alias,
                     "prefix_macos": st.prefix_macos,
+                    "zsh_modules": st.zsh_modules,
                 })
             );
         } else {
@@ -268,6 +283,7 @@ fn print_status(json: bool) -> Result<()> {
             println!("libc++:    {}", st.libcxx_alias);
             println!("libcurl:   {}", st.libcurl_alias);
             println!("prefix:    {}", st.prefix_macos);
+            println!("zsh mods:  {}", st.zsh_modules);
             if st.exists && st.valid_marker {
                 let bridge = st.path.join(bottle::VOLUMES_LINUX);
                 println!("linux:     {} -> /", bridge.display());
@@ -316,5 +332,6 @@ fn status_json(st: &BottleStatus) -> serde_json::Value {
         "libcxx_alias": st.libcxx_alias,
         "libcurl_alias": st.libcurl_alias,
         "prefix_macos": st.prefix_macos,
+        "zsh_modules": st.zsh_modules,
     })
 }

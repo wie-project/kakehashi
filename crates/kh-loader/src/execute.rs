@@ -180,7 +180,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         let keep = k.starts_with("GIT_")
             || k == "DYLD_LIBRARY_PATH"
             || k == "DYLD_FALLBACK_LIBRARY_PATH"
-            || k == "DYLD_FRAMEWORK_PATH";
+            || k == "DYLD_FRAMEWORK_PATH"
+            || k == "RUSTUP_LOG"
+            || k == "RUST_LOG"
+            || k == "RUST_BACKTRACE";
         if !keep || k.contains('\0') || v.contains('\0') {
             continue;
         }

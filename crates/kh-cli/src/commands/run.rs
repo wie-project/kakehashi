@@ -72,6 +72,15 @@ pub(crate) fn execute(args: &RunArgs<'_>) -> Result<i32> {
     let program = resolve_guest_program(args.path, root.as_deref());
     let host_open = resolve_host_open_path(&program, root.as_deref());
 
+    // Nested `kh run /…/cc -- -Wl,--as-needed …` (Linux rustc / rustc driver
+    // re-exec) must not enter Darwin clang: guest open() cannot see `/home/…`.
+    if !args.dry_load && looks_like_host_gnu_cc(args.guest_args) {
+        let base = program.file_name().and_then(|s| s.to_str()).unwrap_or("cc");
+        if looks_like_cc_name(base) {
+            return spawn_host_cc(base, args.guest_args);
+        }
+    }
+
     if args.dry_load {
         dry_load(args, guest, root, &host_open)?;
         return Ok(0);
@@ -146,7 +155,10 @@ fn parse_shebang(path: &Path) -> Option<Shebang> {
     if bytes.first().copied() != Some(b'#') || bytes.get(1).copied() != Some(b'!') {
         return None;
     }
-    let line_end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len());
     let line = bytes.get(2..line_end)?;
     let line = core::str::from_utf8(line).ok()?.trim();
     if line.is_empty() {
@@ -297,6 +309,18 @@ fn run_host_native(host_open: &Path, program: &Path, args: &RunArgs<'_>) -> Resu
 /// `argv0` was a host-bin symlink (`sh`, `curl`, …): run that bottle program.
 pub(crate) fn run_wrapper(name: &str) -> Result<()> {
     let guest_args: Vec<String> = std::env::args().skip(1).collect();
+    // Linux rustc/cargo put `cc` on PATH. host-bin `cc` is Darwin clang; GNU
+    // link lines (`-Wl,--as-needed`, linux-gnu rustlib) must use the host cc
+    // or the objects/rlibs at `/home/…` are invisible to the guest.
+    if looks_like_cc_name(name) && looks_like_host_gnu_cc(&guest_args) {
+        std::process::exit(spawn_host_cc(name, &guest_args)?);
+    }
+    // `cargo` / `rustc` wrappers exist so a bottle rustup stays first. When the
+    // Darwin tool is not installed, fall through to the next PATH entry so
+    // `cargo install` of kakehashi itself still uses Linux rustc.
+    if !bottle_has_named_tool(name) {
+        std::process::exit(spawn_host_tool(name, &guest_args)?);
+    }
     run(&RunArgs {
         path: Path::new(name),
         root: None,
@@ -308,6 +332,78 @@ pub(crate) fn run_wrapper(name: &str) -> Result<()> {
         json: false,
         passthrough_exit: true,
     })
+}
+
+/// True when `cc`/`clang` is being used as a GNU/Linux driver (not Apple).
+pub(crate) fn looks_like_host_gnu_cc(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a.contains("unknown-linux-gnu")
+            || a.contains("linux-gnu")
+            || a.starts_with("-Wl,--")
+            || a.starts_with("-Wl,-B")
+            || a.starts_with("-Wl,-z")
+            || Path::new(a)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rlib"))
+            || a.contains("/rustlib/")
+    })
+}
+
+fn bottle_has_named_tool(name: &str) -> bool {
+    let root = super::util::resolve_root(None);
+    let program = resolve_guest_program(Path::new(name), root.as_deref());
+    let host_open = resolve_host_open_path(&program, root.as_deref());
+    host_open.is_file()
+}
+
+fn host_tool_path(name: &str) -> PathBuf {
+    if name == "cc"
+        && let Ok(p) = std::env::var("KH_HOST_CC")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    let skip = super::env::host_bin_dir().ok();
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            if skip.as_ref().is_some_and(|s| Path::new(dir) == s) {
+                continue;
+            }
+            let cand = Path::new(dir).join(name);
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from(format!("/usr/bin/{name}"))
+}
+
+fn host_cc_path(name: &str) -> PathBuf {
+    host_tool_path(name)
+}
+
+fn spawn_host_tool(name: &str, args: &[String]) -> Result<i32> {
+    let path = host_tool_path(name);
+    let status = Command::new(&path)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to exec host {name} {}", path.display()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn looks_like_cc_name(name: &str) -> bool {
+    matches!(name, "cc" | "clang" | "clang++" | "gcc" | "c++" | "g++")
+        || name.starts_with("clang-")
+        || name.starts_with("gcc-")
+}
+
+fn spawn_host_cc(name: &str, args: &[String]) -> Result<i32> {
+    let path = host_cc_path(name);
+    let status = Command::new(&path)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to exec host {name} {}", path.display()))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// Skip Linux `~/.bashrc` when the guest is bottle `sh`/`bash`.
@@ -475,7 +571,10 @@ fn dry_load(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{guest_args_for, guest_script_path, parse_shebang};
+    use super::{
+        guest_args_for, guest_script_path, looks_like_cc_name, looks_like_host_gnu_cc,
+        parse_shebang,
+    };
     use std::io::Write;
     use std::path::Path;
 
@@ -493,7 +592,10 @@ mod tests {
 
     #[test]
     fn explicit_norc_is_kept() {
-        let args = guest_args_for(Path::new("bash"), &["--norc".into(), "-c".into(), "x".into()]);
+        let args = guest_args_for(
+            Path::new("bash"),
+            &["--norc".into(), "-c".into(), "x".into()],
+        );
         assert_eq!(args, ["--norc", "-c", "x"]);
     }
 
@@ -539,5 +641,30 @@ mod tests {
             ),
             "/Volumes/linux/home/x/configure"
         );
+    }
+
+    #[test]
+    fn gnu_rustc_link_line_is_host_cc() {
+        let args = [
+            "/tmp/symbols.o".into(),
+            "-Wl,--as-needed".into(),
+            "-Wl,-Bstatic".into(),
+            "/home/u/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/lib/libstd.rlib".into(),
+        ];
+        assert!(looks_like_host_gnu_cc(&args));
+        assert!(looks_like_cc_name("cc"));
+        assert!(looks_like_cc_name("clang-16"));
+    }
+
+    #[test]
+    fn apple_clang_flags_stay_guest() {
+        let args = [
+            "-arch".into(),
+            "arm64".into(),
+            "-isysroot".into(),
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk".into(),
+            "-Wl,-syslibroot,/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk".into(),
+        ];
+        assert!(!looks_like_host_gnu_cc(&args));
     }
 }

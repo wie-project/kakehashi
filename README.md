@@ -34,8 +34,9 @@ cargo install --path crates/kh-cli --force
    - `/bin` → `~/.local/share/kakehashi/bottle/bin/`
    - `/sbin` → `~/.local/share/kakehashi/bottle/sbin/`
    - `/usr/bin` → `~/.local/share/kakehashi/bottle/usr/bin/`
+   - `/usr/lib/zsh` → `~/.local/share/kakehashi/bottle/usr/lib/zsh/` (interactive `zsh`; `zle.so` and other modules. Check with `kh bottle status`.)
 
-   _(Note: This base utility set—including `rm`, `zsh`, `codesign`—occupies ~256 MB uncompressed and is critical for runtime isolation)._
+   _(Note: This base utility set—including `rm`, `zsh`, `codesign`—occupies ~256 MB uncompressed and is critical for runtime isolation. `/usr/lib/zsh` is ~1 MB extra. `libpcre.0.dylib` / `libiconv.2.dylib` live in the dyld shared cache and cannot be copied; `kh bottle ensure` aliases them to libSystem.)_
 
 3. **Install Xcode Command Line Tools:** Once the base directories are staged, bootstrap the rest of the environment by running:
    ```bash

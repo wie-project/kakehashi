@@ -13,7 +13,8 @@
     clippy::manual_c_str_literals,
     clippy::manual_is_ascii_check,
     clippy::many_single_char_names,
-    clippy::used_underscore_binding
+    clippy::used_underscore_binding,
+    static_mut_refs
 )]
 
 use core::ffi::{c_char, c_int, c_void};
@@ -555,33 +556,319 @@ pub(crate) unsafe extern "C" fn ttyname_r(fd: c_int, buf: *mut c_char, buflen: u
 const ERANGE_TTY: i32 = 34;
 
 
-/// C `kqueue` → anonymous pipe read end (kevent will soft-return 0).
+/// C `kqueue` → dummy fd. Interest lives in a process-wide table so a
+/// `dup`'d kqueue (rust std) still sees the same watches. An empty per-fd
+/// table plus `poll([], -1)` hung rustup after "syncing channel updates".
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn kqueue() -> c_int {
-    // pipe() returns read in low 32 / write high on Darwin via our wrapper...
-    // Use open("/dev/null") style: allocate a pipe via net::pipe.
     let mut fds = [0_i32; 2];
     let rc = unsafe { crate::dylib::libsystem_c::net::pipe(fds.as_mut_ptr()) };
     if rc != 0 {
         return -1;
     }
-    // Close write end; return read end as a pollable fd.
     let _ = unsafe { crate::dylib::libsystem_c::posix::close(fds[1]) };
     fds[0]
 }
 
-/// C `kevent` → always 0 events (timeout / idle).
+const KEV_SIZE: usize = 32;
+const EVFILT_READ: i16 = -1;
+const EVFILT_WRITE: i16 = -2;
+const EV_ADD: u16 = 0x0001;
+const EV_DELETE: u16 = 0x0002;
+const EV_EOF: u16 = 0x8000;
+const EV_ERROR: u16 = 0x4000;
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0004;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const KQ_WATCH: usize = 32;
+
+#[derive(Clone, Copy)]
+struct KqWatch {
+    live: bool,
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    udata: u64,
+}
+
+static KQ_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut KQ_WATCHES: [KqWatch; KQ_WATCH] = [KqWatch {
+    live: false,
+    ident: 0,
+    filter: 0,
+    flags: 0,
+    fflags: 0,
+    udata: 0,
+}; KQ_WATCH];
+
+fn kq_lock() {
+    while KQ_LOCK
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn kq_unlock() {
+    KQ_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// C `kevent` — apply changelist, then `poll` registered fds (rust std connect).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn kevent(
     _kq: c_int,
-    _changelist: *const c_void,
+    changelist: *const c_void,
     nchanges: c_int,
-    _eventlist: *mut c_void,
-    _nevents: c_int,
-    _timeout: *const c_void,
+    eventlist: *mut c_void,
+    nevents: c_int,
+    timeout: *const c_void,
 ) -> c_int {
-    let _ = nchanges;
-    0
+    kq_lock();
+    if nchanges > 0 && !changelist.is_null() {
+        let n = usize::try_from(nchanges).unwrap_or(0);
+        for i in 0..n {
+            let ev = unsafe { changelist.cast::<u8>().add(i.saturating_mul(KEV_SIZE)) };
+            apply_kevent_change(ev);
+        }
+    }
+    if nevents <= 0 || eventlist.is_null() {
+        kq_unlock();
+        return 0;
+    }
+    let mut pfds = [PollFd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; KQ_WATCH];
+    let mut map = [0_usize; KQ_WATCH];
+    let mut np = 0_usize;
+    unsafe {
+        for (wi, w) in KQ_WATCHES.iter().enumerate() {
+            if !w.live || np >= KQ_WATCH {
+                continue;
+            }
+            // Only poll real fds (EVFILT_READ/WRITE). Timers / user events skip.
+            if w.filter != EVFILT_READ && w.filter != EVFILT_WRITE {
+                continue;
+            }
+            let fd = c_int::try_from(w.ident).unwrap_or(-1);
+            if fd < 0 {
+                continue;
+            }
+            let ev = if w.filter == EVFILT_WRITE {
+                POLLOUT
+            } else {
+                POLLIN
+            };
+            pfds[np] = PollFd {
+                fd,
+                events: ev,
+                revents: 0,
+            };
+            map[np] = wi;
+            np = np.saturating_add(1);
+        }
+    }
+    kq_unlock();
+
+    // Empty interest + infinite timeout is a sleep-forever (rustup hang).
+    if np == 0 {
+        return 0;
+    }
+
+    let timeout_ms = timespec_to_ms(timeout);
+    let n_u32 = u32::try_from(np).unwrap_or(0);
+    let pr = unsafe {
+        crate::dylib::libsystem_c::net::poll(pfds.as_mut_ptr().cast(), n_u32, timeout_ms)
+    };
+    if pr < 0 {
+        return -1;
+    }
+    if pr == 0 {
+        return 0;
+    }
+
+    kq_lock();
+    let max_out = usize::try_from(nevents).unwrap_or(0);
+    let mut out_n = 0_usize;
+    for pi in 0..np {
+        if out_n >= max_out {
+            break;
+        }
+        let rev = pfds[pi].revents;
+        if rev == 0 {
+            continue;
+        }
+        let wi = map[pi];
+        let Some((ident, filter, flags, fflags, udata)) = (unsafe {
+            let w = &KQ_WATCHES[wi];
+            w.live
+                .then_some((w.ident, w.filter, w.flags, w.fflags, w.udata))
+        }) else {
+            continue;
+        };
+        let mut ev_flags = flags;
+        if rev & (POLLERR | POLLHUP) != 0 {
+            ev_flags |= EV_EOF;
+            if rev & POLLERR != 0 {
+                ev_flags |= EV_ERROR;
+            }
+        }
+        // Darwin: EVFILT_WRITE `data` = send-buffer space. rust/mio treats 0 as
+        // not writable and immediately kevent-waits again (tight spin, no send).
+        let data = if rev & (POLLERR | POLLHUP) != 0 {
+            0
+        } else if filter == EVFILT_WRITE {
+            65_536
+        } else {
+            1
+        };
+        let dst = unsafe { eventlist.cast::<u8>().add(out_n.saturating_mul(KEV_SIZE)) };
+        write_kevent(dst, ident, filter, ev_flags, fflags, data, udata);
+        out_n = out_n.saturating_add(1);
+    }
+    kq_unlock();
+    c_int::try_from(out_n).unwrap_or(0)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+fn apply_kevent_change(ev: *const u8) {
+    let ident = usize::try_from(read_u64(ev, 0)).unwrap_or(0);
+    let filter = read_i16(ev, 8);
+    let flags = read_u16(ev, 10);
+    let fflags = read_u32(ev, 12);
+    let udata = read_u64(ev, 24);
+    unsafe {
+        if flags & EV_DELETE != 0 {
+            for w in &mut KQ_WATCHES {
+                if w.live && w.ident == ident && w.filter == filter {
+                    w.live = false;
+                }
+            }
+            return;
+        }
+        if flags & EV_ADD == 0 {
+            return;
+        }
+        if let Some(w) = KQ_WATCHES
+            .iter_mut()
+            .find(|w| w.live && w.ident == ident && w.filter == filter)
+        {
+            w.flags = flags;
+            w.fflags = fflags;
+            w.udata = udata;
+            return;
+        }
+        if let Some(w) = KQ_WATCHES.iter_mut().find(|w| !w.live) {
+            w.live = true;
+            w.ident = ident;
+            w.filter = filter;
+            w.flags = flags;
+            w.fflags = fflags;
+            w.udata = udata;
+        }
+    }
+}
+
+fn write_kevent(
+    dst: *mut u8,
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: i64,
+    udata: u64,
+) {
+    write_u64(dst, 0, ident as u64);
+    write_i16(dst, 8, filter);
+    write_u16(dst, 10, flags);
+    write_u32(dst, 12, fflags);
+    write_i64(dst, 16, data);
+    write_u64(dst, 24, udata);
+}
+
+fn timespec_to_ms(timeout: *const c_void) -> c_int {
+    if timeout.is_null() {
+        return -1;
+    }
+    let p = timeout.cast::<i64>();
+    let sec = unsafe { p.read() };
+    let nsec = unsafe { p.add(1).read() };
+    let ms = sec.saturating_mul(1000).saturating_add(nsec.saturating_div(1_000_000));
+    if ms <= 0 {
+        0
+    } else {
+        c_int::try_from(ms).unwrap_or(c_int::MAX)
+    }
+}
+
+fn read_u64(p: *const u8, off: usize) -> u64 {
+    let mut b = [0_u8; 8];
+    unsafe {
+        core::ptr::copy_nonoverlapping(p.add(off), b.as_mut_ptr(), 8);
+    }
+    u64::from_le_bytes(b)
+}
+
+fn read_u32(p: *const u8, off: usize) -> u32 {
+    let mut b = [0_u8; 4];
+    unsafe {
+        core::ptr::copy_nonoverlapping(p.add(off), b.as_mut_ptr(), 4);
+    }
+    u32::from_le_bytes(b)
+}
+
+fn read_u16(p: *const u8, off: usize) -> u16 {
+    let mut b = [0_u8; 2];
+    unsafe {
+        core::ptr::copy_nonoverlapping(p.add(off), b.as_mut_ptr(), 2);
+    }
+    u16::from_le_bytes(b)
+}
+
+fn read_i16(p: *const u8, off: usize) -> i16 {
+    i16::from_le_bytes(read_u16(p, off).to_le_bytes())
+}
+
+fn write_u64(p: *mut u8, off: usize, v: u64) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p.add(off), 8);
+    }
+}
+
+fn write_i64(p: *mut u8, off: usize, v: i64) {
+    write_u64(p, off, v.cast_unsigned());
+}
+
+fn write_u32(p: *mut u8, off: usize, v: u32) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p.add(off), 4);
+    }
+}
+
+fn write_u16(p: *mut u8, off: usize, v: u16) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), p.add(off), 2);
+    }
+}
+
+fn write_i16(p: *mut u8, off: usize, v: i16) {
+    write_u16(p, off, v.cast_unsigned());
 }
 
 

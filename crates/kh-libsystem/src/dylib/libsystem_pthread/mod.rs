@@ -822,6 +822,35 @@ pub(crate) unsafe extern "C" fn pthread_cond_timedwait(
     }
 }
 
+/// Darwin `pthread_cond_timedwait_relative_np` (relative `timespec`).
+///
+/// rustup uses this for download / channel-sync timeouts.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn pthread_cond_timedwait_relative_np(
+    cond: *mut c_void,
+    mutex: *mut c_void,
+    reltime: *const c_void,
+) -> c_int {
+    if cond.is_null() || mutex.is_null() || reltime.is_null() {
+        return EINVAL;
+    }
+    let Some(now) = timespec_now_ns() else {
+        return EINVAL;
+    };
+    let Some(rel) = abstime_ns(reltime) else {
+        return EINVAL;
+    };
+    let deadline = now.saturating_add(rel);
+    let mut ts = [0_i64; 2];
+    if let Some(slot) = ts.get_mut(0) {
+        *slot = deadline.div_euclid(1_000_000_000);
+    }
+    if let Some(slot) = ts.get_mut(1) {
+        *slot = deadline.rem_euclid(1_000_000_000);
+    }
+    unsafe { pthread_cond_timedwait(cond, mutex, ts.as_ptr().cast()) }
+}
+
 /// Bump generation and always futex-wake (wake_n waiters).
 #[inline]
 fn cond_notify(cond: *mut c_void, wake_n: u32) {

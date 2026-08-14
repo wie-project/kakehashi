@@ -35,10 +35,10 @@ pub use guest_tools::{
 };
 pub use layout::{
     GUEST_LIBCURL_REL, GUEST_LIBCURL_TARGET, GUEST_LIBCXX_REL, GUEST_LIBCXX_TARGET, GUEST_SSH_REL,
-    MARKER_MAGIC, MARKER_NAME, REQUIRED_PREFIX_DIRS, VOLUMES_LINUX, bottle_has_macos_prefix,
-    ensure_dev_nodes, ensure_host_ssh_bridge, ensure_libcurl_symlink, ensure_libcxx_symlink,
-    has_host_ssh_bridge, has_libcurl_symlink, has_libcxx_symlink, is_bottle_root,
-    macos_prefix_hint, materialize,
+    GUEST_ZSH_MODULES_REL, MARKER_MAGIC, MARKER_NAME, REQUIRED_PREFIX_DIRS, VOLUMES_LINUX,
+    bottle_has_macos_prefix, bottle_has_zsh_modules, ensure_dev_nodes, ensure_host_ssh_bridge,
+    ensure_libcurl_symlink, ensure_libcxx_symlink, has_host_ssh_bridge, has_libcurl_symlink,
+    has_libcxx_symlink, is_bottle_root, macos_prefix_hint, materialize, zsh_modules_hint,
 };
 pub use libsystem::{
     EMBEDDED_SOURCE_LABEL, ENV_LIBSYSTEM, GUEST_LIBSYSTEM_ID, GUEST_LIBSYSTEM_REL,

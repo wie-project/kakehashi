@@ -100,6 +100,15 @@ pub(crate) fn handle_execve(args: SyscallArgs) -> SyscallResult {
         argc = argv.len(),
         "execve"
     );
+    // Darwin ssh from a copied macOS prefix links libcrypto (`OPENSSL_init_crypto`).
+    // Product policy: host OpenSSH (same as the bottle ssh bridge).
+    if let Some(host_ssh) = host_openssh_for(&path)
+        && host_ssh.is_file()
+    {
+        tracing::debug!(guest = %path, host = %host_ssh.display(), "execve: host OpenSSH bridge");
+        let err = reexec_direct(&host_ssh, &argv, &envp);
+        return SyscallResult::err(name, host_errno_to_darwin(err));
+    }
     let err = if is_macho(&host_path) {
         reexec_kh_macho(&host_path, &argv, &envp)
     } else if let Some(script_err) = try_exec_script(&host_path, &argv, &envp) {
@@ -150,6 +159,16 @@ fn read_cstr_array(ptr: u64, max: usize) -> Option<Vec<String>> {
         out.push(s);
     }
     Some(out)
+}
+
+fn host_openssh_for(guest_path: &str) -> Option<std::path::PathBuf> {
+    let base = std::path::Path::new(guest_path)
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    if !matches!(base, "ssh" | "scp" | "sftp" | "ssh-add" | "ssh-agent" | "ssh-keygen") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("/usr/bin/{base}")))
 }
 
 fn is_macho(path: &Path) -> bool {
@@ -623,16 +642,29 @@ pub(crate) fn handle_kill(args: SyscallArgs) -> SyscallResult {
     let name = "kill";
     let pid = reg_as_i32(args.x0);
     let sig = reg_as_i32(args.x1);
-    // SAFETY: host kill; guest signals are best-effort.
-    let rc = unsafe { libc::kill(pid, sig) };
-    if rc < 0 {
-        SyscallResult::err(
-            name,
-            host_errno_to_darwin(std::io::Error::last_os_error().raw_os_error().unwrap_or(1)),
-        )
-    } else {
-        SyscallResult::ok(name, 0)
+    // SAFETY: compare against this process only; never signal the host.
+    let self_pid = unsafe { libc::getpid() };
+    if pid == self_pid || pid == 0 {
+        if sig == 0 {
+            return SyscallResult::ok(name, 0);
+        }
+        // rustup `abort` is kill(getpid(), SIGABRT). Delivering that to the
+        // host `kh` process was guest exit 134 / "Aborted" with no panic text.
+        let fatal = sig == libc::SIGABRT
+            || sig == libc::SIGKILL
+            || sig == libc::SIGTERM
+            || sig == libc::SIGINT
+            || sig == libc::SIGQUIT
+            || sig == libc::SIGBUS
+            || sig == libc::SIGSEGV;
+        if fatal {
+            tracing::warn!(sig, "guest kill(self) → exit");
+            return SyscallResult::exit(128_i32.saturating_add(sig));
+        }
+        return SyscallResult::ok(name, 0);
     }
+    // Guest must not signal arbitrary host PIDs.
+    SyscallResult::err(name, EINVAL)
 }
 
 /// `getuid` — host real user id (must match file owners for git safe.directory).

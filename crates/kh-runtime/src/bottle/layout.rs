@@ -62,6 +62,24 @@ pub(crate) const GUEST_LIBEDIT_REL: &str = "usr/lib/libedit.3.dylib";
 /// Relative symlink target of [`GUEST_LIBEDIT_REL`].
 pub(crate) const GUEST_LIBEDIT_TARGET: &str = "libSystem.B.dylib";
 
+/// Guest path for `libncurses.5.4.dylib` (Apple bash / csh / zsh termcap).
+pub(crate) const GUEST_LIBNCURSES_REL: &str = "usr/lib/libncurses.5.4.dylib";
+
+/// Relative symlink target of [`GUEST_LIBNCURSES_REL`].
+pub(crate) const GUEST_LIBNCURSES_TARGET: &str = "libSystem.B.dylib";
+
+/// Guest path for `libpcre.0.dylib` (Apple zsh / zle; lives in the dyld cache).
+pub(crate) const GUEST_LIBPCRE_REL: &str = "usr/lib/libpcre.0.dylib";
+
+/// Relative symlink target of [`GUEST_LIBPCRE_REL`].
+pub(crate) const GUEST_LIBPCRE_TARGET: &str = "libSystem.B.dylib";
+
+/// Guest path for `libiconv.2.dylib` (zsh / git; dyld shared cache on macOS).
+pub(crate) const GUEST_LIBICONV_REL: &str = "usr/lib/libiconv.2.dylib";
+
+/// Relative symlink target of [`GUEST_LIBICONV_REL`].
+pub(crate) const GUEST_LIBICONV_TARGET: &str = "libSystem.B.dylib";
+
 /// Empty directories that form the post-install macOS root skeleton.
 ///
 /// Symlinks (`etc`, `tmp`, `var`, `Volumes/linux`, `usr/lib/libc++.1.dylib`,
@@ -142,6 +160,10 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     ensure_libxar_symlink(root)?;
     ensure_libz_symlink(root)?;
     ensure_libedit_symlink(root)?;
+    ensure_libncurses_symlink(root)?;
+    ensure_libpcre_symlink(root)?;
+    ensure_libiconv_symlink(root)?;
+    ensure_security_framework_alias(root)?;
 
     // Host Linux bridge: guest `/Volumes/linux/...` → host `/...`.
     let volumes_linux = root.join(VOLUMES_LINUX);
@@ -160,6 +182,7 @@ pub fn materialize(root: &Path) -> io::Result<()> {
     // Git SSH remotes: guest `execvp("ssh")` → host OpenSSH (not in CLT).
     // Guest `/bin/sh` comes from the user-copied macOS prefix (`bin/`).
     ensure_host_ssh_bridge(root)?;
+    ensure_clt_m4_shims(root)?;
 
     fs::write(root.join(MARKER_NAME), format!("{MARKER_MAGIC}\n"))?;
     Ok(())
@@ -264,8 +287,10 @@ const GUEST_SSH_TARGET: &str = "../../Volumes/linux/usr/bin/ssh";
 /// in freestanding libSystem. Nested Mach-O helpers still re-exec via `kh`;
 /// this path is a native host ELF (see `reexec_direct` + host env rewrite).
 ///
-/// Idempotent. Does not require host `ssh` to exist at ensure time (broken
-/// symlink → guest `ENOENT` on exec, same as missing binary).
+/// A real Darwin `ssh` copied with the macOS prefix is **replaced**: that
+/// binary needs `libcrypto` (`OPENSSL_init_crypto`) which is not a
+/// freestanding surface. Idempotent. Missing host `ssh` leaves a dangling
+/// symlink (guest `ENOENT` on exec).
 pub fn ensure_host_ssh_bridge(root: &Path) -> io::Result<()> {
     let link_path = root.join(GUEST_SSH_REL);
     if let Ok(meta) = link_path.symlink_metadata() {
@@ -274,17 +299,51 @@ pub fn ensure_host_ssh_bridge(root: &Path) -> io::Result<()> {
             if target == Path::new(GUEST_SSH_TARGET) {
                 return Ok(());
             }
-            // Wrong target: replace so bottle ensure always lands the bridge.
             fs::remove_file(&link_path)?;
         } else {
-            // Real file (e.g. user-dropped binary) — leave alone.
-            return Ok(());
+            // Darwin ssh from a copied macOS prefix — swap for the host bridge.
+            fs::remove_file(&link_path)?;
         }
     }
     if let Some(parent) = link_path.parent() {
         fs::create_dir_all(parent)?;
     }
     std::os::unix::fs::symlink(GUEST_SSH_TARGET, &link_path)
+}
+
+/// Apple flex hard-codes `/usr/bin/gm4`. The copied prefix `usr/bin/m4` /
+/// `gm4` are `xcrun` stubs that SIGSEGV under kh (and hang `flex -t`).
+/// Point them at CLT `usr/bin/m4` when that file exists.
+const GUEST_M4_REL: &str = "usr/bin/m4";
+const GUEST_GM4_REL: &str = "usr/bin/gm4";
+const GUEST_CLT_M4_TARGET: &str = "../../Library/Developer/CommandLineTools/usr/bin/m4";
+
+pub(crate) fn ensure_clt_m4_shims(root: &Path) -> io::Result<()> {
+    let clt = root.join("Library/Developer/CommandLineTools/usr/bin/m4");
+    if !clt.is_file() {
+        return Ok(());
+    }
+    replace_with_symlink(root, GUEST_M4_REL, GUEST_CLT_M4_TARGET)?;
+    replace_with_symlink(root, GUEST_GM4_REL, GUEST_CLT_M4_TARGET)?;
+    Ok(())
+}
+
+fn replace_with_symlink(root: &Path, rel: &str, target: &str) -> io::Result<()> {
+    let link_path = root.join(rel);
+    if let Ok(meta) = link_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            if fs::read_link(&link_path)? == Path::new(target) {
+                return Ok(());
+            }
+            fs::remove_file(&link_path)?;
+        } else {
+            fs::remove_file(&link_path)?;
+        }
+    }
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, &link_path)
 }
 
 /// Returns `true` if the bottle has the host OpenSSH bridge symlink.
@@ -347,6 +406,96 @@ pub(crate) fn ensure_libz_symlink(root: &Path) -> io::Result<()> {
 /// Ensures `usr/lib/libedit.3.dylib` → freestanding libSystem (readline).
 pub(crate) fn ensure_libedit_symlink(root: &Path) -> io::Result<()> {
     ensure_lib_alias_symlink(root, GUEST_LIBEDIT_REL, GUEST_LIBEDIT_TARGET, true)
+}
+
+/// Ensures `usr/lib/libncurses.5.4.dylib` → freestanding libSystem (termcap).
+pub(crate) fn ensure_libncurses_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBNCURSES_REL, GUEST_LIBNCURSES_TARGET, true)?;
+    ensure_lib_alias_symlink(
+        root,
+        "usr/lib/libncurses.dylib",
+        GUEST_LIBNCURSES_TARGET,
+        true,
+    )?;
+    ensure_lib_alias_symlink(
+        root,
+        "usr/lib/libcurses.dylib",
+        GUEST_LIBNCURSES_TARGET,
+        true,
+    )?;
+    Ok(())
+}
+
+/// Ensures `usr/lib/libpcre.0.dylib` → freestanding libSystem (Apple zsh).
+pub(crate) fn ensure_libpcre_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBPCRE_REL, GUEST_LIBPCRE_TARGET, true)?;
+    ensure_lib_alias_symlink(root, "usr/lib/libpcre.dylib", GUEST_LIBPCRE_TARGET, true)
+}
+
+/// Ensures `usr/lib/libiconv.2.dylib` → freestanding libSystem.
+pub(crate) fn ensure_libiconv_symlink(root: &Path) -> io::Result<()> {
+    ensure_lib_alias_symlink(root, GUEST_LIBICONV_REL, GUEST_LIBICONV_TARGET, true)?;
+    ensure_lib_alias_symlink(root, "usr/lib/libiconv.dylib", GUEST_LIBICONV_TARGET, true)
+}
+
+/// Darwin rustup / native-tls load Security.framework. Alias the binary to
+/// freestanding libSystem (SSL* live in the Security surface).
+const GUEST_SECURITY_REL: &str =
+    "System/Library/Frameworks/Security.framework/Versions/A/Security";
+const GUEST_SECURITY_TARGET: &str = "../../../../../../usr/lib/libSystem.B.dylib";
+
+pub(crate) fn ensure_security_framework_alias(root: &Path) -> io::Result<()> {
+    let fw = root.join("System/Library/Frameworks/Security.framework");
+    let versions = fw.join("Versions");
+    let a_dir = versions.join("A");
+    fs::create_dir_all(&a_dir)?;
+    let current = versions.join("Current");
+    if current.symlink_metadata().is_err() {
+        std::os::unix::fs::symlink("A", &current)?;
+    }
+    let top = fw.join("Security");
+    if top.symlink_metadata().is_err() {
+        std::os::unix::fs::symlink("Versions/Current/Security", &top)?;
+    }
+    replace_with_symlink(root, GUEST_SECURITY_REL, GUEST_SECURITY_TARGET)
+}
+
+/// Guest-relative path of the Apple zsh module tree.
+pub const GUEST_ZSH_MODULES_REL: &str = "usr/lib/zsh";
+
+/// Returns `true` when the bottle has Apple zsh modules (`zle.so` under a version dir).
+///
+/// Interactive `zsh` `dlopen`s `zsh/zle`. The tree is not in `bin`/`usr/bin`;
+/// copy `/usr/lib/zsh` from macOS 26+ Apple Silicon (see README).
+#[must_use]
+pub fn bottle_has_zsh_modules(root: &Path) -> bool {
+    let zsh_root = root.join(GUEST_ZSH_MODULES_REL);
+    let Ok(versions) = fs::read_dir(&zsh_root) else {
+        return false;
+    };
+    for ent in versions.flatten() {
+        let zle = ent.path().join("zsh/zle.so");
+        if zle.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Short reminder when interactive zsh modules are missing.
+#[must_use]
+pub fn zsh_modules_hint(root: &Path) -> String {
+    format!(
+        "bottle is missing Apple zsh modules (usr/lib/zsh/*/zsh/zle.so).\n\
+         Interactive zsh needs this tree; `zsh -c` works without it.\n\
+         \n\
+         Copy from a macOS 26+ Apple Silicon Mac:\n\
+           /usr/lib/zsh → {root}/usr/lib/zsh/\n\
+         \n\
+         `libpcre.0.dylib` / `libiconv.2.dylib` live in the dyld shared cache\n\
+         and cannot be copied; `kh bottle ensure` aliases them to libSystem.",
+        root = root.display()
+    )
 }
 
 /// Shared install-name alias helper (libc++ / libcurl → freestanding libSystem).
@@ -450,6 +599,10 @@ mod tests {
             !bottle_has_macos_prefix(&root),
             "empty skeleton must not look like a macOS prefix"
         );
+        assert!(
+            !bottle_has_zsh_modules(&root),
+            "empty skeleton has no zsh modules"
+        );
 
         let target = fs::read_link(root.join(VOLUMES_LINUX)).expect("readlink");
         assert_eq!(target, Path::new("/"));
@@ -479,6 +632,12 @@ mod tests {
         let hint = macos_prefix_hint(&root);
         assert!(hint.contains("macOS 26+"));
         assert!(hint.contains("Apple Silicon"));
+        assert!(!bottle_has_zsh_modules(&root));
+        let zle = root.join("usr/lib/zsh/5.9/zsh/zle.so");
+        fs::create_dir_all(zle.parent().expect("parent")).expect("zsh dir");
+        fs::write(&zle, macho).expect("zle");
+        assert!(bottle_has_zsh_modules(&root));
+        assert!(zsh_modules_hint(&root).contains("/usr/lib/zsh"));
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

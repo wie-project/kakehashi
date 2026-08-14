@@ -265,6 +265,40 @@ pub(crate) unsafe extern "C" fn mblen(s: *const c_char, n: usize) -> c_int {
     i32::from(unsafe { s.read() } != 0)
 }
 
+/// C `mbtowc` → nlist `_mbtowc` ("C" locale).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn mbtowc(pwc: *mut i32, s: *const c_char, n: usize) -> c_int {
+    if s.is_null() {
+        return 0;
+    }
+    if n == 0 {
+        return -1;
+    }
+    let b = unsafe { s.read() };
+    if !pwc.is_null() {
+        unsafe {
+            pwc.write(i32::from(b.cast_unsigned()));
+        }
+    }
+    i32::from(b != 0)
+}
+
+/// C `wctomb` → nlist `_wctomb` ("C" locale).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wctomb(s: *mut c_char, wc: i32) -> c_int {
+    if s.is_null() {
+        return 0;
+    }
+    if !(0..=0xff).contains(&wc) {
+        return -1;
+    }
+    let byte = u8::try_from(wc).unwrap_or(0);
+    unsafe {
+        s.write(byte.cast_signed());
+    }
+    i32::from(wc != 0)
+}
+
 /// Darwin `wchar_t` for locale conversion (32-bit).
 type Wchar = i32;
 
@@ -324,11 +358,7 @@ pub(crate) unsafe extern "C" fn btowc(c: c_int) -> Wchar {
 /// C `wctob` → nlist `_wctob`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn wctob(c: Wchar) -> c_int {
-    if (0..=127).contains(&c) {
-        c
-    } else {
-        -1
-    }
+    if (0..=127).contains(&c) { c } else { -1 }
 }
 
 /// C `wcrtomb` → nlist `_wcrtomb` ("C" locale).
@@ -482,7 +512,11 @@ fn c_locale_nl(item: c_int) -> &'static [u8] {
         let idx = usize::try_from(item.wrapping_sub(ABMON_1)).unwrap_or(0);
         return ABMONTHS.get(idx).copied().unwrap_or(EMPTY);
     }
-    if item == ERA || item == ERA_D_FMT || item == ERA_D_T_FMT || item == ERA_T_FMT || item == ALT_DIGITS
+    if item == ERA
+        || item == ERA_D_FMT
+        || item == ERA_D_T_FMT
+        || item == ERA_T_FMT
+        || item == ALT_DIGITS
     {
         return EMPTY;
     }
@@ -528,4 +562,312 @@ pub(crate) unsafe extern "C" fn nl_langinfo_l(
     _locale: *mut core::ffi::c_void,
 ) -> *mut c_char {
     unsafe { nl_langinfo(item) }
+}
+
+/// Darwin `wctype_t` is 32-bit (`__darwin_wctype_t`).
+type Wctype = u32;
+
+const WCTRANS_TOLOWER: usize = 1;
+const WCTRANS_TOUPPER: usize = 2;
+
+fn cstr_eq_bytes(p: *const c_char, s: &[u8]) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    for (i, &b) in s.iter().enumerate() {
+        // SAFETY: `p` is a guest C string; `s` is a short ASCII name.
+        if unsafe { p.add(i).read() }.cast_unsigned() != b {
+            return false;
+        }
+    }
+    unsafe { p.add(s.len()).read() == 0 }
+}
+
+/// C `wctype` → nlist `_wctype` (class name → `_CTYPE_*` mask).
+///
+/// Apple `/usr/bin/cd` runs `tr [:upper:] [:lower:]`, which looks up classes
+/// here. "C" locale only.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wctype(property: *const c_char) -> Wctype {
+    if cstr_eq_bytes(property, b"alnum") {
+        return CTYPE_A | CTYPE_D;
+    }
+    if cstr_eq_bytes(property, b"alpha") {
+        return CTYPE_A;
+    }
+    if cstr_eq_bytes(property, b"blank") {
+        return CTYPE_B;
+    }
+    if cstr_eq_bytes(property, b"cntrl") {
+        return CTYPE_C;
+    }
+    if cstr_eq_bytes(property, b"digit") {
+        return CTYPE_D;
+    }
+    if cstr_eq_bytes(property, b"graph") {
+        return CTYPE_G;
+    }
+    if cstr_eq_bytes(property, b"lower") {
+        return CTYPE_L;
+    }
+    if cstr_eq_bytes(property, b"print") {
+        return CTYPE_R;
+    }
+    if cstr_eq_bytes(property, b"punct") {
+        return CTYPE_P;
+    }
+    if cstr_eq_bytes(property, b"space") {
+        return CTYPE_S;
+    }
+    if cstr_eq_bytes(property, b"upper") {
+        return CTYPE_U;
+    }
+    if cstr_eq_bytes(property, b"xdigit") {
+        return CTYPE_X;
+    }
+    0
+}
+
+/// C `iswctype` → nlist `_iswctype`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswctype(wc: Wchar, charclass: Wctype) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(charclass).unwrap_or(0)) }
+}
+
+/// C `iswalnum` → nlist `_iswalnum`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswalnum(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_A | CTYPE_D).unwrap_or(0)) }
+}
+
+/// C `iswalpha` → nlist `_iswalpha`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswalpha(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_A).unwrap_or(0)) }
+}
+
+/// C `iswblank` → nlist `_iswblank`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswblank(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_B).unwrap_or(0)) }
+}
+
+/// C `iswcntrl` → nlist `_iswcntrl`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswcntrl(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_C).unwrap_or(0)) }
+}
+
+/// C `iswdigit` → nlist `_iswdigit`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswdigit(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_D).unwrap_or(0)) }
+}
+
+/// C `iswgraph` → nlist `_iswgraph`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswgraph(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_G).unwrap_or(0)) }
+}
+
+/// C `iswlower` → nlist `_iswlower`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswlower(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_L).unwrap_or(0)) }
+}
+
+/// C `iswprint` → nlist `_iswprint`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswprint(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_R).unwrap_or(0)) }
+}
+
+/// C `iswpunct` → nlist `_iswpunct`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswpunct(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_P).unwrap_or(0)) }
+}
+
+/// C `iswspace` → nlist `_iswspace`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswspace(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_S).unwrap_or(0)) }
+}
+
+/// C `iswupper` → nlist `_iswupper`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswupper(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_U).unwrap_or(0)) }
+}
+
+/// C `iswxdigit` → nlist `_iswxdigit`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn iswxdigit(wc: Wchar) -> c_int {
+    unsafe { __maskrune(wc, usize::try_from(CTYPE_X).unwrap_or(0)) }
+}
+
+/// C `towlower` → nlist `_towlower`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn towlower(wc: Wchar) -> Wchar {
+    if (i32::from(b'A')..=i32::from(b'Z')).contains(&wc) {
+        wc.wrapping_add(32)
+    } else {
+        wc
+    }
+}
+
+/// C `towupper` → nlist `_towupper`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn towupper(wc: Wchar) -> Wchar {
+    if (i32::from(b'a')..=i32::from(b'z')).contains(&wc) {
+        wc.wrapping_sub(32)
+    } else {
+        wc
+    }
+}
+
+/// C `wctrans` → nlist `_wctrans`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wctrans(property: *const c_char) -> usize {
+    if cstr_eq_bytes(property, b"tolower") {
+        WCTRANS_TOLOWER
+    } else if cstr_eq_bytes(property, b"toupper") {
+        WCTRANS_TOUPPER
+    } else {
+        0
+    }
+}
+
+/// C `getwchar` → nlist `_getwchar` ("C" locale: one byte from stdin).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getwchar() -> Wchar {
+    let mut b = 0_u8;
+    let n = unsafe {
+        crate::kh_core::sys::syscall3(
+            crate::kh_core::sys::SYS_READ,
+            0,
+            u64::try_from(core::ptr::from_mut(&mut b).addr()).unwrap_or(0),
+            1,
+        )
+    };
+    if n <= 0 {
+        -1
+    } else {
+        i32::from(b)
+    }
+}
+
+/// C `putwchar` → nlist `_putwchar`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn putwchar(wc: Wchar) -> Wchar {
+    let Ok(b) = u8::try_from(wc) else {
+        return -1;
+    };
+    let n = unsafe {
+        crate::kh_core::sys::syscall3(
+            crate::kh_core::sys::SYS_WRITE,
+            1,
+            u64::try_from(core::ptr::from_ref(&b).addr()).unwrap_or(0),
+            1,
+        )
+    };
+    if n <= 0 { -1 } else { wc }
+}
+
+/// C `getwc` → nlist `_getwc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getwc(stream: *mut c_void) -> Wchar {
+    let c = unsafe { crate::dylib::libsystem_c::stdio::fgetc(stream) };
+    if c < 0 { -1 } else { c }
+}
+
+/// C `putwc` → nlist `_putwc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn putwc(wc: Wchar, stream: *mut c_void) -> Wchar {
+    let c = unsafe { crate::dylib::libsystem_c::stdio::fputc(wc, stream) };
+    if c < 0 { -1 } else { wc }
+}
+
+/// C `fgetwc` → nlist `_fgetwc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fgetwc(stream: *mut c_void) -> Wchar {
+    unsafe { getwc(stream) }
+}
+
+/// C `fputwc` → nlist `_fputwc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fputwc(wc: Wchar, stream: *mut c_void) -> Wchar {
+    unsafe { putwc(wc, stream) }
+}
+
+/// C `ungetwc` → nlist `_ungetwc`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ungetwc(wc: Wchar, stream: *mut c_void) -> Wchar {
+    let c = unsafe { crate::dylib::libsystem_c::stdio::ungetc(wc, stream) };
+    if c < 0 { -1 } else { wc }
+}
+
+/// C `wcwidth` → nlist `_wcwidth` ("C" locale column width).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcwidth(wc: Wchar) -> c_int {
+    if wc == 0 {
+        return 0;
+    }
+    if unsafe { iswprint(wc) } != 0 {
+        1
+    } else {
+        -1
+    }
+}
+
+/// C `wcswidth` → nlist `_wcswidth`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcswidth(pwcs: *const Wchar, n: usize) -> c_int {
+    if pwcs.is_null() {
+        return -1;
+    }
+    let mut w = 0_i32;
+    let mut i = 0_usize;
+    while i < n {
+        let c = unsafe { pwcs.add(i).read() };
+        if c == 0 {
+            break;
+        }
+        let cw = unsafe { wcwidth(c) };
+        if cw < 0 {
+            return -1;
+        }
+        w = w.saturating_add(cw);
+        i = i.saturating_add(1);
+    }
+    w
+}
+
+/// C `nextwctype` → nlist `_nextwctype` (next rune in `charclass`, or −1).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn nextwctype(wc: Wchar, charclass: Wctype) -> Wchar {
+    if charclass == 0 {
+        return -1;
+    }
+    let start = if wc < 0 { 0 } else { wc.saturating_add(1) };
+    let mut c = start;
+    while c <= 255 {
+        if unsafe { iswctype(c, charclass) } != 0 {
+            return c;
+        }
+        c = c.saturating_add(1);
+    }
+    -1
+}
+
+/// C `towctrans` → nlist `_towctrans`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn towctrans(wc: Wchar, desc: usize) -> Wchar {
+    if desc == WCTRANS_TOLOWER {
+        unsafe { towlower(wc) }
+    } else if desc == WCTRANS_TOUPPER {
+        unsafe { towupper(wc) }
+    } else {
+        wc
+    }
 }

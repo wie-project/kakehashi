@@ -7,6 +7,21 @@ use crate::kh_core::sys::{self, SYS_READ, SYS_WRITE};
 use crate::kh_core::trace;
 use crate::kh_core::helpers::KH_HELPER_PUTS;
 
+/// C `perror` → nlist `_perror` (write `strerror` to fd 2).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn perror(s: *const c_char) {
+    let err = errno::get_errno();
+    let msg = unsafe { crate::dylib::libsystem_c::string::strerror(err) };
+    if !s.is_null() && unsafe { *s != 0 } {
+        let _ = unsafe { write(2, s.cast(), strlen(s)) };
+        let _ = unsafe { write(2, b": ".as_ptr().cast(), 2) };
+    }
+    if !msg.is_null() {
+        let _ = unsafe { write(2, msg.cast(), strlen(msg)) };
+    }
+    let _ = unsafe { write(2, b"\n".as_ptr().cast(), 1) };
+}
+
 /// C `write` → nlist `_write`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, nbyte: usize) -> isize {
@@ -213,7 +228,9 @@ struct FileStub {
     fd: c_int,
     flags: u32,
     err: c_int,
-    _pad: [u8; 52],
+    /// One-byte pushback (`ungetc`); `-1` means empty.
+    ungot: c_int,
+    _pad: [u8; 48],
 }
 
 const FILE_EOF: u32 = 1;
@@ -223,19 +240,22 @@ static mut STDIN_FILE: FileStub = FileStub {
     fd: 0,
     flags: 0,
     err: 0,
-    _pad: [0; 52],
+    ungot: -1,
+    _pad: [0; 48],
 };
 static mut STDOUT_FILE: FileStub = FileStub {
     fd: 1,
     flags: 0,
     err: 0,
-    _pad: [0; 52],
+    ungot: -1,
+    _pad: [0; 48],
 };
 static mut STDERR_FILE: FileStub = FileStub {
     fd: 2,
     flags: 0,
     err: 0,
-    _pad: [0; 52],
+    ungot: -1,
+    _pad: [0; 48],
 };
 
 /// `FILE *__stdinp` → nlist `___stdinp`.
@@ -283,6 +303,9 @@ pub(crate) unsafe extern "C" fn srget(stream: *mut c_void) -> c_int {
     let f = unsafe { as_file(stream) };
     if f.is_null() {
         return -1;
+    }
+    if let Some(c) = unsafe { take_ungot(f) } {
+        return c;
     }
     let fd = unsafe { (*f).fd };
     let mut b = 0_u8;
@@ -400,6 +423,7 @@ fn file_from_fd(fd: c_int) -> *mut FileStub {
     unsafe {
         core::ptr::write_bytes(f.cast::<u8>(), 0, core::mem::size_of::<FileStub>());
         (*f).fd = fd;
+        (*f).ungot = -1;
     }
     f
 }
@@ -442,24 +466,35 @@ pub(crate) unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut c
 }
 
 /// C `fclose` → nlist `_fclose`.
+///
+/// Std streams are not freed (they are static), but the underlying fd **is**
+/// closed. Apple flex `FLEX_EXIT` does `fclose(stdout)` then `wait()` so the
+/// m4 filter chain sees EOF on the stdout pipe. A no-op close left the write
+/// end open and hung `flex -t`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
     if stream.is_null() {
         errno::set_errno(9);
         return -1;
     }
-    // Do not free/close std streams.
     let p = stream.cast::<FileStub>();
-    if core::ptr::eq(p, core::ptr::addr_of_mut!(STDIN_FILE))
+    let is_std = core::ptr::eq(p, core::ptr::addr_of_mut!(STDIN_FILE))
         || core::ptr::eq(p, core::ptr::addr_of_mut!(STDOUT_FILE))
-        || core::ptr::eq(p, core::ptr::addr_of_mut!(STDERR_FILE))
-    {
-        return 0;
-    }
+        || core::ptr::eq(p, core::ptr::addr_of_mut!(STDERR_FILE));
     let fd = unsafe { (*p).fd };
-    let rc = unsafe { crate::dylib::libsystem_c::posix::close(fd) };
+    let rc = if fd >= 0 {
+        unsafe { crate::dylib::libsystem_c::posix::close(fd) }
+    } else {
+        0
+    };
     unsafe {
-        crate::kh_core::heap::free(stream);
+        (*p).fd = -1;
+        (*p).flags |= FILE_EOF;
+    }
+    if !is_std {
+        unsafe {
+            crate::kh_core::heap::free(stream);
+        }
     }
     rc
 }
@@ -564,6 +599,9 @@ pub(crate) unsafe extern "C" fn fgetc(stream: *mut c_void) -> c_int {
         return -1; // EOF
     }
     let f = unsafe { as_file(stream) };
+    if let Some(c) = unsafe { take_ungot(f) } {
+        return c;
+    }
     let mut byte = [0_u8; 1];
     let fd = unsafe { (*f).fd };
     let fd_u = u64::from(fd.cast_unsigned());
@@ -720,23 +758,45 @@ pub(crate) unsafe extern "C" fn fread(
     }
     let f = unsafe { as_file(stream) };
     let total = size.saturating_mul(nitems);
+    let mut off = 0_usize;
+    if let Some(c) = unsafe { take_ungot(f) }
+        && let Some(b) = u8::try_from(c).ok()
+    {
+        unsafe {
+            ptr.cast::<u8>().write(b);
+        }
+        off = 1;
+        if off >= total {
+            return off.checked_div(size).unwrap_or(0);
+        }
+    }
     let fd = unsafe { (*f).fd };
     let fd_u = u64::from(fd.cast_unsigned());
-    let n = unsafe { sys::syscall3(SYS_READ, fd_u, ptr_to_u64(ptr), usize_to_u64(total)) };
+    let remain = total.saturating_sub(off);
+    let dest = unsafe { ptr.cast::<u8>().add(off).cast::<c_void>() };
+    let n = unsafe { sys::syscall3(SYS_READ, fd_u, ptr_to_u64(dest), usize_to_u64(remain)) };
     if n < 0 {
         unsafe {
             (*f).flags |= FILE_ERR;
             (*f).err = 1;
         }
-        return 0;
+        return if off > 0 {
+            off.checked_div(size).unwrap_or(0)
+        } else {
+            0
+        };
     }
     if n == 0 {
         unsafe {
             (*f).flags |= FILE_EOF;
         }
-        return 0;
+        return if off > 0 {
+            off.checked_div(size).unwrap_or(0)
+        } else {
+            0
+        };
     }
-    let got = usize::try_from(n).unwrap_or(0);
+    let got = off.saturating_add(usize::try_from(n).unwrap_or(0));
     // Whole items only (POSIX fread).
     got.checked_div(size).unwrap_or(0)
 }
@@ -772,6 +832,11 @@ pub(crate) unsafe extern "C" fn fwrite(
 }
 
 /// C `fseek` → nlist `_fseek`.
+///
+/// `fseek(fp, 0, SEEK_CUR)` is a stream-sync (flex filter chain after
+/// `dup2` onto a pipe). `lseek` on a FIFO returns `ESPIPE`; treating that as
+/// `FILE_ERR` makes `ferror(stdout)` true so Apple flex skips `fclose(stdout)`
+/// and `wait()` hangs (m4 never sees EOF).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn fseek(stream: *mut c_void, offset: i64, whence: c_int) -> c_int {
     if stream.is_null() {
@@ -779,6 +844,13 @@ pub(crate) unsafe extern "C" fn fseek(stream: *mut c_void, offset: i64, whence: 
         return -1;
     }
     let f = unsafe { as_file(stream) };
+    // SEEK_CUR = 1. Offset 0: drop pushback only; do not lseek (pipes).
+    if offset == 0 && whence == 1 {
+        unsafe {
+            (*f).ungot = -1;
+        }
+        return 0;
+    }
     let fd = unsafe { (*f).fd };
     let pos = unsafe { crate::dylib::libsystem_c::posix::lseek(fd, offset, whence) };
     if pos < 0 {
@@ -789,6 +861,7 @@ pub(crate) unsafe extern "C" fn fseek(stream: *mut c_void, offset: i64, whence: 
     }
     unsafe {
         (*f).flags &= !FILE_EOF;
+        (*f).ungot = -1;
     }
     0
 }
@@ -828,6 +901,7 @@ pub(crate) unsafe extern "C" fn rewind(stream: *mut c_void) {
     unsafe {
         (*as_file(stream)).flags &= !(FILE_EOF | FILE_ERR);
         (*as_file(stream)).err = 0;
+        (*as_file(stream)).ungot = -1;
     }
 }
 
@@ -858,24 +932,79 @@ pub(crate) unsafe extern "C" fn freopen(
     }
     let f = unsafe { as_file(stream) };
     let old_fd = unsafe { (*f).fd };
-    let is_std = core::ptr::eq(f, core::ptr::addr_of_mut!(STDIN_FILE))
-        || core::ptr::eq(f, core::ptr::addr_of_mut!(STDOUT_FILE))
-        || core::ptr::eq(f, core::ptr::addr_of_mut!(STDERR_FILE));
-    // Close previous fd except for the three std streams' original slots when
-    // guests freopen stdio onto a path (still close the prior open if non-std).
-    if !is_std && old_fd >= 0 {
-        let _ = unsafe { crate::dylib::libsystem_c::posix::close(old_fd) };
-    }
+    let std_slot = if core::ptr::eq(f, core::ptr::addr_of_mut!(STDIN_FILE)) {
+        Some(0)
+    } else if core::ptr::eq(f, core::ptr::addr_of_mut!(STDOUT_FILE)) {
+        Some(1)
+    } else if core::ptr::eq(f, core::ptr::addr_of_mut!(STDERR_FILE)) {
+        Some(2)
+    } else {
+        None
+    };
     let new_fd = unsafe { crate::dylib::libsystem_c::posix::kh_open_impl(path, flags, creat_mode) };
     if new_fd < 0 {
         return core::ptr::null_mut();
     }
+    let keep_fd = if let Some(slot) = std_slot {
+        // Keep fileno(stdin/out/err) as 0/1/2 so a later `dup2(pipe, 1)`
+        // (flex filter chain) captures FILE writes.
+        if new_fd != slot {
+            let rc = unsafe { crate::dylib::libsystem_c::posix::dup2(new_fd, slot) };
+            let _ = unsafe { crate::dylib::libsystem_c::posix::close(new_fd) };
+            if rc < 0 {
+                return core::ptr::null_mut();
+            }
+        }
+        slot
+    } else {
+        if old_fd >= 0 && old_fd != new_fd {
+            let _ = unsafe { crate::dylib::libsystem_c::posix::close(old_fd) };
+        }
+        new_fd
+    };
     unsafe {
-        (*f).fd = new_fd;
+        (*f).fd = keep_fd;
         (*f).flags = 0;
         (*f).err = 0;
+        (*f).ungot = -1;
     }
     stream
+}
+
+/// C `ungetc` → nlist `_ungetc` (one-byte pushback).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ungetc(c: c_int, stream: *mut c_void) -> c_int {
+    if stream.is_null() || c < 0 {
+        return -1;
+    }
+    let f = unsafe { as_file(stream) };
+    if f.is_null() {
+        return -1;
+    }
+    unsafe {
+        if (*f).ungot >= 0 {
+            return -1;
+        }
+        (*f).ungot = c & 0xff;
+        (*f).flags &= !FILE_EOF;
+    }
+    c & 0xff
+}
+
+#[inline]
+unsafe fn take_ungot(f: *mut FileStub) -> Option<c_int> {
+    if f.is_null() {
+        return None;
+    }
+    let v = unsafe { (*f).ungot };
+    if v < 0 {
+        None
+    } else {
+        unsafe {
+            (*f).ungot = -1;
+        }
+        Some(v)
+    }
 }
 
 #[inline]

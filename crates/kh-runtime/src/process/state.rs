@@ -17,6 +17,22 @@ static SYSCALL_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Cap for [`SYSCALL_COUNT`]; updated by [`reset_run`].
 static MAX_SYSCALLS: AtomicU64 = AtomicU64::new(256);
 
+/// Last `connect` guest FD (SecureTransport `SSLHandshake` wrap).
+static LAST_TCP_GFD: AtomicI32 = AtomicI32::new(-1);
+
+/// Record the guest socket used by the latest `connect` (even `EINPROGRESS`).
+#[inline]
+pub fn set_last_tcp_gfd(gfd: i32) {
+    LAST_TCP_GFD.store(gfd, Ordering::Release);
+}
+
+/// Guest FD of the latest TCP `connect`, or `-1`.
+#[must_use]
+#[inline]
+pub fn last_tcp_gfd() -> i32 {
+    LAST_TCP_GFD.load(Ordering::Acquire)
+}
+
 /// Unreaped host children from guest `fork` (parent side only).
 ///
 /// Secondary signal for blocking I/O waits; primary control is

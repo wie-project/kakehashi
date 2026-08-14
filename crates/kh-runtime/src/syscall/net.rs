@@ -22,6 +22,8 @@ const DARWIN_AF_INET6: i32 = 30;
 const DARWIN_SOCK_STREAM: i32 = 1;
 const DARWIN_SOCK_DGRAM: i32 = 2;
 const DARWIN_SOCK_RAW: i32 = 3;
+/// Darwin `SOCK_NONBLOCK` (not Linux `04000`).
+const DARWIN_SOCK_NONBLOCK: i32 = 0x2000_0000;
 
 /// Darwin `SOL_SOCKET`.
 const DARWIN_SOL_SOCKET: i32 = 0xffff;
@@ -272,6 +274,19 @@ fn darwin_sockaddr_to_host(buf: &mut Vec<u8>) -> Result<(), i64> {
 // Keep a thin wrapper for call sites that still pass a fixed guest slice
 // through a temporary Vec (connect/bind/sendmsg).
 
+/// After [`host_sockaddr_to_darwin`], prefer Darwin `sa_len` (16 / 28).
+fn darwin_socklen(buf: &[u8], fallback: usize) -> usize {
+    let sa_len = usize::from(*buf.first().unwrap_or(&0));
+    let fam = i32::from(*buf.get(1).unwrap_or(&0));
+    if fam == DARWIN_AF_INET && sa_len == 16 {
+        16
+    } else if fam == DARWIN_AF_INET6 && sa_len == 28 {
+        28
+    } else {
+        fallback
+    }
+}
+
 fn host_sockaddr_to_darwin(buf: &mut [u8]) {
     if buf.len() < 2 {
         return;
@@ -461,8 +476,12 @@ pub(crate) fn handle_socket(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EPERM);
     };
     if let Some(g) = alloc_guest_fd(hfd) {
-        // See socketpair: host is nonblock; guest flag must match for EAGAIN.
-        crate::process::fd_set_guest_nonblock(g, true);
+        // Darwin sockets start blocking. Host fd is O_NONBLOCK; read/write
+        // emulate blocking until the guest fcntl's O_NONBLOCK (curl multi).
+        // rustup/rust std uses blocking `connect` — do not advertise
+        // O_NONBLOCK here or F_GETFL + EINPROGRESS fails without kevent.
+        let guest_nb = ty & DARWIN_SOCK_NONBLOCK != 0;
+        crate::process::fd_set_guest_nonblock(g, guest_nb);
         net_log(&format!("socket -> gfd {g}"));
         SyscallResult::ok(name, u64::try_from(g).unwrap_or(0))
     } else {
@@ -504,9 +523,39 @@ pub(crate) fn handle_connect(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EINVAL);
     };
     net_log(&format!("connect hfd={hfd} len={len}"));
+    crate::process::set_last_tcp_gfd(reg_as_i32(args.x0));
     let r = with_translated_sockaddr(name, args.x1, len, |addr| host::connect(hfd, addr));
     net_log(&format!("connect done err={} ret={:?}", r.error, r.retval));
+    let gfd = reg_as_i32(args.x0);
+    if r.error
+        && r.retval == Some(DARWIN_EINPROGRESS.unsigned_abs())
+        && !crate::process::fd_guest_nonblock(gfd)
+    {
+        return complete_blocking_connect(name, hfd);
+    }
     r
+}
+
+/// Host sockets are O_NONBLOCK; a blocking guest `connect` must wait out
+/// `EINPROGRESS` (rustup / rust std) instead of returning it as a hard error.
+fn complete_blocking_connect(name: &'static str, hfd: std::os::fd::RawFd) -> SyscallResult {
+    if !host::poll_fd_writable(hfd, -1) {
+        return SyscallResult::err(name, DARWIN_ETIMEDOUT);
+    }
+    let mut errbuf = [0_u8; 4];
+    match host::getsockopt(hfd, libc::SOL_SOCKET, libc::SO_ERROR, &mut errbuf) {
+        Ok(_) => {
+            let e = i32::from_le_bytes(errbuf);
+            if e == 0 || e == libc::EISCONN {
+                net_log("connect blocking complete ok");
+                SyscallResult::ok(name, 0)
+            } else {
+                net_log(&format!("connect blocking so_error={e}"));
+                SyscallResult::err(name, host_errno_to_darwin(e))
+            }
+        }
+        Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
+    }
 }
 
 /// `bind`.
@@ -571,7 +620,7 @@ pub(crate) fn handle_accept(args: SyscallArgs) -> SyscallResult {
     match result {
         Ok(new_h) => {
             if let Some(g) = alloc_guest_fd(new_h) {
-                crate::process::fd_set_guest_nonblock(g, true);
+                crate::process::fd_set_guest_nonblock(g, false);
                 SyscallResult::ok(name, u64::try_from(g).unwrap_or(0))
             } else {
                 host::close_fd(new_h);
@@ -640,7 +689,23 @@ pub(crate) fn handle_getsockopt(args: SyscallArgs) -> SyscallResult {
     let buf = guest_slice_mut(args.x3, len_us);
     match host::getsockopt(hfd, hl, ho, buf) {
         Ok(n) => {
+            // Linux `SO_ERROR` is a host errno; guests compare Darwin numbers
+            // (`EINPROGRESS` 36 vs Linux 115).
+            if ho == libc::SO_ERROR
+                && n >= 4
+                && let Some(raw) = buf.get(..4)
+            {
+                let host_e = i32::from_ne_bytes(raw.try_into().unwrap_or([0; 4]));
+                if host_e != 0 {
+                    let dar = i32::try_from(host_errno_to_darwin(host_e)).unwrap_or(host_e);
+                    guest_write(args.x3, &dar.to_ne_bytes());
+                    net_log(&format!("SO_ERROR host={host_e} darwin={dar}"));
+                } else {
+                    net_log("SO_ERROR 0");
+                }
+            }
             guest_write_u32(args.x4, u32::try_from(n).unwrap_or(0));
+            net_log(&format!("getsockopt level={level} opt={optname} n={n}"));
             SyscallResult::ok(name, 0)
         }
         Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
@@ -680,12 +745,15 @@ fn handle_sockname(
     match op(hfd, &mut buf) {
         Ok(n) => {
             let n = n.min(buf.len());
-            if let Some(slice) = buf.get_mut(..n) {
+            let out_len = if let Some(slice) = buf.get_mut(..n) {
                 host_sockaddr_to_darwin(slice);
                 guest_write(args.x1, slice);
-            }
-            guest_write_u32(args.x2, u32::try_from(n).unwrap_or(0));
-            net_log(&format!("{name} ok n={n}"));
+                darwin_socklen(slice, n)
+            } else {
+                n
+            };
+            guest_write_u32(args.x2, u32::try_from(out_len).unwrap_or(0));
+            net_log(&format!("{name} ok n={out_len}"));
             SyscallResult::ok(name, 0)
         }
         Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
@@ -794,11 +862,14 @@ pub(crate) fn handle_recvfrom(args: SyscallArgs) -> SyscallResult {
         match host::recvfrom(hfd, buf, flags, Some(abuf.as_mut_slice())) {
             Ok((n, naddr)) => {
                 let naddr = naddr.min(abuf.len());
-                if let Some(slice) = abuf.get_mut(..naddr) {
+                let out_len = if let Some(slice) = abuf.get_mut(..naddr) {
                     host_sockaddr_to_darwin(slice);
                     guest_write(args.x4, slice);
-                }
-                guest_write_u32(args.x5, u32::try_from(naddr).unwrap_or(0));
+                    darwin_socklen(slice, naddr)
+                } else {
+                    naddr
+                };
+                guest_write_u32(args.x5, u32::try_from(out_len).unwrap_or(0));
                 SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
             }
             Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),

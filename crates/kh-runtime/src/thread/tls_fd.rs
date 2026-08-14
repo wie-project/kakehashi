@@ -24,7 +24,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::{IntoRawFd, RawFd};
+use std::mem::ManuallyDrop;
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -70,6 +71,59 @@ fn with_slots<R>(f: impl FnOnce(&mut HashMap<i32, TlsSlot>) -> R) -> R {
 #[inline]
 pub fn is_tls_fd(gfd: i32) -> bool {
     crate::process::fd_is_tls(gfd)
+}
+
+/// Run a rustls client handshake on an already-connected guest TCP socket.
+///
+/// Darwin rustup uses SecureTransport (`SSLHandshake`) on a raw `connect`'d
+/// fd. After this, guest `read`/`write` on `gfd` are plaintext (same as
+/// [`connect`]).
+pub fn wrap_existing(gfd: i32, hostname: &str) -> Result<(), String> {
+    if is_tls_fd(gfd) {
+        return Ok(());
+    }
+    let host_fd = crate::process::fd_get(gfd).ok_or_else(|| "bad guest fd".to_owned())?;
+    let ca = crate::bottle::active_ca_pem_path();
+    let config = build_config(ca.is_some(), ca.as_deref())?;
+    let sni = if hostname.is_empty() {
+        "localhost"
+    } else {
+        hostname
+    };
+    let server_name =
+        ServerName::try_from(sni.to_owned()).map_err(|e| format!("server name: {e}"))?;
+    let mut conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("tls client: {e}"))?;
+    // SAFETY: `host_fd` stays in the guest FD table. `ManuallyDrop` so an
+    // error path must not `close` it (that was EBADF → rustup abort 134).
+    let mut sock = ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(host_fd) });
+    // Guest `connect` is non-blocking (EINPROGRESS). Wait until the TCP
+    // handshake finishes so rustls does not write to an unconnected socket.
+    if !crate::host::poll_fd_writable(host_fd, 15_000) {
+        return Err("connect wait timeout".into());
+    }
+    drop(sock.set_nonblocking(false));
+    while conn.is_handshaking() {
+        if let Err(e) = conn.complete_io(&mut *sock) {
+            drop(sock.set_nonblocking(true));
+            return Err(format!("tls handshake: {e}"));
+        }
+    }
+    drop(conn.complete_io(&mut *sock));
+    drop(sock.set_nonblocking(true));
+    crate::process::fd_set_tls(gfd, true);
+    with_slots(|m| {
+        m.insert(
+            gfd,
+            TlsSlot {
+                conn,
+                pending_out: Vec::new(),
+                pending_in: Vec::new(),
+            },
+        );
+    });
+    tracing::debug!(%hostname, gfd, host_fd, "tls_fd wrap ok");
+    Ok(())
 }
 
 /// Drop TLS state for `gfd` (does not close the host socket).

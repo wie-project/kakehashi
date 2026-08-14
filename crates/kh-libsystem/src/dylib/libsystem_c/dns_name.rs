@@ -1,7 +1,6 @@
 //! DNS name helpers (getnameinfo soft / hostent).
 
 #![allow(unused_imports, dead_code)]
-
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
@@ -18,10 +17,10 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-use crate::kh_core::errno;
-use crate::kh_core::heap::{free, malloc};
 use crate::dylib::libsystem_c::stdio::strlen;
 use crate::dylib::libsystem_c::string::{strcmp, strcpy};
+use crate::kh_core::errno;
+use crate::kh_core::heap::{free, malloc};
 
 const EINVAL: i32 = 22;
 const ENOTTY: i32 = 25;
@@ -250,4 +249,3 @@ pub(crate) unsafe extern "C" fn getservbyport(port: c_int, _proto: *const c_char
     };
     unsafe { fill_servent(nm, p, b"tcp\0").cast() }
 }
-

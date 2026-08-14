@@ -7,11 +7,12 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::indexing_slicing,
+    clippy::integer_division,
     static_mut_refs
 )]
 
 use core::ffi::{c_char, c_int, c_void};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::kh_core::errno;
 use crate::kh_core::heap::{free, malloc};
@@ -22,13 +23,14 @@ use crate::kh_core::sys::{
     SYS_GETEUID, SYS_GETGID, SYS_GETPGRP, SYS_GETPID, SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_GETUID,
     SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_LSTAT64, SYS_MKDIR, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
     SYS_OPEN, SYS_OPENAT, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_READLINK, SYS_RENAME, SYS_RMDIR,
+    SYS_WRITE,
     SYS_SETPGID, SYS_SETSID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_STAT64, SYS_SYMLINK, SYS_SYSCTL,
     SYS_SYSCTLBYNAME, SYS_UNLINK, SYS_VFORK, SYS_WAIT4,
 };
 use crate::kh_core::trace;
 use crate::{
     KH_HELPER_ARGV, KH_HELPER_EXECUTABLE_PATH, KH_HELPER_GUEST_HOME, KH_HELPER_NCPU,
-    KH_HELPER_READDIR, KH_HELPER_SPAWN,
+    KH_HELPER_PARK, KH_HELPER_READDIR, KH_HELPER_SPAWN, KH_HELPER_WAKE,
 };
 
 const ENOSYS: i32 = 78;
@@ -370,6 +372,135 @@ pub(crate) unsafe extern "C" fn fstatat(
     ret_c_int(ret)
 }
 
+/// Darwin `clonefile(2)` flags (public man page).
+const CLONE_NOFOLLOW: u32 = 0x0001;
+const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+const STAT64_MODE_OFF: usize = 4;
+const STAT64_SIZE_OFF: usize = 96;
+const S_IFMT_U16: u16 = 0o170_000;
+const S_IFDIR_U16: u16 = 0o040_000;
+
+fn stat64_mode(buf: &[u8; 144]) -> u16 {
+    let b = [buf[STAT64_MODE_OFF], buf[STAT64_MODE_OFF + 1]];
+    u16::from_le_bytes(b)
+}
+
+fn stat64_size(buf: &[u8; 144]) -> i64 {
+    let mut b = [0_u8; 8];
+    b.copy_from_slice(&buf[STAT64_SIZE_OFF..STAT64_SIZE_OFF + 8]);
+    i64::from_le_bytes(b)
+}
+
+fn copy_fd_to_path(src_fd: c_int, dst_dirfd: c_int, dst: *const c_char, mode: c_int) -> c_int {
+    let out = unsafe { kh_openat_impl(dst_dirfd, dst, O_WRONLY | O_CREAT | O_EXCL, mode) };
+    if out < 0 {
+        return -1;
+    }
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = unsafe { read(src_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let _ = unsafe { close(out) };
+            let _ = unlinkat_best_effort(dst_dirfd, dst);
+            return -1;
+        }
+        if n == 0 {
+            break;
+        }
+        let mut off = 0_usize;
+        let total = usize::try_from(n).unwrap_or(0);
+        while off < total {
+            let w = unsafe {
+                sys::syscall3(
+                    SYS_WRITE,
+                    u64::from(out.cast_unsigned()),
+                    ptr_u64(buf.as_ptr().add(off).cast()),
+                    u64::try_from(total.saturating_sub(off)).unwrap_or(0),
+                )
+            };
+            if w <= 0 {
+                let _ = unsafe { close(out) };
+                let _ = unlinkat_best_effort(dst_dirfd, dst);
+                return -1;
+            }
+            off = off.saturating_add(usize::try_from(w).unwrap_or(0));
+        }
+    }
+    let _ = unsafe { close(out) };
+    0
+}
+
+fn unlinkat_best_effort(dirfd: c_int, path: *const c_char) -> c_int {
+    // Best-effort: open+unlink via unlink() when path is absolute-looking; else ignore.
+    if path.is_null() {
+        return -1;
+    }
+    let _ = dirfd;
+    unsafe { unlink(path) }
+}
+
+/// C `fclonefileat` → nlist `_fclonefileat` (copy; Linux has no APFS clone).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fclonefileat(
+    srcfd: c_int,
+    dst_dirfd: c_int,
+    dst: *const c_char,
+    _flags: u32,
+) -> c_int {
+    if dst.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let mut st = [0_u8; 144];
+    if unsafe { fstat(srcfd, st.as_mut_ptr().cast()) } != 0 {
+        return -1;
+    }
+    if stat64_mode(&st) & S_IFMT_U16 == S_IFDIR_U16 {
+        errno::set_errno(21); // EISDIR
+        return -1;
+    }
+    let mode = c_int::from(stat64_mode(&st) & 0o777);
+    let _ = stat64_size(&st);
+    copy_fd_to_path(srcfd, dst_dirfd, dst, mode)
+}
+
+/// C `clonefileat` → nlist `_clonefileat`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn clonefileat(
+    src_dirfd: c_int,
+    src: *const c_char,
+    dst_dirfd: c_int,
+    dst: *const c_char,
+    flags: u32,
+) -> c_int {
+    if src.is_null() || dst.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let src_fd = unsafe { kh_openat_impl(src_dirfd, src, O_RDONLY, 0) };
+    if src_fd < 0 {
+        return -1;
+    }
+    if flags & CLONE_NOFOLLOW != 0 {
+        // Source already opened without O_NOFOLLOW; soft: proceed as a copy.
+    }
+    let rc = unsafe { fclonefileat(src_fd, dst_dirfd, dst, flags) };
+    let _ = unsafe { close(src_fd) };
+    rc
+}
+
+/// C `clonefile` → nlist `_clonefile`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn clonefile(
+    src: *const c_char,
+    dst: *const c_char,
+    flags: u32,
+) -> c_int {
+    const AT_FDCWD: c_int = -2;
+    unsafe { clonefileat(AT_FDCWD, src, AT_FDCWD, dst, flags) }
+}
+
 /// C `ftruncate` → nlist `_ftruncate`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn ftruncate(fd: c_int, length: i64) -> c_int {
@@ -519,6 +650,27 @@ pub(crate) unsafe extern "C" fn fchmod(fd: c_int, mode: c_int) -> c_int {
         )
     };
     ret_c_int(ret)
+}
+
+/// C `fchmodat` → nlist `_fchmodat` (`chmod` after `fts_*`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn fchmodat(
+    fd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    _flag: c_int,
+) -> c_int {
+    if path.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    let ofd = unsafe { kh_openat_impl(fd, path, 0, 0) };
+    if ofd < 0 {
+        return -1;
+    }
+    let rc = unsafe { fchmod(ofd, mode) };
+    let _ = unsafe { close(ofd) };
+    rc
 }
 
 /// C `chown` → nlist `_chown`.
@@ -789,6 +941,34 @@ pub(crate) unsafe extern "C" fn readdir(dirp: *mut c_void) -> *mut c_void {
     }
 }
 
+/// C `readdir_r` → nlist `_readdir_r` (rustup toolchain scan).
+///
+/// Fills the caller `entry` buffer (Darwin `struct dirent`) and sets `*result`
+/// to `entry`, or to NULL at EOF. Returns 0 on success/EOF.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn readdir_r(
+    dirp: *mut c_void,
+    entry: *mut c_void,
+    result: *mut *mut c_void,
+) -> c_int {
+    if dirp.is_null() || entry.is_null() || result.is_null() {
+        errno::set_errno(22);
+        return 22;
+    }
+    let ent = unsafe { readdir(dirp) };
+    if ent.is_null() {
+        unsafe {
+            *result = core::ptr::null_mut();
+        }
+        return 0;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(ent.cast::<u8>(), entry.cast::<u8>(), DIRENT_SIZE);
+        *result = entry;
+    }
+    0
+}
+
 /// C `dirfd` → nlist `_dirfd`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn dirfd(dirp: *mut c_void) -> c_int {
@@ -857,6 +1037,78 @@ pub(crate) unsafe extern "C" fn wait4(
             ptr_u64(rusage.cast_const()),
         )
     })
+}
+
+/// C `wait3` → nlist `_wait3` (`wait4(-1, …)`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wait3(
+    status: *mut c_int,
+    options: c_int,
+    rusage: *mut c_void,
+) -> c_int {
+    unsafe { wait4(-1, status, options, rusage) }
+}
+
+/// C `catopen` → nlist `_catopen` (no message catalogs).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn catopen(_name: *const c_char, _oflag: c_int) -> *mut c_void {
+    core::ptr::with_exposed_provenance_mut(1)
+}
+
+/// C `catgets` → nlist `_catgets` (return the default string).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn catgets(
+    _catd: *mut c_void,
+    _set_id: c_int,
+    _msg_id: c_int,
+    s: *const c_char,
+) -> *mut c_char {
+    s.cast_mut()
+}
+
+/// C `catclose` → nlist `_catclose`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn catclose(_catd: *mut c_void) -> c_int {
+    0
+}
+
+/// C `crypt` → nlist `_crypt` (static dummy; not a real password hash).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn crypt(_key: *const c_char, salt: *const c_char) -> *mut c_char {
+    static mut OUT: [u8; 16] = *b"xx.............\0";
+    if !salt.is_null() {
+        let a = unsafe { *salt }.cast_unsigned();
+        let b = unsafe { *salt.add(1) }.cast_unsigned();
+        unsafe {
+            OUT[0] = if a == 0 { b'x' } else { a };
+            OUT[1] = if b == 0 { b'x' } else { b };
+        }
+    }
+    unsafe { OUT.as_mut_ptr().cast() }
+}
+
+/// C `alarm` → nlist `_alarm` (no real SIGALRM; remaining time always 0).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn alarm(_seconds: u32) -> u32 {
+    0
+}
+
+/// C `setpriority` → nlist `_setpriority` (soft success).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setpriority(_which: c_int, _who: c_int, _prio: c_int) -> c_int {
+    0
+}
+
+/// C `setutxent` / `endutxent` / `getutxent` → no utmpx database.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn setutxent() {}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn endutxent() {}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getutxent() -> *mut c_void {
+    core::ptr::null_mut()
 }
 
 /// C `setsid` → nlist `_setsid` (new session; used by git maintenance).
@@ -1473,6 +1725,13 @@ pub(crate) unsafe extern "C" fn kh_ioctl_impl(fd: c_int, request: u64, arg: u64)
     })
 }
 
+/// C `sched_yield` → nlist `_sched_yield` (rustup download / thread backoff).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn sched_yield() -> c_int {
+    let _ = unsafe { sys::helper0(crate::kh_core::helpers::KH_HELPER_YIELD) };
+    0
+}
+
 /// C `usleep` → nlist `_usleep` (yield-based soft sleep for curl G3 cleanup).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn usleep(usec: u32) -> c_int {
@@ -1919,9 +2178,13 @@ pub(crate) unsafe extern "C" fn __darwin_check_fd_set_overflow(
 }
 
 /// C `setlocale` → nlist `_setlocale` (always "C").
+///
+/// tcsh/`csh` call this before walking `_environ`; seed so `environ` is not
+/// NULL (`blk2short(environ)` SEGV).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> *mut c_char {
     static mut C_LOCALE: [u8; 2] = *b"C\0";
+    soft_env_seed_defaults();
     core::ptr::addr_of_mut!(C_LOCALE).cast()
 }
 
@@ -1946,9 +2209,8 @@ static mut ENVIRON_PTRS: [*mut c_char; SOFT_ENV_SLOTS + 1] =
 
 /// C `environ` → nlist `_environ` (`char **` — the *variable*, not the vector).
 ///
-/// Starts null; first `getenv`/`setenv`/`_NSGetEnviron` seeds defaults and
-/// points this at [`ENVIRON_PTRS`]. A null value is also safe: git skips the
-/// walk when `environ == NULL`.
+/// Starts null; `setlocale` / `getenv` / `setenv` seed defaults and point
+/// this at [`ENVIRON_PTRS`]. `csh` reads `_environ` right after `setlocale`.
 #[unsafe(no_mangle)]
 pub(crate) static mut environ: *mut *mut c_char = core::ptr::null_mut();
 
@@ -2520,6 +2782,26 @@ pub(crate) unsafe extern "C" fn getegid() -> u32 {
     }
 }
 
+/// C `getgroups` → nlist `_getgroups` (primary gid only).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getgroups(gidsetsize: c_int, grouplist: *mut u32) -> c_int {
+    if gidsetsize < 0 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    if gidsetsize == 0 {
+        return 1;
+    }
+    if grouplist.is_null() {
+        errno::set_errno(14);
+        return -1;
+    }
+    unsafe {
+        grouplist.write(getgid());
+    }
+    1
+}
+
 /// C `setvbuf` → nlist `_setvbuf` (no buffering).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn setvbuf(
@@ -2555,6 +2837,22 @@ pub(crate) unsafe extern "C" fn clock_gettime(clock_id: c_int, tp: *mut c_void) 
             .copy_from_nonoverlapping(nsec.to_le_bytes().as_ptr(), 8);
     }
     0
+}
+
+/// Darwin `clock_gettime_nsec_np` → nlist `_clock_gettime_nsec_np` (ns since epoch-ish).
+///
+/// rustup uses this after a writable `poll` on the download socket.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn clock_gettime_nsec_np(_clock_id: c_int) -> u64 {
+    let mut tv = [0_u8; 16];
+    let ret = unsafe { sys::syscall2(SYS_GETTIMEOFDAY, ptr_u64(tv.as_mut_ptr().cast()), 0) };
+    if ret < 0 {
+        return 0;
+    }
+    let sec = u64::from_le_bytes([tv[0], tv[1], tv[2], tv[3], tv[4], tv[5], tv[6], tv[7]]);
+    let usec = u64::from(u32::from_le_bytes([tv[8], tv[9], tv[10], tv[11]]));
+    sec.saturating_mul(1_000_000_000)
+        .saturating_add(usec.saturating_mul(1_000))
 }
 
 /// Darwin `mach_absolute_time` → nlist `_mach_absolute_time`.
@@ -2779,10 +3077,123 @@ pub(crate) unsafe extern "C" fn getlogin() -> *mut c_char {
     core::ptr::addr_of_mut!(NAME).cast()
 }
 
-/// C `getpwuid` / `getgrgid` → null (no passwd DB).
+/// Darwin `struct passwd` (arm64; public `pwd.h`, no `pw_fields` on current SDK).
+#[repr(C)]
+#[allow(clippy::struct_field_names)]
+struct Passwd {
+    pw_name: *mut c_char,
+    pw_passwd: *mut c_char,
+    pw_uid: u32,
+    pw_gid: u32,
+    pw_change: i64,
+    pw_class: *mut c_char,
+    pw_gecos: *mut c_char,
+    pw_dir: *mut c_char,
+    pw_shell: *mut c_char,
+    pw_expire: i64,
+}
+
+static mut PW_STORE: Passwd = Passwd {
+    pw_name: core::ptr::null_mut(),
+    pw_passwd: core::ptr::null_mut(),
+    pw_uid: 0,
+    pw_gid: 0,
+    pw_change: 0,
+    pw_class: core::ptr::null_mut(),
+    pw_gecos: core::ptr::null_mut(),
+    pw_dir: core::ptr::null_mut(),
+    pw_shell: core::ptr::null_mut(),
+    pw_expire: 0,
+};
+static mut PW_NAME: [u8; 64] = [0; 64];
+static mut PW_DIR: [u8; 256] = [0; 256];
+static mut PW_SHELL: [u8; 16] = *b"/bin/zsh\0\0\0\0\0\0\0\0";
+static mut PW_EMPTY: [u8; 1] = [0];
+static mut PW_PASS: [u8; 2] = *b"*\0";
+static mut PW_WALKED: bool = false;
+
+fn copy_cstr_to(dst: &mut [u8], src: *const c_char, fallback: &[u8]) {
+    dst.fill(0);
+    if src.is_null() {
+        let n = fallback.len().min(dst.len().saturating_sub(1));
+        if n > 0 {
+            dst[..n].copy_from_slice(&fallback[..n]);
+        }
+        return;
+    }
+    let n = unsafe { super::stdio::strlen(src) };
+    let n = n.min(dst.len().saturating_sub(1));
+    if n > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.as_mut_ptr(), n);
+        }
+    }
+}
+
+fn passwd_fill_store() -> *mut Passwd {
+    soft_env_seed_defaults();
+    let uid = unsafe { getuid() };
+    let gid = unsafe { getgid() };
+    let login = unsafe { getlogin() };
+    let home = unsafe { getenv(c"HOME".as_ptr()) };
+    unsafe {
+        copy_cstr_to(&mut PW_NAME, login, b"kakehashi");
+        copy_cstr_to(&mut PW_DIR, home, b"/var/root");
+        PW_STORE = Passwd {
+            pw_name: PW_NAME.as_mut_ptr().cast(),
+            pw_passwd: PW_PASS.as_mut_ptr().cast(),
+            pw_uid: uid,
+            pw_gid: gid,
+            pw_change: 0,
+            pw_class: PW_EMPTY.as_mut_ptr().cast(),
+            pw_gecos: PW_NAME.as_mut_ptr().cast(),
+            pw_dir: PW_DIR.as_mut_ptr().cast(),
+            pw_shell: PW_SHELL.as_mut_ptr().cast(),
+            pw_expire: 0,
+        };
+        core::ptr::addr_of_mut!(PW_STORE)
+    }
+}
+
+fn cstr_eq(left: *const c_char, right: *const c_char) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+    let mut idx = 0_usize;
+    loop {
+        let lhs = unsafe { *left.add(idx) };
+        let rhs = unsafe { *right.add(idx) };
+        if lhs != rhs {
+            return false;
+        }
+        if lhs == 0 {
+            return true;
+        }
+        idx = idx.saturating_add(1);
+        if idx > 256 {
+            return false;
+        }
+    }
+}
+
+/// C `getpwuid` → nlist `_getpwuid`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getpwuid(_uid: u32) -> *mut c_void {
-    core::ptr::null_mut()
+    passwd_fill_store().cast()
+}
+
+/// C `getpwnam` → nlist `_getpwnam`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpwnam(name: *const c_char) -> *mut c_void {
+    if name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let pw = passwd_fill_store();
+    if cstr_eq(name, unsafe { (*pw).pw_name }) {
+        pw.cast()
+    } else {
+        core::ptr::null_mut()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2792,33 +3203,131 @@ pub(crate) unsafe extern "C" fn getgrgid(_gid: u32) -> *mut c_void {
 
 /// C `setpwent` → nlist `_setpwent`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn setpwent() {}
+pub(crate) unsafe extern "C" fn setpwent() {
+    unsafe {
+        PW_WALKED = false;
+    }
+}
 
 /// C `endpwent` → nlist `_endpwent`.
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn endpwent() {}
-
-/// C `getpwent` → nlist `_getpwent` (no passwd DB).
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn getpwent() -> *mut c_void {
-    core::ptr::null_mut()
+pub(crate) unsafe extern "C" fn endpwent() {
+    unsafe {
+        PW_WALKED = true;
+    }
 }
 
-/// C `getpwuid_r` → nlist `_getpwuid_r` (no passwd DB; return 0 with null result).
+/// C `getpwent` → nlist `_getpwent`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpwent() -> *mut c_void {
+    unsafe {
+        if PW_WALKED {
+            return core::ptr::null_mut();
+        }
+        PW_WALKED = true;
+    }
+    passwd_fill_store().cast()
+}
+
+fn passwd_copy_to(
+    dst: *mut Passwd,
+    buf: *mut c_char,
+    buflen: usize,
+) -> Result<(), c_int> {
+    if dst.is_null() || buf.is_null() {
+        return Err(EINVAL);
+    }
+    let src = passwd_fill_store();
+    let name = unsafe { (*src).pw_name };
+    let dir = unsafe { (*src).pw_dir };
+    let shell = unsafe { (*src).pw_shell };
+    let nlen = unsafe { super::stdio::strlen(name) }.saturating_add(1);
+    let dlen = unsafe { super::stdio::strlen(dir) }.saturating_add(1);
+    let slen = unsafe { super::stdio::strlen(shell) }.saturating_add(1);
+    let need = nlen.saturating_add(dlen).saturating_add(slen).saturating_add(4);
+    if buflen < need {
+        return Err(34); // ERANGE
+    }
+    let mut off = 0_usize;
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.cast::<u8>(), buf.add(off).cast::<u8>(), nlen);
+        let name_p = buf.add(off);
+        off = off.saturating_add(nlen);
+        core::ptr::copy_nonoverlapping(dir.cast::<u8>(), buf.add(off).cast::<u8>(), dlen);
+        let dir_p = buf.add(off);
+        off = off.saturating_add(dlen);
+        core::ptr::copy_nonoverlapping(shell.cast::<u8>(), buf.add(off).cast::<u8>(), slen);
+        let shell_p = buf.add(off);
+        off = off.saturating_add(slen);
+        buf.add(off).write(0);
+        let empty_p = buf.add(off);
+        off = off.saturating_add(1);
+        buf.add(off).write(b'*'.cast_signed());
+        buf.add(off.saturating_add(1)).write(0);
+        let pass_p = buf.add(off);
+        dst.write(Passwd {
+            pw_name: name_p,
+            pw_passwd: pass_p,
+            pw_uid: (*src).pw_uid,
+            pw_gid: (*src).pw_gid,
+            pw_change: 0,
+            pw_class: empty_p,
+            pw_gecos: name_p,
+            pw_dir: dir_p,
+            pw_shell: shell_p,
+            pw_expire: 0,
+        });
+    }
+    Ok(())
+}
+
+/// C `getpwuid_r` → nlist `_getpwuid_r`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn getpwuid_r(
     _uid: u32,
-    _pwd: *mut c_void,
-    _buf: *mut c_char,
-    _buflen: usize,
+    pwd: *mut c_void,
+    buf: *mut c_char,
+    buflen: usize,
     result: *mut *mut c_void,
 ) -> c_int {
-    if !result.is_null() {
-        unsafe {
-            result.write(core::ptr::null_mut());
+    match passwd_copy_to(pwd.cast(), buf, buflen) {
+        Ok(()) => {
+            if !result.is_null() {
+                unsafe {
+                    result.write(pwd);
+                }
+            }
+            0
+        }
+        Err(e) => {
+            if !result.is_null() {
+                unsafe {
+                    result.write(core::ptr::null_mut());
+                }
+            }
+            e
         }
     }
-    0
+}
+
+/// C `getpwnam_r` → nlist `_getpwnam_r`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getpwnam_r(
+    name: *const c_char,
+    pwd: *mut c_void,
+    buf: *mut c_char,
+    buflen: usize,
+    result: *mut *mut c_void,
+) -> c_int {
+    if name.is_null() || unsafe { getpwnam(name) }.is_null() {
+        if !result.is_null() {
+            unsafe {
+                result.write(core::ptr::null_mut());
+            }
+        }
+        return 0;
+    }
+    unsafe { getpwuid_r(0, pwd, buf, buflen, result) }
 }
 
 // ── mmap surface (OpenSSL / curl may map pages) ─────────────────────────────
@@ -2914,6 +3423,152 @@ static mut MACH_TASK_SELF: usize = 1;
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mach_task_self() -> usize {
     1
+}
+
+// Mach `semaphore_*` (libpthread / rust std). Ports are 1-based table indices.
+const MACH_SEM_CAP: usize = 64;
+const KERN_FAILURE: c_int = 5;
+const KERN_OPERATION_TIMED_OUT: c_int = 49;
+
+static MACH_SEM_USED: [AtomicBool; MACH_SEM_CAP] = [const { AtomicBool::new(false) }; MACH_SEM_CAP];
+static MACH_SEM_COUNT: [AtomicI32; MACH_SEM_CAP] = [const { AtomicI32::new(0) }; MACH_SEM_CAP];
+static MACH_SEM_PARK: [AtomicU32; MACH_SEM_CAP] = [const { AtomicU32::new(0) }; MACH_SEM_CAP];
+
+fn mach_sem_idx(port: u32) -> Option<usize> {
+    let i = usize::try_from(port).ok()?.checked_sub(1)?;
+    if i < MACH_SEM_CAP && MACH_SEM_USED[i].load(Ordering::Acquire) {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+fn mach_sem_park(i: usize, expected: u32) {
+    let addr = u64::try_from(MACH_SEM_PARK[i].as_ptr().addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_PARK, addr, u64::from(expected)) };
+}
+
+fn mach_sem_wake(i: usize) {
+    let addr = u64::try_from(MACH_SEM_PARK[i].as_ptr().addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_WAKE, addr, 1) };
+}
+
+/// `semaphore_create(task, semaphore, policy, value)` → nlist `_semaphore_create`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_create(
+    _task: usize,
+    semaphore: *mut u32,
+    _policy: c_int,
+    value: c_int,
+) -> c_int {
+    if semaphore.is_null() || value < 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    for i in 0..MACH_SEM_CAP {
+        if MACH_SEM_USED[i]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            MACH_SEM_COUNT[i].store(value, Ordering::Release);
+            MACH_SEM_PARK[i].store(0, Ordering::Release);
+            let port = u32::try_from(i.saturating_add(1)).unwrap_or(1);
+            unsafe {
+                semaphore.write(port);
+            }
+            return KERN_SUCCESS;
+        }
+    }
+    KERN_FAILURE
+}
+
+/// `semaphore_destroy(task, semaphore)`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_destroy(_task: usize, semaphore: u32) -> c_int {
+    let Some(i) = mach_sem_idx(semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    MACH_SEM_USED[i].store(false, Ordering::Release);
+    MACH_SEM_PARK[i].fetch_add(1, Ordering::AcqRel);
+    mach_sem_wake(i);
+    KERN_SUCCESS
+}
+
+/// `semaphore_signal(semaphore)`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_signal(semaphore: u32) -> c_int {
+    let Some(i) = mach_sem_idx(semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    MACH_SEM_COUNT[i].fetch_add(1, Ordering::AcqRel);
+    MACH_SEM_PARK[i].fetch_add(1, Ordering::AcqRel);
+    mach_sem_wake(i);
+    KERN_SUCCESS
+}
+
+/// `semaphore_signal_all(semaphore)`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_signal_all(semaphore: u32) -> c_int {
+    let Some(i) = mach_sem_idx(semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    MACH_SEM_COUNT[i].fetch_add(1, Ordering::AcqRel);
+    MACH_SEM_PARK[i].fetch_add(1, Ordering::AcqRel);
+    let addr = u64::try_from(MACH_SEM_PARK[i].as_ptr().addr()).unwrap_or(0);
+    let _ = unsafe { sys::helper2(KH_HELPER_WAKE, addr, 0) };
+    KERN_SUCCESS
+}
+
+/// `semaphore_wait(semaphore)`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_wait(semaphore: u32) -> c_int {
+    let Some(i) = mach_sem_idx(semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    loop {
+        let cur = MACH_SEM_COUNT[i].load(Ordering::Acquire);
+        if cur > 0
+            && MACH_SEM_COUNT[i]
+                .compare_exchange(cur, cur.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return KERN_SUCCESS;
+        }
+        if !MACH_SEM_USED[i].load(Ordering::Acquire) {
+            return KERN_INVALID_ARGUMENT;
+        }
+        let park_gen = MACH_SEM_PARK[i].load(Ordering::Acquire);
+        if MACH_SEM_COUNT[i].load(Ordering::Acquire) > 0 {
+            continue;
+        }
+        mach_sem_park(i, park_gen);
+    }
+}
+
+/// `semaphore_timedwait(semaphore, wait_time)` — one park; timeout if still empty.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn semaphore_timedwait(semaphore: u32, _wait_time: u64) -> c_int {
+    let Some(i) = mach_sem_idx(semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let cur = MACH_SEM_COUNT[i].load(Ordering::Acquire);
+    if cur > 0
+        && MACH_SEM_COUNT[i]
+            .compare_exchange(cur, cur.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        return KERN_SUCCESS;
+    }
+    let park_gen = MACH_SEM_PARK[i].load(Ordering::Acquire);
+    mach_sem_park(i, park_gen);
+    let cur = MACH_SEM_COUNT[i].load(Ordering::Acquire);
+    if cur > 0
+        && MACH_SEM_COUNT[i]
+            .compare_exchange(cur, cur.saturating_sub(1), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        return KERN_SUCCESS;
+    }
+    KERN_OPERATION_TIMED_OUT
 }
 
 /// `vm_page_mask` data → page_size-1 (page size also in `ld_surface::vm_page_size`).
@@ -4269,4 +4924,375 @@ pub(crate) unsafe extern "C" fn getopt_long_only(
     longindex: *mut c_int,
 ) -> c_int {
     unsafe { getopt_long_inner(argc, argv, optstring, longopts, longindex, true) }
+}
+
+// ── getbsize / proc_pidinfo ─────────────────────────────────────────────────
+
+const GETBSIZE_DEFAULT: i64 = 512;
+static mut GETBSIZE_HDR: [u8; 32] = [0; 32];
+
+fn parse_blocksize(s: *const c_char) -> Option<i64> {
+    if s.is_null() {
+        return None;
+    }
+    let mut i = 0_usize;
+    let mut n: i64 = 0;
+    let mut seen = false;
+    loop {
+        let b = unsafe { *s.add(i) } as u8;
+        if b == 0 {
+            break;
+        }
+        if b.is_ascii_digit() {
+            seen = true;
+            n = n.saturating_mul(10).saturating_add(i64::from(b - b'0'));
+        } else {
+            let mul: i64 = match b {
+                b'k' | b'K' => 1024,
+                b'm' | b'M' => 1024 * 1024,
+                b'g' | b'G' => 1024 * 1024 * 1024,
+                _ => return None,
+            };
+            if unsafe { *s.add(i.saturating_add(1)) } != 0 {
+                return None;
+            }
+            n = n.saturating_mul(mul);
+            seen = true;
+            break;
+        }
+        i = i.saturating_add(1);
+        if i > 16 {
+            return None;
+        }
+    }
+    if !seen || n <= 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+fn write_bsize_hdr(bytes: i64) -> usize {
+    let (n, suf): (i64, &[u8]) = if bytes >= 1024 * 1024 * 1024 && bytes % (1024 * 1024 * 1024) == 0
+    {
+        (bytes / (1024 * 1024 * 1024), b"G-blocks")
+    } else if bytes >= 1024 * 1024 && bytes % (1024 * 1024) == 0 {
+        (bytes / (1024 * 1024), b"M-blocks")
+    } else if bytes >= 1024 && bytes % 1024 == 0 {
+        (bytes / 1024, b"K-blocks")
+    } else {
+        (bytes, b"-blocks")
+    };
+    let mut tmp = [0_u8; 32];
+    let mut val = n;
+    let mut digits = [0_u8; 20];
+    let mut nd = 0_usize;
+    if val == 0 {
+        digits[0] = b'0';
+        nd = 1;
+    } else {
+        while val > 0 && nd < digits.len() {
+            digits[nd] = b'0' + u8::try_from((val % 10) as u32).unwrap_or(0);
+            nd = nd.saturating_add(1);
+            val /= 10;
+        }
+    }
+    let mut o = 0_usize;
+    while nd > 0 {
+        nd -= 1;
+        tmp[o] = digits[nd];
+        o = o.saturating_add(1);
+    }
+    for &b in suf {
+        if o < tmp.len() {
+            tmp[o] = b;
+            o = o.saturating_add(1);
+        }
+    }
+    if o < tmp.len() {
+        tmp[o] = 0;
+    }
+    unsafe {
+        GETBSIZE_HDR = [0; 32];
+        let ncopy = o.saturating_add(1).min(GETBSIZE_HDR.len());
+        GETBSIZE_HDR[..ncopy].copy_from_slice(&tmp[..ncopy]);
+    }
+    o
+}
+
+/// C `getbsize` → nlist `_getbsize` (BSD; `ls` / `du` header + block size).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getbsize(
+    headerlenp: *mut c_int,
+    blocksizep: *mut i64,
+) -> *mut c_char {
+    let key = b"BLOCKSIZE\0";
+    let env = unsafe { getenv(key.as_ptr().cast()) };
+    let bytes = parse_blocksize(env).unwrap_or(GETBSIZE_DEFAULT);
+    let len = write_bsize_hdr(bytes);
+    if !headerlenp.is_null() {
+        unsafe {
+            *headerlenp = c_int::try_from(len).unwrap_or(0);
+        }
+    }
+    if !blocksizep.is_null() {
+        unsafe {
+            *blocksizep = bytes;
+        }
+    }
+    unsafe { GETBSIZE_HDR.as_mut_ptr().cast() }
+}
+
+const PROC_PIDTASKALLINFO: c_int = 2;
+const PROC_PIDTBSDINFO: c_int = 3;
+const PROC_PIDTASKINFO: c_int = 4;
+const PROC_PIDT_SHORTBSDINFO: c_int = 13;
+const PROC_PIDPATHINFO: c_int = 11;
+const PROC_PIDVNODEPATHINFO: c_int = 9;
+const PROC_FLAG_LP64: u32 = 0x10;
+const MAXCOMLEN: usize = 16;
+const BSDINFO_SIZE: usize = 136;
+const TASKINFO_SIZE: usize = 96;
+const SHORTBSD_SIZE: usize = 64;
+const MAXPATHLEN: usize = 1024;
+
+fn put_u32_at(buf: &mut [u8], off: usize, v: u32) {
+    if let Some(slot) = buf.get_mut(off..off.saturating_add(4)) {
+        slot.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn put_i32_at(buf: &mut [u8], off: usize, v: i32) {
+    if let Some(slot) = buf.get_mut(off..off.saturating_add(4)) {
+        slot.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+unsafe fn fill_comm(dst: &mut [u8]) {
+    let name = b"kh-guest";
+    let n = name.len().min(dst.len().saturating_sub(1));
+    if let Some(slot) = dst.get_mut(..n) {
+        slot.copy_from_slice(&name[..n]);
+    }
+}
+
+unsafe fn fill_bsdinfo(buf: &mut [u8]) {
+    let pid = unsafe { getpid() }.cast_unsigned();
+    let ppid = unsafe { getppid() }.cast_unsigned();
+    let uid = unsafe { getuid() };
+    let gid = unsafe { getgid() };
+    let euid = unsafe { geteuid() };
+    let egid = unsafe { getegid() };
+    put_u32_at(buf, 0, PROC_FLAG_LP64);
+    put_u32_at(buf, 4, 2);
+    put_u32_at(buf, 12, pid);
+    put_u32_at(buf, 16, ppid);
+    put_u32_at(buf, 20, uid);
+    put_u32_at(buf, 24, gid);
+    put_u32_at(buf, 28, uid);
+    put_u32_at(buf, 32, gid);
+    put_u32_at(buf, 36, euid);
+    put_u32_at(buf, 40, egid);
+    if let Some(comm) = buf.get_mut(48..48 + MAXCOMLEN) {
+        unsafe {
+            fill_comm(comm);
+        }
+    }
+    if let Some(nm) = buf.get_mut(48 + MAXCOMLEN..48 + MAXCOMLEN * 3) {
+        unsafe {
+            fill_comm(nm);
+        }
+    }
+    put_u32_at(buf, 96, 3);
+    put_u32_at(buf, 100, pid);
+}
+
+unsafe fn fill_taskinfo(buf: &mut [u8]) {
+    put_i32_at(buf, 80, 1);
+    put_i32_at(buf, 84, 1);
+}
+
+unsafe fn copy_pidpath(dst: *mut u8, cap: usize) -> usize {
+    if dst.is_null() || cap == 0 {
+        return 0;
+    }
+    let ret = unsafe {
+        sys::helper2(
+            KH_HELPER_EXECUTABLE_PATH,
+            ptr_u64(dst.cast()),
+            u64::try_from(cap).unwrap_or(0),
+        )
+    };
+    if ret <= 0 {
+        let fallback = b"/usr/bin/kh-guest";
+        let n = fallback.len().min(cap.saturating_sub(1));
+        unsafe {
+            core::ptr::copy_nonoverlapping(fallback.as_ptr(), dst, n);
+            dst.add(n).write(0);
+        }
+        return n;
+    }
+    usize::try_from(ret).unwrap_or(0)
+}
+
+/// C `proc_pidinfo` → nlist `_proc_pidinfo` (libproc; `git` process queries).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn proc_pidinfo(
+    pid: c_int,
+    flavor: c_int,
+    _arg: u64,
+    buffer: *mut c_void,
+    buffersize: c_int,
+) -> c_int {
+    let self_pid = unsafe { getpid() };
+    if pid != 0 && pid != self_pid {
+        errno::set_errno(3);
+        return 0;
+    }
+    if buffersize <= 0 {
+        let n = match flavor {
+            PROC_PIDTBSDINFO => BSDINFO_SIZE,
+            PROC_PIDTASKINFO => TASKINFO_SIZE,
+            PROC_PIDTASKALLINFO => BSDINFO_SIZE.saturating_add(TASKINFO_SIZE),
+            PROC_PIDT_SHORTBSDINFO => SHORTBSD_SIZE,
+            PROC_PIDPATHINFO => MAXPATHLEN,
+            PROC_PIDVNODEPATHINFO => MAXPATHLEN.saturating_mul(2).saturating_add(4),
+            _ => 0,
+        };
+        return c_int::try_from(n).unwrap_or(0);
+    }
+    if buffer.is_null() {
+        errno::set_errno(14);
+        return 0;
+    }
+    let cap = usize::try_from(buffersize).unwrap_or(0);
+    match flavor {
+        PROC_PIDTBSDINFO => {
+            if cap < BSDINFO_SIZE {
+                errno::set_errno(ENOMEM);
+                return 0;
+            }
+            let mut raw = [0_u8; BSDINFO_SIZE];
+            unsafe {
+                fill_bsdinfo(&mut raw);
+                core::ptr::copy_nonoverlapping(raw.as_ptr(), buffer.cast::<u8>(), BSDINFO_SIZE);
+            }
+            c_int::try_from(BSDINFO_SIZE).unwrap_or(0)
+        }
+        PROC_PIDTASKINFO => {
+            if cap < TASKINFO_SIZE {
+                errno::set_errno(ENOMEM);
+                return 0;
+            }
+            let mut raw = [0_u8; TASKINFO_SIZE];
+            unsafe {
+                fill_taskinfo(&mut raw);
+                core::ptr::copy_nonoverlapping(raw.as_ptr(), buffer.cast::<u8>(), TASKINFO_SIZE);
+            }
+            c_int::try_from(TASKINFO_SIZE).unwrap_or(0)
+        }
+        PROC_PIDTASKALLINFO => {
+            let need = BSDINFO_SIZE.saturating_add(TASKINFO_SIZE);
+            if cap < need {
+                errno::set_errno(ENOMEM);
+                return 0;
+            }
+            let mut raw = [0_u8; BSDINFO_SIZE + TASKINFO_SIZE];
+            unsafe {
+                fill_bsdinfo(&mut raw[..BSDINFO_SIZE]);
+                fill_taskinfo(&mut raw[BSDINFO_SIZE..]);
+                core::ptr::copy_nonoverlapping(raw.as_ptr(), buffer.cast::<u8>(), need);
+            }
+            c_int::try_from(need).unwrap_or(0)
+        }
+        PROC_PIDT_SHORTBSDINFO => {
+            if cap < SHORTBSD_SIZE {
+                errno::set_errno(ENOMEM);
+                return 0;
+            }
+            let mut raw = [0_u8; SHORTBSD_SIZE];
+            let p = unsafe { getpid() }.cast_unsigned();
+            let pp = unsafe { getppid() }.cast_unsigned();
+            put_u32_at(&mut raw, 0, p);
+            put_u32_at(&mut raw, 4, pp);
+            put_u32_at(&mut raw, 8, p);
+            put_u32_at(&mut raw, 12, 2);
+            if let Some(comm) = raw.get_mut(16..16 + MAXCOMLEN) {
+                unsafe {
+                    fill_comm(comm);
+                }
+            }
+            put_u32_at(&mut raw, 32, PROC_FLAG_LP64);
+            put_u32_at(&mut raw, 36, unsafe { getuid() });
+            put_u32_at(&mut raw, 40, unsafe { getgid() });
+            unsafe {
+                core::ptr::copy_nonoverlapping(raw.as_ptr(), buffer.cast::<u8>(), SHORTBSD_SIZE);
+            }
+            c_int::try_from(SHORTBSD_SIZE).unwrap_or(0)
+        }
+        PROC_PIDPATHINFO => {
+            let n = unsafe { copy_pidpath(buffer.cast(), cap) };
+            c_int::try_from(n.saturating_add(1)).unwrap_or(0)
+        }
+        PROC_PIDVNODEPATHINFO => {
+            // Soft: zeroed vnodepathinfo; cwd string in the first path slot
+            // after `proc_vnodeinfo` (offset 152 on Darwin: two `vnode_info`
+            // 152-byte prefixes — write cwd at 152 if the buffer is large).
+            unsafe {
+                crate::dylib::libsystem_c::stdio::bzero(buffer, cap);
+            }
+            if cap > 152 {
+                let _ = unsafe { copy_pidpath(buffer.cast::<u8>().add(152), cap.saturating_sub(152)) };
+            }
+            c_int::try_from(cap.min(1024)).unwrap_or(0)
+        }
+        _ => {
+            errno::set_errno(ENOSYS);
+            0
+        }
+    }
+}
+
+/// C `proc_pidpath` → nlist `_proc_pidpath`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn proc_pidpath(
+    pid: c_int,
+    buffer: *mut c_void,
+    buffersize: u32,
+) -> c_int {
+    let self_pid = unsafe { getpid() };
+    if pid != 0 && pid != self_pid {
+        errno::set_errno(3);
+        return 0;
+    }
+    let cap = usize::try_from(buffersize).unwrap_or(0);
+    let n = unsafe { copy_pidpath(buffer.cast(), cap) };
+    c_int::try_from(n).unwrap_or(0)
+}
+
+/// C `proc_name` → nlist `_proc_name`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn proc_name(
+    pid: c_int,
+    buffer: *mut c_void,
+    buffersize: u32,
+) -> c_int {
+    let self_pid = unsafe { getpid() };
+    if pid != 0 && pid != self_pid {
+        errno::set_errno(3);
+        return 0;
+    }
+    if buffer.is_null() || buffersize == 0 {
+        return 0;
+    }
+    let cap = usize::try_from(buffersize).unwrap_or(0);
+    let mut tmp = [0_u8; MAXCOMLEN];
+    unsafe {
+        fill_comm(&mut tmp);
+        let n = tmp.iter().position(|&b| b == 0).unwrap_or(tmp.len());
+        let copy = n.min(cap.saturating_sub(1));
+        core::ptr::copy_nonoverlapping(tmp.as_ptr(), buffer.cast::<u8>(), copy);
+        buffer.cast::<u8>().add(copy).write(0);
+        c_int::try_from(copy).unwrap_or(0)
+    }
 }

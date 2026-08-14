@@ -107,6 +107,23 @@ pub(crate) unsafe extern "C" fn arc4random_buf(buf: *mut c_void, nbytes: usize) 
     }
 }
 
+/// C `getentropy` → nlist `_getentropy` (rustup TLS / rustls).
+///
+/// Darwin rejects `buflen > 256`. Soft fill via [`arc4random_buf`].
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn getentropy(buf: *mut c_void, buflen: usize) -> c_int {
+    if buflen > 256 {
+        errno::set_errno(EINVAL);
+        return -1;
+    }
+    if buflen > 0 && buf.is_null() {
+        errno::set_errno(EFAULT);
+        return -1;
+    }
+    unsafe { arc4random_buf(buf, buflen) };
+    0
+}
+
 /// C `gethostname` → `"kakehashi"`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn gethostname(name: *mut c_char, len: usize) -> c_int {
@@ -715,8 +732,8 @@ struct DarwinAddrinfo {
     ai_next: *mut DarwinAddrinfo,
 }
 
-/// Packed record from host helper (fixed 40 bytes).
-const PACKED_REC: usize = 40;
+/// Packed record from host helper (fixed 48 bytes: 16-byte header + 32-byte addr).
+const PACKED_REC: usize = 48;
 const PACKED_MAX: usize = 16;
 const PACKED_BUF: usize = 4_usize.saturating_add(PACKED_MAX.saturating_mul(PACKED_REC));
 
@@ -813,7 +830,9 @@ pub(crate) unsafe extern "C" fn getaddrinfo(
         let st = c_int::try_from(unsafe { read_u32_le(rec.add(4)) }).unwrap_or(0);
         let proto = c_int::try_from(unsafe { read_u32_le(rec.add(8)) }).unwrap_or(0);
         let alen_u = unsafe { read_u32_le(rec.add(12)) };
-        let alen = usize::try_from(alen_u).unwrap_or(0).min(24);
+        // Darwin `sockaddr_in` is 16, `sockaddr_in6` is 28. Older packs used 24
+        // and truncated IPv6 — rust std then asserts `len >= size_of::<sockaddr_in6>()`.
+        let alen = usize::try_from(alen_u).unwrap_or(0).min(32);
 
         let ai_raw = unsafe { malloc(core::mem::size_of::<DarwinAddrinfo>()) };
         let addr_raw = unsafe { malloc(alen.max(16)) };

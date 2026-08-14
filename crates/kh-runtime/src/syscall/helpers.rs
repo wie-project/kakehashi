@@ -15,7 +15,8 @@ use crate::mem::registry_check_range;
 use crate::process as proc_state;
 
 use super::common::{
-    EBADF, EFAULT, EINVAL, ENOSYS, SyscallArgs, SyscallResult, guest_slice, guest_write, reg_as_i32,
+    EBADF, EFAULT, EINVAL, ENOSYS, EPERM, SyscallArgs, SyscallResult, guest_slice, guest_write,
+    reg_as_i32,
 };
 
 // ── Opt-in park/wake stats (`KAKEHASHI_FUTEX_STATS=1`) ───────────────────────
@@ -185,9 +186,10 @@ pub(crate) const KH_HELPER_WAKE: u32 = KH_HELPER_BASE | 7;
 /// `x2` = Darwin `AF_*` preference, `x3` = out buffer VA, `x4` = capacity,
 /// `x5` = preferred socktype (0 → any).
 ///
-/// Buffer layout: `u32 count` then up to N records of 40 bytes:
-/// `family_darwin:u32, socktype:u32, protocol:u32, addrlen:u32, addr[24]`.
+/// Buffer layout: `u32 count` then up to N records of 48 bytes:
+/// `family_darwin:u32, socktype:u32, protocol:u32, addrlen:u32, addr[32]`.
 /// Addr bytes are **Darwin** sockaddr layout (sa_len + sa_family + …).
+/// `addr[32]` holds `sockaddr_in` (16) or `sockaddr_in6` (28).
 pub(crate) const KH_HELPER_GETADDRINFO: u32 = KH_HELPER_BASE | 8;
 
 /// TLS cert chain verify against the bottle CA bundle (SecTrust soft path).
@@ -301,9 +303,14 @@ pub(crate) const KH_HELPER_TLV_COPY: u32 = KH_HELPER_BASE | 0x17;
 /// strings. Returns total bytes written (incl. NULs and the count), or 0.
 pub(crate) const KH_HELPER_ARGV: u32 = KH_HELPER_BASE | 0x18;
 
+/// Wrap an already-connected guest TCP fd with rustls (SecureTransport).
+///
+/// `x0` = guest fd, `x1` = hostname C string. Returns 0 or `-errno`.
+pub(crate) const KH_HELPER_TLS_WRAP: u32 = KH_HELPER_BASE | 0x19;
+
 const CSTR_MAX: usize = 1 << 20;
 const NAME_MAX: usize = 255;
-const GAI_REC: usize = 40;
+const GAI_REC: usize = 48;
 const GAI_MAX: usize = 16;
 const VERIFY_MAX_BUF: usize = 1 << 20;
 const VERIFY_MAX_CERTS: usize = 16;
@@ -341,6 +348,7 @@ pub(crate) fn dispatch_helper(args: SyscallArgs) -> SyscallResult {
         KH_HELPER_MAIN_STACK => handle_main_stack(args),
         KH_HELPER_TLV_COPY => handle_tlv_copy(args),
         KH_HELPER_ARGV => handle_argv(args),
+        KH_HELPER_TLS_WRAP => handle_tls_wrap(args),
         _ => SyscallResult::err("kh_helper", EINVAL),
     }
 }
@@ -360,27 +368,63 @@ fn handle_dlopen(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     };
     let guest_path = resolve_dlopen_guest_path(&raw_path);
-    let host = bottle::translate_path(&guest_path).ok();
-    if let Some(h) = crate::dyld_table::dlopen_lookup(host.as_deref(), &guest_path) {
-        // Real handle: `otool-classic` `dlsym`s `LLVMCreateDisasm`. `lto_*`
-        // plugin APIs stay blocked in `handle_dlsym` (ld `-lto_library`).
-        return SyscallResult::ok(name, h);
-    }
-    // First open of a file that was not in the startup image set.
-    // Do **not** on-demand-map `libLTO.dylib` here: a mid-run bind of that
-    // ~150 MiB image SIGSEGVs (TEXT RX). `otool -t -v` seeds it at load.
-    if guest_path.ends_with("libLTO.dylib") {
-        tracing::debug!(guest = %guest_path, "dlopen: skip on-demand libLTO");
-        return SyscallResult::ok(name, 0);
-    }
-    if let Some(hp) = host.as_deref()
-        && hp.is_file()
-        && let Some(h) = crate::try_dlopen_load(hp, &guest_path)
-    {
-        return SyscallResult::ok(name, h);
+    for cand in dlopen_candidates(&guest_path) {
+        let host = bottle::translate_path(&cand).ok();
+        if let Some(h) = crate::dyld_table::dlopen_lookup(host.as_deref(), &cand) {
+            return SyscallResult::ok(name, h);
+        }
+        if cand.ends_with("libLTO.dylib") {
+            tracing::debug!(guest = %cand, "dlopen: skip on-demand libLTO");
+            continue;
+        }
+        if let Some(hp) = host.as_deref()
+            && hp.is_file()
+            && let Some(h) = crate::try_dlopen_load(hp, &cand)
+        {
+            return SyscallResult::ok(name, h);
+        }
     }
     tracing::debug!(guest = %guest_path, "dlopen: no mapped image");
     SyscallResult::ok(name, 0)
+}
+
+/// Extra locations for relative `dlopen` names (`zsh/zle` → bottle zsh modules).
+fn dlopen_candidates(guest_path: &str) -> Vec<String> {
+    let mut out = vec![guest_path.to_owned()];
+    let base = guest_path.rsplit('/').next().unwrap_or(guest_path);
+    let has_ext = base.contains('.');
+    if !has_ext {
+        out.push(format!("{guest_path}.so"));
+        out.push(format!("{guest_path}.dylib"));
+        out.push(format!("{guest_path}.bundle"));
+    }
+    if guest_path.starts_with('/') {
+        return out;
+    }
+    // zsh `MODULE_PATH` default on Darwin.
+    if let Some(root) = crate::bottle::bottle_root() {
+        let zsh_root = root.join("usr/lib/zsh");
+        if let Ok(versions) = std::fs::read_dir(&zsh_root) {
+            for ent in versions.flatten() {
+                let ver = ent.path();
+                if !ver.is_dir() {
+                    continue;
+                }
+                let rel = if has_ext {
+                    guest_path.to_owned()
+                } else {
+                    format!("{guest_path}.so")
+                };
+                let host_mod = ver.join(&rel);
+                if host_mod.is_file()
+                    && let Some(name) = ent.file_name().to_str()
+                {
+                    out.push(format!("/usr/lib/zsh/{name}/{rel}"));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Make `dlopen` paths absolute and collapse `..`.
@@ -465,6 +509,37 @@ fn is_llvm_c_disasm_symbol(sym: &str) -> bool {
             | "LLVMSetDisasmOptions"
             | "lto_initialize_disassembler"
     )
+}
+
+fn handle_tls_wrap(args: SyscallArgs) -> SyscallResult {
+    let name = "kh_tls_wrap";
+    let mut gfd = reg_as_i32(args.x0);
+    if gfd < 0 {
+        gfd = crate::process::last_tcp_gfd();
+    }
+    if gfd < 0 {
+        return SyscallResult::err(name, EBADF);
+    }
+    let Some(host) = bottle::read_c_string(args.x1, 256) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    let wrapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::tls_fd::wrap_existing(gfd, &host)
+    }));
+    match wrapped {
+        Err(_) => {
+            tracing::warn!(gfd, "tls wrap panicked");
+            SyscallResult::err(name, EPERM)
+        }
+        Ok(Ok(())) => {
+            tracing::info!(gfd, hostname = %host, "tls wrap ok");
+            SyscallResult::ok(name, u64::from(gfd.cast_unsigned()))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(gfd, hostname = %host, error = %e, "tls wrap fail");
+            SyscallResult::err(name, EPERM)
+        }
+    }
 }
 
 const KHTLS_MAGIC: u32 = 0x4B48_544C; // KHTL
@@ -1087,11 +1162,15 @@ fn count_groups(pat: &str) -> usize {
     n
 }
 
-/// Minimal BRE → rust-regex (subset used by git pathspecs).
+/// Minimal BRE → rust-regex (subset used by git pathspecs / BSD sed).
+///
+/// Darwin `[]` treats `[` inside a class as literal; the `regex` crate does
+/// not. Wine / libtool `sed` quotes use `'[^|&;<>()$`\\"*?[]` — without this
+/// the host compile returns `REG_BADPAT` (`ar: … RE error`).
 #[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
-fn bre_to_rust(bre: &str) -> String {
-    let mut out = String::with_capacity(bre.len().saturating_mul(2));
-    let bytes = bre.as_bytes();
+fn posix_to_rust(pat: &str, bre: bool) -> String {
+    let mut out = String::with_capacity(pat.len().saturating_mul(2));
+    let bytes = pat.as_bytes();
     let mut i = 0_usize;
     while i < bytes.len() {
         let Some(&b) = bytes.get(i) else {
@@ -1100,31 +1179,91 @@ fn bre_to_rust(bre: &str) -> String {
         if b == b'\\'
             && let Some(&n) = bytes.get(i.saturating_add(1))
         {
-            match n {
+            if bre {
+                match n {
+                    b'(' | b')' | b'+' | b'?' | b'|' | b'{' | b'}' => {
+                        out.push(char::from(n));
+                        i = i.saturating_add(2);
+                        continue;
+                    }
+                    _ => {
+                        out.push('\\');
+                        out.push(char::from(n));
+                        i = i.saturating_add(2);
+                        continue;
+                    }
+                }
+            }
+            out.push('\\');
+            out.push(char::from(n));
+            i = i.saturating_add(2);
+            continue;
+        }
+        if b == b'[' {
+            emit_char_class(bytes, &mut i, &mut out);
+            continue;
+        }
+        if bre {
+            match b {
                 b'(' | b')' | b'+' | b'?' | b'|' | b'{' | b'}' => {
-                    out.push(char::from(n));
-                    i = i.saturating_add(2);
-                    continue;
-                }
-                _ => {
                     out.push('\\');
-                    out.push(char::from(n));
-                    i = i.saturating_add(2);
+                    out.push(char::from(b));
+                    i = i.saturating_add(1);
                     continue;
                 }
+                _ => {}
             }
         }
-        match b {
-            b'(' | b')' | b'+' | b'?' | b'|' | b'{' | b'}' => {
-                out.push('\\');
-                out.push(char::from(b));
-            }
-            _ => out.push(char::from(b)),
-        }
+        out.push(char::from(b));
         i = i.saturating_add(1);
     }
     out
 }
+
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+fn emit_char_class(bytes: &[u8], i: &mut usize, out: &mut String) {
+    out.push('[');
+    *i = i.saturating_add(1);
+    if bytes.get(*i) == Some(&b'^') {
+        out.push('^');
+        *i = i.saturating_add(1);
+    }
+    if bytes.get(*i) == Some(&b']') {
+        out.push(']');
+        *i = i.saturating_add(1);
+    }
+    while *i < bytes.len() {
+        let Some(&c) = bytes.get(*i) else {
+            break;
+        };
+        if c == b']' {
+            out.push(']');
+            *i = i.saturating_add(1);
+            return;
+        }
+        if c == b'\\'
+            && let Some(&n) = bytes.get(i.saturating_add(1))
+        {
+            out.push('\\');
+            out.push(char::from(n));
+            *i = i.saturating_add(2);
+            continue;
+        }
+        // POSIX named class `[:space:]` — keep as-is for the rust crate.
+        if c == b'[' && bytes.get(i.saturating_add(1)) == Some(&b':') {
+            out.push('[');
+            *i = i.saturating_add(1);
+            continue;
+        }
+        if c == b'[' {
+            out.push('\\');
+        }
+        out.push(char::from(c));
+        *i = i.saturating_add(1);
+    }
+}
+
+
 
 fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
     let name = "kh_regcomp";
@@ -1141,7 +1280,7 @@ fn handle_regcomp(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::ok(name, DARWIN_REG_INVARG);
     };
     let is_ere = cflags & DARWIN_REG_EXTENDED != 0;
-    let mut rust_pat = if is_ere { pat } else { bre_to_rust(&pat) };
+    let mut rust_pat = posix_to_rust(&pat, !is_ere);
     if cflags & DARWIN_REG_NEWLINE != 0 {
         rust_pat.insert_str(0, "(?m)");
     }
@@ -1505,6 +1644,7 @@ fn handle_getaddrinfo(args: SyscallArgs) -> SyscallResult {
                 gai_put_bytes(&mut rec, 18, &v6.port().to_be_bytes());
                 // flowinfo stays zero at 20..24
                 gai_put_bytes(&mut rec, 24, &v6.ip().octets());
+                gai_put_bytes(&mut rec, 40, &v6.scope_id().to_ne_bytes());
                 records.push(rec);
             }
             _ => {}
@@ -1735,5 +1875,22 @@ mod tests {
         assert!(!is_llvm_c_disasm_symbol("lto_get_version"));
         assert!(!is_llvm_c_disasm_symbol("_lto_codegen_compile"));
         assert!(!is_llvm_c_disasm_symbol("LLVMCreateCoverageIterator"));
+    }
+
+    #[test]
+    fn bre_char_class_with_literal_bracket_compiles() {
+        // libtool / wine configure quote class (BSD sed BRE).
+        let bre = "[^|&;<>()$`\\\"*?[]";
+        let rust = posix_to_rust(bre, true);
+        assert!(
+            regex::Regex::new(&rust).is_ok(),
+            "rust pat {rust:?} from {bre:?}"
+        );
+    }
+
+    #[test]
+    fn bre_groups_and_literal_parens() {
+        assert_eq!(posix_to_rust(r"\(ab\)", true), "(ab)");
+        assert_eq!(posix_to_rust("a(b)", true), r"a\(b\)");
     }
 }

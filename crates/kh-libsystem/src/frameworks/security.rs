@@ -342,3 +342,358 @@ pub(crate) unsafe extern "C" fn SecTrustSetOCSPResponse(
 ) -> i32 {
     0 // errSecSuccess
 }
+
+// ── SecureTransport (Darwin rustup / native-tls) ─────────────────────────────
+//
+// rustup links Security.framework. The bottle aliases that path to libSystem;
+// these wrap the last `connect`'d guest fd with host rustls.
+
+const SSL_OK: i32 = 0;
+const SSL_PARAM: i32 = -50;
+const SSL_CTX_BYTES: usize = 320;
+const SSL_HOST_OFF: usize = 0;
+const SSL_HOST_CAP: usize = 256;
+const SSL_HOST_LEN_OFF: usize = 256;
+const SSL_GFD_OFF: usize = 264;
+const SSL_CONN_OFF: usize = 272;
+const SSL_STATE_CONNECTED: i32 = 2;
+
+fn ssl_ctx_ok(ctx: *mut c_void) -> bool {
+    !ctx.is_null()
+}
+
+fn ssl_write_host(ctx: *mut u8, name: *const c_char, len: usize) {
+    let n = len.min(SSL_HOST_CAP.saturating_sub(1));
+    unsafe {
+        if !name.is_null() && n > 0 {
+            core::ptr::copy_nonoverlapping(name.cast::<u8>(), ctx.add(SSL_HOST_OFF), n);
+        }
+        ctx.add(SSL_HOST_OFF).add(n).write(0);
+        let ln = u64::try_from(n).unwrap_or(0).to_ne_bytes();
+        core::ptr::copy_nonoverlapping(ln.as_ptr(), ctx.add(SSL_HOST_LEN_OFF), 8);
+    }
+}
+
+fn ssl_host_ptr(ctx: *mut u8) -> *const c_char {
+    unsafe { ctx.add(SSL_HOST_OFF).cast() }
+}
+
+fn ssl_set_gfd(ctx: *mut u8, gfd: i32) {
+    let b = i32::to_ne_bytes(gfd);
+    unsafe {
+        core::ptr::copy_nonoverlapping(b.as_ptr(), ctx.add(SSL_GFD_OFF), 4);
+    }
+}
+
+fn ssl_gfd(ctx: *const u8) -> i32 {
+    let mut b = [0_u8; 4];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ctx.add(SSL_GFD_OFF), b.as_mut_ptr(), 4);
+    }
+    i32::from_ne_bytes(b)
+}
+
+/// `SSLCreateContext` → heap ctx (hostname + wrapped guest fd).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLCreateContext(
+    _alloc: *mut c_void,
+    _side: i32,
+    _ty: i32,
+) -> *mut c_void {
+    let p = unsafe { malloc(SSL_CTX_BYTES) };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        core::ptr::write_bytes(p.cast::<u8>(), 0, SSL_CTX_BYTES);
+    }
+    ssl_set_gfd(p.cast(), -1);
+    p
+}
+
+/// `SSLSetPeerDomainName`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetPeerDomainName(
+    ctx: *mut c_void,
+    name: *const c_char,
+    len: usize,
+) -> i32 {
+    if !ssl_ctx_ok(ctx) {
+        return SSL_PARAM;
+    }
+    ssl_write_host(ctx.cast(), name, len);
+    SSL_OK
+}
+
+/// `SSLSetConnection` — stash rust's stream pointer; TCP fd is last `connect`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetConnection(
+    ctx: *mut c_void,
+    connection: *mut c_void,
+) -> i32 {
+    if !ssl_ctx_ok(ctx) {
+        return SSL_PARAM;
+    }
+    let addr = u64::try_from(connection.addr()).unwrap_or(0);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            addr.to_ne_bytes().as_ptr(),
+            ctx.cast::<u8>().add(SSL_CONN_OFF),
+            8,
+        );
+    }
+    SSL_OK
+}
+
+/// `SSLSetIOFuncs` — unused; I/O is host rustls on the guest fd.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetIOFuncs(
+    _ctx: *mut c_void,
+    _read: *mut c_void,
+    _write: *mut c_void,
+) -> i32 {
+    SSL_OK
+}
+
+/// `SSLSetSessionOption` — soft success (BreakOnServerAuth etc.).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetSessionOption(
+    _ctx: *mut c_void,
+    _option: i32,
+    _value: u8,
+) -> i32 {
+    SSL_OK
+}
+
+/// `SSLHandshake` → rustls wrap on the last connected guest TCP fd.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLHandshake(ctx: *mut c_void) -> i32 {
+    if !ssl_ctx_ok(ctx) {
+        return SSL_PARAM;
+    }
+    let base = ctx.cast::<u8>();
+    let rc = unsafe {
+        crate::kh_core::sys::helper2(
+            crate::kh_core::helpers::KH_HELPER_TLS_WRAP,
+            u64::from(ssl_gfd(base).cast_unsigned()),
+            u64::try_from(ssl_host_ptr(base).addr()).unwrap_or(0),
+        )
+    };
+    if rc < 0 {
+        return -1;
+    }
+    // Helper returns the wrapped guest fd (never leave gfd=-1 for SSLRead).
+    let wrapped = i32::try_from(rc).unwrap_or(-1);
+    if wrapped >= 0 {
+        ssl_set_gfd(base, wrapped);
+    }
+    SSL_OK
+}
+
+/// `SSLRead` — plaintext via tls-wrapped `read`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLRead(
+    ctx: *mut c_void,
+    data: *mut c_void,
+    data_len: usize,
+    processed: *mut usize,
+) -> i32 {
+    if !ssl_ctx_ok(ctx) || data.is_null() {
+        return SSL_PARAM;
+    }
+    let gfd = ssl_gfd(ctx.cast());
+    if gfd < 0 {
+        return SSL_PARAM;
+    }
+    let n = unsafe { crate::dylib::libsystem_c::posix::read(gfd, data, data_len) };
+    if n < 0 {
+        return -1;
+    }
+    if !processed.is_null() {
+        unsafe {
+            processed.write(usize::try_from(n).unwrap_or(0));
+        }
+    }
+    SSL_OK
+}
+
+/// `SSLWrite` — plaintext via tls-wrapped `write`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLWrite(
+    ctx: *mut c_void,
+    data: *const c_void,
+    data_len: usize,
+    processed: *mut usize,
+) -> i32 {
+    if !ssl_ctx_ok(ctx) || (data.is_null() && data_len > 0) {
+        return SSL_PARAM;
+    }
+    let gfd = ssl_gfd(ctx.cast());
+    if gfd < 0 {
+        return SSL_PARAM;
+    }
+    let n = unsafe { crate::dylib::libsystem_c::stdio::write(gfd, data, data_len) };
+    if n < 0 {
+        return -1;
+    }
+    if !processed.is_null() {
+        unsafe {
+            processed.write(usize::try_from(n).unwrap_or(0));
+        }
+    }
+    SSL_OK
+}
+
+/// `SSLClose`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLClose(_ctx: *mut c_void) -> i32 {
+    SSL_OK
+}
+
+/// `SSLGetBufferedReadSize`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLGetBufferedReadSize(
+    _ctx: *mut c_void,
+    buf_size: *mut usize,
+) -> i32 {
+    if !buf_size.is_null() {
+        unsafe {
+            buf_size.write(0);
+        }
+    }
+    SSL_OK
+}
+
+/// `SSLCopyPeerTrust` — soft empty trust (verify already done in rustls).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLCopyPeerTrust(
+    _ctx: *mut c_void,
+    trust: *mut *mut c_void,
+) -> i32 {
+    if !trust.is_null() {
+        unsafe {
+            trust.write(core::ptr::null_mut());
+        }
+    }
+    SSL_OK
+}
+
+/// `SSLSetProtocolVersionMin` / max — soft.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetProtocolVersionMin(
+    _ctx: *mut c_void,
+    _version: i32,
+) -> i32 {
+    SSL_OK
+}
+
+/// `SSLSetProtocolVersionMax`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetProtocolVersionMax(
+    _ctx: *mut c_void,
+    _version: i32,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLGetConnection(
+    ctx: *mut c_void,
+    connection: *mut *mut c_void,
+) -> i32 {
+    if !ssl_ctx_ok(ctx) || connection.is_null() {
+        return SSL_PARAM;
+    }
+    let mut b = [0_u8; 8];
+    unsafe {
+        core::ptr::copy_nonoverlapping(ctx.cast::<u8>().add(SSL_CONN_OFF), b.as_mut_ptr(), 8);
+        let addr = usize::try_from(u64::from_ne_bytes(b)).unwrap_or(0);
+        connection.write(core::ptr::with_exposed_provenance_mut(addr));
+    }
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLGetSessionState(ctx: *mut c_void, state: *mut i32) -> i32 {
+    if !ssl_ctx_ok(ctx) || state.is_null() {
+        return SSL_PARAM;
+    }
+    let st = if ssl_gfd(ctx.cast()) >= 0 {
+        SSL_STATE_CONNECTED
+    } else {
+        0
+    };
+    unsafe {
+        state.write(st);
+    }
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetALPNProtocols(
+    _ctx: *mut c_void,
+    _protos: *mut c_void,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLCopyALPNProtocols(
+    _ctx: *mut c_void,
+    _protos: *mut *mut c_void,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetCertificate(_ctx: *mut c_void, _cert: *mut c_void) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetEnabledCiphers(
+    _ctx: *mut c_void,
+    _ciphers: *const c_void,
+    _n: usize,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLGetNumberEnabledCiphers(
+    _ctx: *mut c_void,
+    n: *mut usize,
+) -> i32 {
+    if !n.is_null() {
+        unsafe {
+            n.write(0);
+        }
+    }
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLGetEnabledCiphers(
+    _ctx: *mut c_void,
+    _ciphers: *mut c_void,
+    _n: usize,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetPeerID(
+    _ctx: *mut c_void,
+    _peer_id: *const c_void,
+    _len: usize,
+) -> i32 {
+    SSL_OK
+}
+
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn SSLSetSessionTicketsEnabled(
+    _ctx: *mut c_void,
+    _enabled: u8,
+) -> i32 {
+    SSL_OK
+}

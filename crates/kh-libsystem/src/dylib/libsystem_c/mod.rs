@@ -3,6 +3,7 @@
 pub(crate) mod dl;
 pub(crate) mod dns_name;
 pub(crate) mod extra_path;
+pub(crate) mod fts;
 pub(crate) mod locale;
 pub(crate) mod net;
 pub(crate) mod path_extras;

@@ -455,6 +455,153 @@ pub(crate) unsafe extern "C" fn wcscmp(s1: *const Wchar, s2: *const Wchar) -> c_
     }
 }
 
+/// C `wcsncmp` → nlist `_wcsncmp` (tcsh/`csh` wide env compare).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcsncmp(
+    s1: *const Wchar,
+    s2: *const Wchar,
+    n: usize,
+) -> c_int {
+    if n == 0 || s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut left = s1;
+        let mut right = s2;
+        let mut left_n = n;
+        loop {
+            let left_w = left.read();
+            let right_w = right.read();
+            if left_w != right_w {
+                return left_w.wrapping_sub(right_w);
+            }
+            if left_w == 0 {
+                return 0;
+            }
+            left_n = left_n.saturating_sub(1);
+            if left_n == 0 {
+                return 0;
+            }
+            left = left.add(1);
+            right = right.add(1);
+        }
+    }
+}
+
+/// C `wcscpy` → nlist `_wcscpy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcscpy(dst: *mut Wchar, src: *const Wchar) -> *mut Wchar {
+    if dst.is_null() || src.is_null() {
+        return dst;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        loop {
+            let w = src.add(i).read();
+            dst.add(i).write(w);
+            if w == 0 || i > (1 << 20) {
+                break;
+            }
+            i = i.saturating_add(1);
+        }
+    }
+    dst
+}
+
+/// C `wcsncpy` → nlist `_wcsncpy`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcsncpy(
+    dst: *mut Wchar,
+    src: *const Wchar,
+    n: usize,
+) -> *mut Wchar {
+    if dst.is_null() || n == 0 {
+        return dst;
+    }
+    unsafe {
+        let mut i = 0_usize;
+        while i < n {
+            let w = if src.is_null() { 0 } else { src.add(i).read() };
+            dst.add(i).write(w);
+            i = i.saturating_add(1);
+            if w == 0 {
+                while i < n {
+                    dst.add(i).write(0);
+                    i = i.saturating_add(1);
+                }
+                break;
+            }
+        }
+    }
+    dst
+}
+
+/// C `wcscat` → nlist `_wcscat`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcscat(dst: *mut Wchar, src: *const Wchar) -> *mut Wchar {
+    if dst.is_null() {
+        return dst;
+    }
+    let n = unsafe { wcslen(dst) };
+    let _ = unsafe { wcscpy(dst.add(n), src) };
+    dst
+}
+
+/// C `wcschr` → nlist `_wcschr`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcschr(s: *const Wchar, c: Wchar) -> *mut Wchar {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let mut p = s;
+        loop {
+            let w = p.read();
+            if w == c {
+                return p.cast_mut();
+            }
+            if w == 0 {
+                return core::ptr::null_mut();
+            }
+            p = p.add(1);
+        }
+    }
+}
+
+/// C `wcsrchr` → nlist `_wcsrchr`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcsrchr(s: *const Wchar, c: Wchar) -> *mut Wchar {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut last = core::ptr::null_mut();
+    unsafe {
+        let mut p = s;
+        loop {
+            let w = p.read();
+            if w == c {
+                last = p.cast_mut();
+            }
+            if w == 0 {
+                return last;
+            }
+            p = p.add(1);
+        }
+    }
+}
+
+/// C `wcscoll` → nlist `_wcscoll` ("C" locale: same as `wcscmp`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wcscoll(s1: *const Wchar, s2: *const Wchar) -> c_int {
+    unsafe { wcscmp(s1, s2) }
+}
+
+/// C `atof` → nlist `_atof`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn atof(s: *const c_char) -> f64 {
+    unsafe { strtod(s, core::ptr::null_mut()) }
+}
+
 /// C `wcsstr` → nlist `_wcsstr`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn wcsstr(haystack: *const Wchar, needle: *const Wchar) -> *mut Wchar {

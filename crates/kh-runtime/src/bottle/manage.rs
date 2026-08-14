@@ -71,6 +71,8 @@ pub struct BottleStatus {
     pub libcurl_alias: bool,
     /// Whether `bin` / `sbin` / `usr/bin` look like a macOS 26+ Apple Silicon copy.
     pub prefix_macos: bool,
+    /// Whether `usr/lib/zsh/*/zsh/zle.so` is present (interactive zsh).
+    pub zsh_modules: bool,
 }
 
 /// Options for [`create`].
@@ -234,6 +236,7 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
     let libcxx_alias = exists && layout::has_libcxx_symlink(&path);
     let libcurl_alias = exists && layout::has_libcurl_symlink(&path);
     let prefix_macos = exists && layout::bottle_has_macos_prefix(&path);
+    let zsh_modules = exists && layout::bottle_has_zsh_modules(&path);
     Ok(Some(BottleStatus {
         path,
         exists,
@@ -242,6 +245,7 @@ pub fn status() -> Result<Option<BottleStatus>, BottleError> {
         libcxx_alias,
         libcurl_alias,
         prefix_macos,
+        zsh_modules,
     }))
 }
 
@@ -296,8 +300,13 @@ fn refresh_bottle(path: &Path, opts: &CreateOptions<'_>) -> Result<CreateResult,
     layout::ensure_libxar_symlink(path)?;
     layout::ensure_libz_symlink(path)?;
     layout::ensure_libedit_symlink(path)?;
+    layout::ensure_libncurses_symlink(path)?;
+    layout::ensure_libpcre_symlink(path)?;
+    layout::ensure_libiconv_symlink(path)?;
+    layout::ensure_security_framework_alias(path)?;
     layout::ensure_dev_nodes(path)?;
     layout::ensure_host_ssh_bridge(path)?;
+    layout::ensure_clt_m4_shims(path)?;
     let libsystem = install_libsystem_for_create(path, opts)?;
     // Mozilla / host CA bundle for OpenSSL CAfile + SecTrust host verify.
     if let Err(e) = super::ca_bundle::ensure_ca_bundle(path) {
