@@ -1,4 +1,4 @@
-//! Host-side microbench of **dispatch** cost by crossing class (roadmap2 P1).
+//! Host-side microbench of **dispatch** cost by crossing class.
 //!
 //! Times `syscall::dispatch` only (after host TLS / outside hypercall prolog).
 //! Use this to rank getpid / open+close / readdir / uncontended park relative
@@ -144,7 +144,7 @@ fn iters_from_env(default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Run the four roadmap2 P1 classes under the process test lock.
+/// Run the four dispatch-class microbenches under the process test lock.
 ///
 /// Caller must not hold other global guest locks. Uses a private temp dir and
 /// an anonymous guest stack mapping for identity-map buffers.

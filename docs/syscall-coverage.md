@@ -49,6 +49,8 @@ States: **done** (dispatched / wrapped), **stub** (soft), **missing** (neither).
 | 105 | `setsockopt` | yes | done |
 | 106 | `listen` | yes | done |
 | 116 | `gettimeofday` | yes | done |
+| 120 | `readv` | yes | done |
+| 121 | `writev` | yes | done |
 | 118 | `getsockopt` | yes | done |
 | 124 | `fchmod` | yes | done |
 | 128 | `rename` | yes | done |
@@ -63,6 +65,7 @@ States: **done** (dispatched / wrapped), **stub** (soft), **missing** (neither).
 | 201 | `ftruncate` | yes | done |
 | 202 | `sysctl` | yes | done |
 | 230 | `poll` | yes | done |
+| 363 | `kevent` | yes | done (EVFILT_READ/WRITE + EVFILT_USER `NOTE_TRIGGER`) |
 | 266 | `clock_gettime` | — | done |
 | 274 | `sysctlbyname` | yes | done |
 | 327 | `issetugid` | — | done |

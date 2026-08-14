@@ -48,7 +48,8 @@ pub use bottle::{
 };
 pub use dyld_table::{
     RTLD_DEFAULT, RTLD_NEXT, RTLD_SELF, clear as dyld_table_clear, dlopen_lookup, dlsym_lookup,
-    exports_flat as dyld_exports_flat, register_image as dyld_register_image,
+    dlsym_sign_ia as dyld_dlsym_sign_ia, exports_flat as dyld_exports_flat,
+    register_image as dyld_register_image, set_dlsym_sign_ia as dyld_set_dlsym_sign_ia,
 };
 pub use process::dlopen_load::{set_dlopen_loader, try_dlopen_load};
 pub use process::{ProcessState, reset_run};

@@ -67,6 +67,10 @@ pub enum BsdSyscall {
     Pread,
     /// `pwrite`.
     Pwrite,
+    /// `readv`.
+    Readv,
+    /// `writev`.
+    Writev,
     /// `stat` / `stat64`.
     Stat,
     /// `fstat` / `fstat64`.
@@ -155,6 +159,8 @@ pub enum BsdSyscall {
     Recv,
     /// `poll`.
     Poll,
+    /// `kevent`.
+    Kevent,
     /// `select`.
     Select,
     /// `getsockname`.
@@ -200,6 +206,8 @@ impl BsdSyscall {
             Self::Lseek => "lseek",
             Self::Pread => "pread",
             Self::Pwrite => "pwrite",
+            Self::Readv => "readv",
+            Self::Writev => "writev",
             Self::Stat => "stat",
             Self::Fstat => "fstat",
             Self::Lstat => "lstat",
@@ -244,6 +252,7 @@ impl BsdSyscall {
             Self::Send => "send",
             Self::Recv => "recv",
             Self::Poll => "poll",
+            Self::Kevent => "kevent",
             Self::Select => "select",
             Self::Getsockname => "getsockname",
             Self::Getpeername => "getpeername",
@@ -298,6 +307,8 @@ impl BsdSyscall {
             Self::Lseek => 199,
             Self::Pread => 153,
             Self::Pwrite => 154,
+            Self::Readv => 120,
+            Self::Writev => 121,
             Self::Ftruncate => 201,
             Self::Fchmod => 124,
             Self::Sysctl => 202,
@@ -330,6 +341,7 @@ impl BsdSyscall {
             Self::Shutdown => 134,
             Self::Select => 93,
             Self::Poll => 230,
+            Self::Kevent => 363,
             Self::Getpeername => 31,
             Self::Getsockname => 32,
         }
@@ -390,6 +402,8 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         105 => Some(BsdSyscall::Setsockopt),
         106 => Some(BsdSyscall::Listen),
         116 => Some(BsdSyscall::Gettimeofday),
+        120 | 411 => Some(BsdSyscall::Readv),   // readv / nocancel
+        121 | 412 => Some(BsdSyscall::Writev),  // writev / nocancel
         118 => Some(BsdSyscall::Getsockopt),
         124 => Some(BsdSyscall::Fchmod),
         128 => Some(BsdSyscall::Rename),
@@ -407,6 +421,7 @@ pub const fn lookup(number: u32) -> Option<BsdSyscall> {
         201 => Some(BsdSyscall::Ftruncate),
         202 => Some(BsdSyscall::Sysctl),
         230 => Some(BsdSyscall::Poll),
+        363 => Some(BsdSyscall::Kevent),
         266 => Some(BsdSyscall::ClockGettime),
         274 => Some(BsdSyscall::Sysctlbyname),
         327 => Some(BsdSyscall::Issetugid),
@@ -462,6 +477,8 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (54, "ioctl"),
         (92, "fcntl"),
         (116, "gettimeofday"),
+        (120, "readv"),
+        (121, "writev"),
         (197, "mmap"),
         (153, "pread"),
         (154, "pwrite"),
@@ -503,6 +520,7 @@ pub fn known_syscalls() -> &'static [(u32, &'static str)] {
         (30, "accept"),
         (93, "select"),
         (230, "poll"),
+        (363, "kevent"),
         (31, "getpeername"),
         (32, "getsockname"),
     ]

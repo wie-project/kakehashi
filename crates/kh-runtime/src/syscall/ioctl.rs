@@ -235,8 +235,11 @@ fn ioctl_get_winsize(name: &'static str, h: i32, buf: u64) -> SyscallResult {
     match host::tiocgwinsz(h) {
         Ok(ws) => {
             let mut raw = [0_u8; DARWIN_WINSIZE_LEN];
-            put_u16(&mut raw, 0, ws.ws_row);
-            put_u16(&mut raw, 2, ws.ws_col);
+            // A 0×0 win made zsh PROMPT_SP / zle pad with a full line of spaces.
+            let row = if ws.ws_row == 0 { 24 } else { ws.ws_row };
+            let col = if ws.ws_col == 0 { 80 } else { ws.ws_col };
+            put_u16(&mut raw, 0, row);
+            put_u16(&mut raw, 2, col);
             put_u16(&mut raw, 4, ws.ws_xpixel);
             put_u16(&mut raw, 6, ws.ws_ypixel);
             guest_write(buf, &raw);

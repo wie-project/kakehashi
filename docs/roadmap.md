@@ -1,167 +1,55 @@
 # Roadmap
 
-Status of performance work and process for further changes. Safety rules:
-[invariants.md](invariants.md). User-facing perf honesty and CI economics:
-root [README.md](../README.md#performance-honest).
+What shipped. Safety: [architecture.md](architecture.md). User-facing perf: root [README.md](../README.md#performance-honest).
 
-## Current status
+## Status
 
 | Item | State |
 | --- | --- |
-| Production BSD entry | Freestanding hypercall (main + workers) |
-| Multi-thread correctness | Green (`7zz -mmt=4 -mx=5` create + test; Docker + UTM) |
-| Zip MT hang (mmt≥3) | Fixed (PRIVATE futex, heap lock, cond always-wake) |
-| Multi-file wall (UTM) | ~**×1.24** vs native Linux `7zz` (post size-class freelist) |
+| BSD entry | Freestanding hypercall (main + workers) |
+| Multi-thread | Green (`7zz -mmt=4 -mx=5` create + test) |
+| Zip MT hang (`mmt≥3`) | Fixed (PRIVATE futex, heap lock, cond wake) |
+| Multi-file wall (UTM) | ~**×1.24** vs native Linux `7zz` |
+| curl / git / Apple clang | Met — [utilities.md](utilities.md) |
 
-### Measured multi-file (Ubuntu aarch64 bare-metal, `mx=5 mmt=4`)
+### Multi-file (Ubuntu aarch64, `mx=5 mmt=4`)
 
-| tree | native `7zz` | `kh` | ratio | notes |
-| --- | ---: | ---: | ---: | --- |
-| ~14.5k files / ~309 MiB (Nook) | ~44.1 s | ~54.8 s | **×1.24** | current plateau (2026-08) |
-| ~8k / ~240 MiB (historical) | ~22.5 s | ~118 s | ~×5.2 | pre size-class freelist; **superseded** |
+| tree | native `7zz` | `kh` | ratio |
+| --- | ---: | ---: | ---: |
+| ~14.5k files / ~309 MiB (Nook) | ~44.1 s | ~54.8 s | **×1.24** |
 
-The historical ×5 was freestanding **first-fit freelist** O(n²) on chatty
-`malloc` (plate A residual), not “wrong LZMA”. Size-class LIFO freelists
-closed most of that gap. Residual is **boundary × crossings** + real guest
-LZMA. Compression-heavy, few-file samples stay ~×1.1–1.3.
+Historical ~×5.2 was first-fit freelist O(n²); size-class LIFO closed it. Residual is boundary × crossings + guest LZMA. Wall-clock parity is not a ship blocker.
 
-Further multi-file opts still need plates + native baseline (see
-[roadmap2.md](roadmap2.md)). Correctness gates remain mandatory; wall-clock
-parity with native is **not** a ship blocker (see README CI economics).
-
-## Completed (summary)
+## Done
 
 | Area | Outcome |
 | --- | --- |
-| Hypercall MT baseline | SYS_exit teardown, NEON, alt stack, TPIDR install defer |
-| A4 `readlinkat` | Cache bottle alias `real_path` at insert |
-| A5 excess `mprotect` | Batch bind/rebase; skip no-op RW |
-| A2 / A1 TLS | Hot path guest-TLS mirrors; gettid only on slow path |
-| F1 / F1c futex | Contended-bit mutex; cond signal≠broadcast; UTM wall ~3:38→~1:57 |
-| B1 bottle dirfd | Kept for hygiene; no measurable wall win post-F1c |
-| A3 light hypercall | **Removed** — no wall win; one production path |
-| Zip MT deadlock | PRIVATE park/wake, 50 ms safety timeout, heap/mutex/cond fixes |
-| Freestanding size-class freelist | First-fit O(n²) → power-of-two LIFO bins; multi-file ~×5.2 → ~×1.24 |
-| Heap / boundary dig stats | `kh heap stats` dump; `KAKEHASHI_BOUNDARY_STATS` (M0) |
-| Curl milestone | **Met** (G0–G5) — [curl.md](curl.md) |
-| Git / CLT milestone | **Met** (G0–G8); Wine full (GH+GL), llvm `--depth 1` SSH — [git.md](git.md) |
+| Hypercall MT | `SYS_exit` teardown, NEON, alt stack, TPIDR install defer |
+| `readlinkat` | Cache bottle alias `real_path` at insert |
+| Bind `mprotect` | Batch; skip no-op RW |
+| TLS | Guest-TLS mirrors; gettid only on slow path |
+| Futex | Contended-bit mutex; cond signal ≠ broadcast |
+| Zip MT deadlock | PRIVATE park/wake, heap/mutex/cond |
+| Size-class freelist | Multi-file ~×5.2 → ~×1.24 |
+| Heap / boundary stats | `kh heap stats`; `KAKEHASHI_BOUNDARY_STATS` |
+| Load path | mmap container, file-backed RX, instruction-only `svc` scan, bind export index, `KH_HELPER_SPAWN` |
+| curl | G0–G5 — [utilities.md](utilities.md#curl) |
+| git / CLT | G0–G8 — [utilities.md](utilities.md#git) |
+| Apple clang | G0–G5 + LTO — [utilities.md](utilities.md#apple-clang) |
 
-## Failed prototypes (do not re-land)
+## Do not re-land
 
 | Attempt | Lesson |
 | --- | --- |
-| Guest cookie via `mrs` without proven guest TPIDR | Only probe when magic marks guest TLS |
-| Light hypercall skipping NEON under MT | SEGV / no win; full save required |
-| Freestanding thin without full NEON clobber list | Guest LLVM keeps live SIMD → unstable MT |
-| `thread_local!` / raw slot pointers on boundary | SEGV / UAF under guest TPIDR |
-| Dual production paths (main=hypercall, workers=SIGTRAP) | Forbidden (invariant 7) |
-
-## Open work (product, not micro-perf)
-
-Priority is **guest surface**, not shaving another tenth off an already ~×1.2 multi-file plate:
-
-| Priority | Direction | Notes |
-| --- | --- | --- |
-| 1 | **Apple clang** (CLT compiler) | **Active** — G1 `clang --version` **pass** (Docker); G2–G3 compile open — [clang.md](clang.md) |
-| — | **curl** (network CLI) | **Milestone met** (G0–G5). Polish only — see [curl.md](curl.md) |
-| — | **git** / **xcode-tools** | **Milestone met** (G0–G8). Verified: Wine full history (GitHub + GitLab), llvm-project `--depth 1` over SSH, push/private/auth — [git.md](git.md) |
-| — | Optional polish | multi‑GiB monorepo soak budgets; `getrusage` / Usage% for 7zz; openssl.cnf seed; freopen — not gates |
-
-Rationale: curl and git closed the open-source utility / CLT VCS slice. **Apple
-clang** is the first priority compiler guest: heavy libc++ / cxxabi surface on
-top of freestanding libSystem (same bottle CLT package as git).
-
-### Curl milestone — **done** (trace-first)
-
-Method and commands: [curl.md](curl.md). User-facing recipes:
-[README — What works](../README.md#what-works).
-
-| Slice | State |
-| --- | --- |
-| `kh install curl` (+ optional `KAKEHASHI_CURL`) | done |
-| Guest `/usr/local/bin/curl` + bottle CA seed | done |
-| `scripts/docker-kh.sh curl` (+ probe) | done |
-| G1 `--version` | **pass** |
-| G3 HTTP GET body + exit 0 | **pass** (Docker + UTM) |
-| G4 HTTPS GET (OpenSSL + CA) | **pass** (Docker) |
-| G5 UTM HTTP confirm | **pass** |
-| Remaining | polish only (HTTPS UTM smoke, broader CLI flags, soft-framework quieting) |
-
-Process notes for curl polish PRs: internet allowed; clippy `-D warnings`;
-keep `7zz -mmt=4` green; clean-room only — see [legal-method.md](legal-method.md).
-
-### Git milestone — **done** (trace-first)
-
-Method and gates: [git.md](git.md). User-facing recipes:
-[README — Apple git](../README.md#apple-git-clt).
-
-| Slice | State |
-| --- | --- |
-| `kh install xcode-tools` (public swscan) | done |
-| Local `init` / `commit` / branches (G3) | **pass** |
-| HTTPS remotes + freestanding libcurl (G4) | **pass** |
-| SSH host OpenSSH bridge (G5) | **pass** |
-| Push + private bare (G6) | **pass** |
-| Plain `http://` (G7) | **pass** |
-| Authenticated GitHub private (G8) | **pass** |
-| **Wine** full history (GitHub + GitLab) | **pass** |
-| **llvm-project** `--depth 1` over SSH | **pass** |
-| Remaining | polish only (multi‑GiB soak under wall budget; quieter credential noise) |
-
-Process notes for git polish PRs: same as curl — internet allowed; clippy
-`-D warnings`; keep `7zz -mmt=4` green; clean-room — [legal-method.md](legal-method.md).
-
-### Apple clang milestone — **active** (trace-first)
-
-Method and gates: [clang.md](clang.md). Binary from the same CLT install as git
-(`kh install xcode-tools`).
-
-| Slice | State |
-| --- | --- |
-| G0 CLT + `…/usr/bin/clang` | **pass** (shared xcode-tools) |
-| G1 `clang --version` | **pass** (Docker Colima: Apple clang 21.0.0 banner + exit 0) |
-| G2 missing-surface list | open |
-| G3 trivial compile | open |
-| Docker helper | `scripts/docker-kh.sh clang` |
-
-Process notes: internet for install only; clippy `-D warnings`; keep
-`7zz -mmt=4` + curl/git green when shared paths change; clean-room —
-[legal-method.md](legal-method.md).
+| Guest cookie via `mrs` without TLS magic | Only probe when magic marks guest TLS |
+| Light hypercall skipping NEON under MT | SEGV / no wall win |
+| Thin freestanding without full NEON clobber | Guest LLVM keeps live SIMD |
+| `thread_local!` / raw slots on the boundary | SEGV / UAF under guest TPIDR |
+| Dual production paths (main hypercall, workers SIGTRAP) | Forbidden (invariant 7) |
+| Shared process-wide path/dentry caches | Lock/invalidation cost > `openat` |
 
 ## Process
 
-### MAY
+One logical change per PR. Stage `resources/libSystem.B.dylib` on freestanding ABI change. Gate: `7zz a -mx=5 -mmt=4` and `t`, create ≥2 times. Do not claim a wall win without a native Linux baseline on the same tree.
 
-1. One logical change per PR with `docker-kh 7zz` / bare-metal `mmt=4` in the description.
-2. Default-off counters/flags for risky paths (`KAKEHASHI_FUTEX_STATS`).
-3. Optimize freely **while host TPIDR is live**.
-4. Stage freestanding ABI changes into `resources/libSystem.B.dylib`.
-
-### MUST NOT
-
-1. Leave guest TPIDR live across host Rust/glibc (invariant 11b).
-2. Use `thread_local!` for boundary bookkeeping under guest TPIDR (invariant 10).
-3. Skip full Q0–Q31 + FPCR/FPSR save before host `bl` (invariant 13).
-4. Run host dispatch / join-publish / `munmap` on a guest worker stack (invariants 4, 14, 16).
-5. Dual production syscall paths (invariant 7).
-6. End workers with `pthread_exit` or dirty `x29` (invariants 5–6).
-7. Ship freestanding ABI without staging the embed.
-8. Land perf PRs that only pass `7zz -- i` or `-mmt=1`; **`-mmt=4 -mx=5` is the gate**.
-9. Drop identity-map / `check_range` on guest buffers (invariant 17).
-10. Reintroduce `dist/guest` as primary libSystem path (invariant 19).
-
-### Perf PR checklist
-
-- [ ] `cargo test -p kh-runtime --lib` (workspace if touching loader/cli)
-- [ ] `7zz a -mx=5 -mmt=4` → Ok; `7zz t` → Ok (hypercall always on)
-- [ ] Repeat MT create ≥2 times
-- [ ] Stage dylib if freestanding ABI changed
-- [ ] Bare-metal note if only Docker was used
-- [ ] strace/perf snippet only if claiming a wall win
-
-## References
-
-- [Invariants](invariants.md)
-- [Guest–host boundary](guest-host-boundary.md)
-- [Threading](threading.md)
-- [Architecture](architecture.md)
+MUST NOT: guest TPIDR across host Rust; `thread_local!` under guest TPIDR; skip full NEON save; host dispatch/join/`munmap` on a guest worker stack; dual syscall paths; `pthread_exit` / dirty `x29`; drop `check_range`; revive `dist/guest`.

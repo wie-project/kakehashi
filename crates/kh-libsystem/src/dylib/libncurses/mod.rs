@@ -40,6 +40,8 @@ const S_UP: &[u8] = b"\x1b[A\0";
 const S_DO: &[u8] = b"\n\0";
 const S_ND: &[u8] = b"\x1b[C\0";
 const S_LE: &[u8] = b"\x08\0";
+const S_BC: &[u8] = b"\x08\0";
+const S_KB: &[u8] = b"\x7f\0";
 const S_CR: &[u8] = b"\r\0";
 const S_BL: &[u8] = b"\x07\0";
 const S_KS: &[u8] = b"\x1b[?1h\x1b=\0";
@@ -107,6 +109,12 @@ const CAPS: &[Cap] = &[
     },
     Cap {
         id: *b"am",
+        num: -1,
+        flag: 1,
+        s: core::ptr::null(),
+    },
+    Cap {
+        id: *b"bs",
         num: -1,
         flag: 1,
         s: core::ptr::null(),
@@ -182,6 +190,18 @@ const CAPS: &[Cap] = &[
         num: -1,
         flag: 0,
         s: S_LE.as_ptr(),
+    },
+    Cap {
+        id: *b"bc",
+        num: -1,
+        flag: 0,
+        s: S_BC.as_ptr(),
+    },
+    Cap {
+        id: *b"kb",
+        num: -1,
+        flag: 0,
+        s: S_KB.as_ptr(),
     },
     Cap {
         id: *b"cr",
@@ -458,11 +478,12 @@ pub(crate) unsafe extern "C" fn tgetent(_bp: *mut c_char, name: *const c_char) -
     } else {
         name
     };
-    if term.is_null() || unsafe { *term } == 0 {
-        TERMCAP_OK.store(false, Ordering::Relaxed);
-        return 0;
-    }
-    let dumb = cstr_eq_ignore_case(term, b"dumb") || cstr_eq_ignore_case(term, b"unknown");
+    // No TERM (guest env did not forward it): still install the xterm set.
+    // Returning 0 made Apple zsh treat the tty as dumb — Backspace printed
+    // spaces and refresh showed WEOF (`?<ffffffff>`).
+    let missing = term.is_null() || unsafe { *term } == 0;
+    let dumb = !missing
+        && (cstr_eq_ignore_case(term, b"dumb") || cstr_eq_ignore_case(term, b"unknown"));
     DUMB.store(dumb, Ordering::Relaxed);
     TERMCAP_OK.store(true, Ordering::Relaxed);
     1

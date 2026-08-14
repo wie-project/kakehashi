@@ -65,6 +65,8 @@ mod linux_aarch64 {
         by_name: HashMap<String, u64>,
         /// Address of `_kh_missing_symbol_named` used when the pool was first filled.
         handler: u64,
+        /// True after [`seal_pool`] (RX). Late `dlopen` must unseal to emit.
+        sealed: bool,
     }
 
     // SAFETY: pool is process-local; entries are only written under the mutex and
@@ -107,7 +109,21 @@ mod linux_aarch64 {
             used: 0,
             by_name: HashMap::new(),
             handler,
+            sealed: false,
         })
+    }
+
+    fn unseal(pool: &mut Pool) -> Result<(), LoadError> {
+        if !pool.sealed {
+            return Ok(());
+        }
+        if !kh_runtime::host::mprotect(pool.base, pool.len, libc::PROT_READ | libc::PROT_WRITE) {
+            return Err(LoadError::NotImplemented(
+                "missing-stub pool mprotect RW failed",
+            ));
+        }
+        pool.sealed = false;
+        Ok(())
     }
 
     fn emit_one(pool: &mut Pool, name: &str, handler: u64) -> Result<u64, LoadError> {
@@ -123,6 +139,7 @@ mod linux_aarch64 {
         if pool.used.saturating_add(need) > pool.len {
             return Err(LoadError::NotImplemented("missing-stub pool exhausted"));
         }
+        unseal(pool)?;
         // SAFETY: `used..used+need` is within the mapped RW region; exclusive under mutex.
         let slot = unsafe { pool.base.add(pool.used) };
         let slot_va = kh_runtime::host::ptr_addr_u64(slot);
@@ -155,12 +172,18 @@ mod linux_aarch64 {
     }
 
     pub(super) fn seal_pool() {
-        let guard = POOL
+        let mut guard = POOL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pool) = guard.as_ref()
-            && !kh_runtime::host::mprotect(pool.base, pool.len, libc::PROT_READ | libc::PROT_EXEC)
-        {
+        let Some(pool) = guard.as_mut() else {
+            return;
+        };
+        if pool.sealed {
+            return;
+        }
+        if kh_runtime::host::mprotect(pool.base, pool.len, libc::PROT_READ | libc::PROT_EXEC) {
+            pool.sealed = true;
+        } else {
             tracing::warn!("missing-stub pool mprotect RX failed; leaving RW");
         }
     }

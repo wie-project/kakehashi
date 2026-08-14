@@ -12,3 +12,4 @@ pub(crate) mod regex;
 pub(crate) mod simple;
 pub(crate) mod stdio;
 pub(crate) mod string;
+pub(crate) mod utf8;

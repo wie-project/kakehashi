@@ -485,12 +485,28 @@ fn handle_dlsym(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::ok(name, 0);
     }
     if let Some(va) = crate::dyld_table::dlsym_lookup(handle, &sym) {
+        let va = sign_dlsym_result(va);
         tracing::debug!(sym = %sym, va, "dlsym: resolved");
         SyscallResult::ok(name, va)
     } else {
         tracing::debug!(sym = %sym, "dlsym: not found");
         SyscallResult::ok(name, 0)
     }
+}
+
+/// Arm64e `dlsym` returns an IA-signed function pointer (discriminator 0).
+///
+/// Apple `zsh` (arm64e-only fat slice) does `dlsym("setup_")` then `braaz`.
+/// An unsigned VA fails auth and the CPU poisons the high bits (`pc=0x20…`).
+///
+/// TEXT can sit in the registry as RW during bind, so this signs every
+/// non-null result when the main image is arm64e. Guests in that ABI almost
+/// only `dlsym` code; a data-symbol hit would need a later carve-out.
+fn sign_dlsym_result(va: u64) -> u64 {
+    if va == 0 || !crate::dyld_table::dlsym_sign_ia() {
+        return va;
+    }
+    crate::host::ptrauth_sign(va, 0, 0)
 }
 
 /// Symbols `otool-classic` `dlsym`s from `libLTO` for `-t -v`.

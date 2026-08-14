@@ -187,6 +187,8 @@ fn image_from_macho(
     let cpu = get_arch_name_from_types(cputype, cpusubtype)
         .unwrap_or("arm64")
         .to_owned();
+    // Capability bits live in the high byte (`CPU_SUBTYPE_MASK`); arm64e is 2.
+    let is_arm64e = cpusubtype & 0x00ff_ffff == 2;
 
     let mut uuid = None;
     let mut minos = None;
@@ -338,6 +340,7 @@ fn image_from_macho(
         platform,
         is_64: macho.is_64,
         little_endian: macho.little_endian,
+        is_arm64e,
     };
 
     let rpaths = macho.rpaths.iter().map(|s| (*s).to_owned()).collect();

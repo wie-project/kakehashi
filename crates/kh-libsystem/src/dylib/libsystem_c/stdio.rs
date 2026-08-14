@@ -3,7 +3,7 @@
 use core::ffi::{c_char, c_int, c_void};
 
 use crate::kh_core::errno;
-use crate::kh_core::sys::{self, SYS_READ, SYS_WRITE};
+use crate::kh_core::sys::{self, SYS_READ, SYS_READV, SYS_WRITE, SYS_WRITEV};
 use crate::kh_core::trace;
 use crate::kh_core::helpers::KH_HELPER_PUTS;
 
@@ -38,6 +38,50 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, nbyte: usize) -> i
     if ret < 0 {
         errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
         // POSIX `ssize_t` error: always -1 + errno (not -errno).
+        return -1;
+    }
+    ret
+}
+
+/// C `writev` → nlist `_writev` (rust std / tokio TLS ClientHello).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn writev(fd: c_int, iov: *const c_void, iovcnt: c_int) -> isize {
+    if iovcnt < 0 || (iov.is_null() && iovcnt > 0) {
+        errno::set_errno(22);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_WRITEV,
+            u64::from(fd.cast_unsigned()),
+            ptr_to_u64(iov),
+            u64::from(iovcnt.cast_unsigned()),
+        )
+    };
+    if ret < 0 {
+        errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
+        return -1;
+    }
+    ret
+}
+
+/// C `readv` → nlist `_readv`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn readv(fd: c_int, iov: *mut c_void, iovcnt: c_int) -> isize {
+    if iovcnt < 0 || (iov.is_null() && iovcnt > 0) {
+        errno::set_errno(22);
+        return -1;
+    }
+    let ret = unsafe {
+        sys::syscall3(
+            SYS_READV,
+            u64::from(fd.cast_unsigned()),
+            ptr_to_u64(iov.cast()),
+            u64::from(iovcnt.cast_unsigned()),
+        )
+    };
+    if ret < 0 {
+        errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
         return -1;
     }
     ret

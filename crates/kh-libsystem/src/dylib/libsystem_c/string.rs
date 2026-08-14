@@ -2,7 +2,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-use crate::dylib::libsystem_c::stdio::memcpy;
+use crate::dylib::libsystem_c::stdio::{memcpy, memmove};
 
 /// Darwin `wchar_t` is 32-bit on arm64.
 type Wchar = i32;
@@ -353,35 +353,62 @@ pub(crate) unsafe extern "C" fn memset_pattern16(
     }
 }
 
-/// C `mbstowcs` → nlist `_mbstowcs` (ASCII-only).
+/// C `mbstowcs` → nlist `_mbstowcs` (UTF-8).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mbstowcs(pwcs: *mut Wchar, s: *const c_char, n: usize) -> usize {
     if s.is_null() {
         return usize::MAX;
     }
-    // SAFETY: walk multi-byte (treated as single-byte ASCII).
-    unsafe {
-        let mut i = 0_usize;
-        loop {
-            let byte = s.add(i).read().cast_unsigned();
-            if byte == 0 {
-                if !pwcs.is_null() && i < n {
-                    pwcs.add(i).write(0);
+    let mut src = s;
+    let mut out = 0_usize;
+    let mut st = super::utf8::MbState::initial();
+    loop {
+        if !pwcs.is_null() && out >= n {
+            return out;
+        }
+        let rem = unsafe { cstr_avail(src) };
+        // SAFETY: `rem` bytes until (and including) the first NUL.
+        let bytes = unsafe { core::slice::from_raw_parts(src.cast::<u8>(), rem) };
+        let (r, wc) = super::utf8::mbrtowc(bytes, &mut st);
+        if r == super::utf8::MB_ILLEGAL || r == super::utf8::MB_INCOMPLETE {
+            return usize::MAX;
+        }
+        if r == 0 {
+            if !pwcs.is_null() && out < n {
+                unsafe {
+                    pwcs.add(out).write(0);
                 }
-                return i;
             }
-            if !pwcs.is_null() {
-                if i >= n {
-                    return i;
-                }
-                pwcs.add(i).write(Wchar::from(byte));
+            return out;
+        }
+        if !pwcs.is_null()
+            && let Some(w) = wc
+        {
+            unsafe {
+                pwcs.add(out).write(w);
             }
-            i = i.saturating_add(1);
+        }
+        src = unsafe { src.add(r) };
+        out = out.saturating_add(1);
+    }
+}
+
+/// Bytes until and including the terminating NUL (at least 1 if `s` is readable).
+unsafe fn cstr_avail(s: *const c_char) -> usize {
+    let mut n = 0_usize;
+    loop {
+        let b = unsafe { s.add(n).read() };
+        n = n.saturating_add(1);
+        if b == 0 {
+            return n;
+        }
+        if n == usize::MAX {
+            return n;
         }
     }
 }
 
-/// C `wcstombs` → nlist `_wcstombs` (ASCII-only).
+/// C `wcstombs` → nlist `_wcstombs` (UTF-8).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn wcstombs(
     out: *mut c_char,
@@ -391,25 +418,36 @@ pub(crate) unsafe extern "C" fn wcstombs(
     if pwcs.is_null() {
         return usize::MAX;
     }
-    unsafe {
-        let mut idx = 0_usize;
-        loop {
-            let wide = pwcs.add(idx).read();
-            if wide == 0 {
-                if !out.is_null() && idx < max {
-                    out.add(idx).write(0);
+    let mut wi = 0_usize;
+    let mut bo = 0_usize;
+    loop {
+        let wide = unsafe { pwcs.add(wi).read() };
+        if wide == 0 {
+            if !out.is_null() && bo < max {
+                unsafe {
+                    out.add(bo).write(0);
                 }
-                return idx;
             }
-            if !out.is_null() {
-                if idx >= max {
-                    return idx;
-                }
-                let byte = u8::try_from(wide.cast_unsigned() & 0xff).unwrap_or(b'?');
-                out.add(idx).write(byte.cast_signed());
-            }
-            idx = idx.saturating_add(1);
+            return bo;
         }
+        let mut buf = [0_u8; 4];
+        let Some(need) = super::utf8::encode(wide, &mut buf) else {
+            return usize::MAX;
+        };
+        if !out.is_null() {
+            if bo.saturating_add(need) > max {
+                return bo;
+            }
+            for i in 0..need {
+                if let Some(&b) = buf.get(i) {
+                    unsafe {
+                        out.add(bo.saturating_add(i)).write(b.cast_signed());
+                    }
+                }
+            }
+        }
+        bo = bo.saturating_add(need);
+        wi = wi.saturating_add(1);
     }
 }
 
@@ -645,6 +683,23 @@ pub(crate) unsafe extern "C" fn wmemcpy(
         // SAFETY: non-overlapping wide regions.
         unsafe {
             let _ = memcpy(dst.cast(), src.cast(), bytes);
+        }
+    }
+    dst
+}
+
+/// C `wmemmove` → nlist `_wmemmove` (zsh `zle` / `zutil`).
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn wmemmove(
+    dst: *mut Wchar,
+    src: *const Wchar,
+    n: usize,
+) -> *mut Wchar {
+    if n > 0 && !dst.is_null() && !src.is_null() {
+        let bytes = n.saturating_mul(core::mem::size_of::<Wchar>());
+        // SAFETY: regions may overlap; `memmove` handles that.
+        unsafe {
+            let _ = memmove(dst.cast(), src.cast(), bytes);
         }
     }
     dst

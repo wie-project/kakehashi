@@ -60,13 +60,91 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
         tracing::warn!(gfd, len, "write fail EFAULT");
         return SyscallResult::err(name, EFAULT);
     }
+    write_slice(name, gfd, host_fd, guest_slice(args.x1, len))
+}
 
-    let slice = guest_slice(args.x1, len);
+/// `writev` — rust std / tokio vectored send (TLS ClientHello, HTTP).
+pub(crate) fn handle_writev(args: SyscallArgs) -> SyscallResult {
+    let name = "writev";
+    let gfd = super::common::reg_as_i32(args.x0);
+    let iovcnt = super::common::reg_as_i32(args.x2);
+    tracing::debug!(gfd, iovcnt, "writev");
+    let Some(host_fd) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if iovcnt < 0 {
+        return SyscallResult::err(name, EFAULT);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::ok(name, 0);
+    }
+    let Ok(n_iov) = usize::try_from(iovcnt) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    // POSIX `IOV_MAX` is 1024; rust tokio uses a handful of slices.
+    if n_iov > 1024 {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let bytes = n_iov.saturating_mul(16);
+    if args.x1 == 0 || !registry_check_range(args.x1, bytes, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let iov = guest_slice(args.x1, bytes);
+    let mut total = 0_u64;
+    for i in 0..n_iov {
+        let off = i.saturating_mul(16);
+        let base = u64::from_le_bytes(
+            iov.get(off..off.saturating_add(8))
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
+        let len = u64::from_le_bytes(
+            iov.get(off.saturating_add(8)..off.saturating_add(16))
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
+        let Ok(n) = usize::try_from(len) else {
+            return SyscallResult::err(name, EFAULT);
+        };
+        if n == 0 {
+            continue;
+        }
+        if n > (1 << 30) || base == 0 || !registry_check_range(base, n, false) {
+            return SyscallResult::err(name, EFAULT);
+        }
+        let r = write_slice(name, gfd, host_fd, guest_slice(base, n));
+        if r.error {
+            if total > 0 && r.retval == Some(DARWIN_EAGAIN.unsigned_abs()) {
+                return SyscallResult::ok(name, total);
+            }
+            return r;
+        }
+        let wrote = r.retval.unwrap_or(0);
+        total = total.saturating_add(wrote);
+        if wrote < len {
+            break;
+        }
+    }
+    SyscallResult::ok(name, total)
+}
+
+fn write_slice(
+    name: &'static str,
+    gfd: i32,
+    host_fd: std::os::fd::RawFd,
+    slice: &[u8],
+) -> SyscallResult {
+    if slice.is_empty() {
+        return SyscallResult::ok(name, 0);
+    }
     // TLS-wrapped guest FD: plaintext app data via rustls (path B freestanding curl).
     if crate::tls_fd::is_tls_fd(gfd) {
         let guest_blocking = !crate::process::fd_guest_nonblock(gfd);
         return match crate::tls_fd::write(gfd, host_fd, slice, guest_blocking) {
-            Ok(n) => SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
+            Ok(n) => {
+                super::net::rearm_kevent_write(gfd);
+                SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
+            }
             Err(e) => {
                 let os = e.raw_os_error().unwrap_or(0);
                 if os == libc::EAGAIN
@@ -88,7 +166,10 @@ pub(crate) fn handle_write(args: SyscallArgs) -> SyscallResult {
     // sets O_NONBLOCK (curl multi) or the pipe drains.
     loop {
         match write_host_fd(host_fd, slice) {
-            Ok(n) => return SyscallResult::ok(name, u64::try_from(n).unwrap_or(0)),
+            Ok(n) => {
+                super::net::rearm_kevent_write(gfd);
+                return SyscallResult::ok(name, u64::try_from(n).unwrap_or(0));
+            }
             Err(e) => {
                 let os = e.raw_os_error().unwrap_or(0);
                 if os == libc::EAGAIN || os == libc::EWOULDBLOCK {
@@ -186,9 +267,84 @@ pub(crate) fn handle_read(args: SyscallArgs) -> SyscallResult {
         return SyscallResult::err(name, EFAULT);
     }
 
+    read_into(name, gfd, host_fd, guest_slice_mut(args.x1, len))
+}
+
+/// `readv`.
+pub(crate) fn handle_readv(args: SyscallArgs) -> SyscallResult {
+    let name = "readv";
+    let gfd = super::common::reg_as_i32(args.x0);
+    let iovcnt = super::common::reg_as_i32(args.x2);
+    tracing::debug!(gfd, iovcnt, "readv");
+    let Some(host_fd) = guest_to_host_fd(args.x0) else {
+        return SyscallResult::err(name, EBADF);
+    };
+    if iovcnt < 0 {
+        return SyscallResult::err(name, EFAULT);
+    }
+    if iovcnt == 0 {
+        return SyscallResult::ok(name, 0);
+    }
+    let Ok(n_iov) = usize::try_from(iovcnt) else {
+        return SyscallResult::err(name, EFAULT);
+    };
+    if n_iov > 1024 {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let bytes = n_iov.saturating_mul(16);
+    if args.x1 == 0 || !registry_check_range(args.x1, bytes, false) {
+        return SyscallResult::err(name, EFAULT);
+    }
+    let iov = guest_slice(args.x1, bytes).to_vec();
+    let mut total = 0_u64;
+    for i in 0..n_iov {
+        let off = i.saturating_mul(16);
+        let base = u64::from_le_bytes(
+            iov.get(off..off.saturating_add(8))
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
+        let len = u64::from_le_bytes(
+            iov.get(off.saturating_add(8)..off.saturating_add(16))
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0; 8]),
+        );
+        let Ok(n) = usize::try_from(len) else {
+            return SyscallResult::err(name, EFAULT);
+        };
+        if n == 0 {
+            continue;
+        }
+        if n > (1 << 30) || base == 0 || !registry_check_range(base, n, true) {
+            return SyscallResult::err(name, EFAULT);
+        }
+        let r = read_into(name, gfd, host_fd, guest_slice_mut(base, n));
+        if r.error {
+            if total > 0 && r.retval == Some(DARWIN_EAGAIN.unsigned_abs()) {
+                return SyscallResult::ok(name, total);
+            }
+            return r;
+        }
+        let got = r.retval.unwrap_or(0);
+        total = total.saturating_add(got);
+        if got < len || got == 0 {
+            break;
+        }
+    }
+    SyscallResult::ok(name, total)
+}
+
+fn read_into(
+    name: &'static str,
+    gfd: i32,
+    host_fd: std::os::fd::RawFd,
+    buf: &mut [u8],
+) -> SyscallResult {
+    if buf.is_empty() {
+        return SyscallResult::ok(name, 0);
+    }
     // Read straight into guest memory (identity map) — no intermediate heap
     // buffer. Double-copy + `Vec` was a major cost on multi‑MiB archive I/O.
-    let buf = guest_slice_mut(args.x1, len);
     // TLS-wrapped guest FD: plaintext from rustls (path B freestanding curl).
     if crate::tls_fd::is_tls_fd(gfd) {
         let guest_blocking = !crate::process::fd_guest_nonblock(gfd);

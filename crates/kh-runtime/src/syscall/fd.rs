@@ -22,6 +22,8 @@ const F_GETFD: i32 = 1;
 const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
+/// Darwin `F_DUPFD_CLOEXEC` (same as `F_DUPFD` + `FD_CLOEXEC`).
+const F_DUPFD_CLOEXEC: i32 = 67;
 /// Darwin `F_GETPATH` — write path of `fd` into `arg` buffer (`MAXPATHLEN`).
 const F_GETPATH: i32 = 50;
 /// Darwin `MAXPATHLEN` / `PATH_MAX` for `F_GETPATH` buffer.
@@ -475,11 +477,23 @@ pub(crate) fn handle_fcntl(args: SyscallArgs) -> SyscallResult {
                 None => SyscallResult::err(name, EBADF),
             }
         }
-        F_DUPFD => {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
             let Some(rc) = host::fcntl_set(h, libc::F_DUPFD, arg.max(0)) else {
                 return SyscallResult::err(name, EBADF);
             };
-            finish_open(name, rc)
+            if cmd == F_DUPFD_CLOEXEC {
+                let flags = host::fcntl_get(rc, libc::F_GETFD).unwrap_or(0);
+                let _ = host::fcntl_set(rc, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+            let old = reg_as_i32(args.x0);
+            let nb = process::fd_guest_nonblock(old);
+            let r = finish_open(name, rc);
+            if !r.error
+                && let Some(gfd) = r.retval.and_then(|v| i32::try_from(v).ok())
+            {
+                process::fd_set_guest_nonblock(gfd, nb);
+            }
+            r
         }
         F_GETPATH => {
             // G5: modern `ld` / tapi call `fcntl(fd, F_GETPATH, buf)` after open.

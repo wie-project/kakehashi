@@ -575,6 +575,8 @@ const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
+const EV_CLEAR: u16 = 0x0020;
+const EV_RECEIPT: u16 = 0x0040;
 const EV_EOF: u16 = 0x8000;
 const EV_ERROR: u16 = 0x4000;
 const POLLIN: i16 = 0x0001;
@@ -621,9 +623,38 @@ fn kq_unlock() {
     KQ_LOCK.store(false, core::sync::atomic::Ordering::Release);
 }
 
-/// C `kevent` — apply changelist, then `poll` registered fds (rust std connect).
+/// C `kevent` — host table (mio / rustup). Guest copy of the watch list was
+/// racing the I/O thread and never delivered a token rust would write on.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn kevent(
+    kq: c_int,
+    changelist: *const c_void,
+    nchanges: c_int,
+    eventlist: *mut c_void,
+    nevents: c_int,
+    timeout: *const c_void,
+) -> c_int {
+    let ret = unsafe {
+        crate::kh_core::sys::syscall6(
+            crate::kh_core::sys::SYS_KEVENT,
+            u64::from(kq.cast_unsigned()),
+            u64::try_from(changelist.addr()).unwrap_or(0),
+            u64::from(nchanges.cast_unsigned()),
+            u64::try_from(eventlist.addr()).unwrap_or(0),
+            u64::from(nevents.cast_unsigned()),
+            u64::try_from(timeout.addr()).unwrap_or(0),
+        )
+    };
+    if ret < 0 {
+        crate::kh_core::errno::set_errno(i32::try_from(ret.saturating_neg()).unwrap_or(1));
+        return -1;
+    }
+    c_int::try_from(ret).unwrap_or(c_int::MAX)
+}
+
+/// Legacy in-process kevent (kept for reference / unused).
+#[allow(dead_code)]
+unsafe fn kevent_local(
     _kq: c_int,
     changelist: *const c_void,
     nchanges: c_int,
@@ -632,11 +663,30 @@ pub(crate) unsafe extern "C" fn kevent(
     timeout: *const c_void,
 ) -> c_int {
     kq_lock();
+    let mut receipt_n = 0_usize;
+    let max_out = usize::try_from(nevents).unwrap_or(0);
     if nchanges > 0 && !changelist.is_null() {
         let n = usize::try_from(nchanges).unwrap_or(0);
+        let want_receipt = !eventlist.is_null() && max_out > 0;
         for i in 0..n {
             let ev = unsafe { changelist.cast::<u8>().add(i.saturating_mul(KEV_SIZE)) };
+            let flags = read_u16(ev, 10);
             apply_kevent_change(ev);
+            // Darwin EV_RECEIPT: return the change immediately (EV_ERROR+data=0).
+            // mio register uses this with a NULL timeout and must not wait on I/O.
+            if want_receipt && flags & EV_RECEIPT != 0 && receipt_n < max_out {
+                let ident = usize::try_from(read_u64(ev, 0)).unwrap_or(0);
+                let filter = read_i16(ev, 8);
+                let fflags = read_u32(ev, 12);
+                let udata = read_u64(ev, 24);
+                let dst = unsafe { eventlist.cast::<u8>().add(receipt_n.saturating_mul(KEV_SIZE)) };
+                write_kevent(dst, ident, filter, EV_ERROR, fflags, 0, udata);
+                receipt_n = receipt_n.saturating_add(1);
+            }
+        }
+        if receipt_n > 0 {
+            kq_unlock();
+            return c_int::try_from(receipt_n).unwrap_or(0);
         }
     }
     if nevents <= 0 || eventlist.is_null() {
@@ -715,7 +765,8 @@ pub(crate) unsafe extern "C" fn kevent(
         }) else {
             continue;
         };
-        let mut ev_flags = flags;
+        // Returned I/O events are not changelist receipts: drop EV_ADD / EV_RECEIPT.
+        let mut ev_flags = flags & EV_CLEAR;
         if rev & (POLLERR | POLLHUP) != 0 {
             ev_flags |= EV_EOF;
             if rev & POLLERR != 0 {

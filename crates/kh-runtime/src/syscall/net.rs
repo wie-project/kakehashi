@@ -1185,6 +1185,463 @@ pub(crate) fn handle_poll(args: SyscallArgs) -> SyscallResult {
     }
 }
 
+/// Darwin `kevent` — `x0` kq, `x1` changelist, `x2` nchanges, `x3` eventlist,
+/// `x4` nevents, `x5` timespec* (NULL = wait forever).
+///
+/// Host-owned watch table so mio tokens survive a `dup`'d kqueue and the
+/// I/O thread can actually see WRITE with a non-zero `udata`.
+pub(crate) fn handle_kevent(args: SyscallArgs) -> SyscallResult {
+    let name = "kevent";
+    let nchanges = reg_as_i32(args.x2);
+    let nevents = reg_as_i32(args.x4);
+    let changelist = args.x1;
+    let eventlist = args.x3;
+    let timeout_va = args.x5;
+    if nchanges < 0 || nevents < 0 {
+        return SyscallResult::err(name, EINVAL);
+    }
+
+    let mut receipts = 0_usize;
+    let max_out = usize::try_from(nevents).unwrap_or(0);
+    if nchanges > 0 {
+        let n = usize::try_from(nchanges).unwrap_or(0);
+        let bytes = n.saturating_mul(KEV_SIZE);
+        if changelist == 0 || !registry_check_range(changelist, bytes, false) {
+            return SyscallResult::err(name, EFAULT);
+        }
+        let raw = guest_slice(changelist, bytes);
+        for i in 0..n {
+            let off = i.saturating_mul(KEV_SIZE);
+            let ev = raw.get(off..off.saturating_add(KEV_SIZE)).unwrap_or(&[]);
+            let ident = read_kev_u64(ev, 0);
+            let filter = read_kev_i16(ev, 8);
+            let flags = read_kev_u16(ev, 10);
+            let fflags = read_kev_u32(ev, 12);
+            let udata = read_kev_u64(ev, 24);
+            if apply_host_kevent(ident, filter, flags, fflags, udata) {
+                poke_kq_wake();
+            }
+            let slot = kev_slot(eventlist, receipts);
+            if flags & EV_RECEIPT != 0
+                && eventlist != 0
+                && receipts < max_out
+                && registry_check_range(slot, KEV_SIZE, true)
+            {
+                write_host_kevent(slot, ident, filter, EV_ERROR, fflags, 0, udata);
+                receipts = receipts.saturating_add(1);
+            }
+            net_log(&format!(
+                "kevent ch ident={ident} filt={filter} fl={flags:#x} ff={fflags:#x} udata={udata:#x}"
+            ));
+        }
+        if receipts > 0 {
+            net_log(&format!("kevent receipts={receipts}"));
+            return SyscallResult::ok(name, u64::try_from(receipts).unwrap_or(0));
+        }
+    }
+
+    if nevents == 0 || eventlist == 0 {
+        return SyscallResult::ok(name, 0);
+    }
+
+    let timeout_ms = timespec_va_to_ms(timeout_va);
+    match wait_host_kevent(eventlist, max_out, timeout_ms) {
+        Ok(n) => {
+            net_log(&format!("kevent -> n={n}"));
+            SyscallResult::ok(name, u64::try_from(n).unwrap_or(0))
+        }
+        Err(e) => SyscallResult::err(name, host_errno_to_darwin(e)),
+    }
+}
+
+const KEV_SIZE: usize = 32;
+const EVFILT_READ: i16 = -1;
+const EVFILT_WRITE: i16 = -2;
+const EVFILT_USER: i16 = -10;
+const EV_ADD: u16 = 0x0001;
+const EV_DELETE: u16 = 0x0002;
+const EV_CLEAR: u16 = 0x0020;
+const EV_RECEIPT: u16 = 0x0040;
+const EV_EOF: u16 = 0x8000;
+const EV_ERROR: u16 = 0x4000;
+const NOTE_TRIGGER: u32 = 0x0100_0000;
+
+const W_LIVE: u8 = 1;
+const W_ARMED: u8 = 2;
+const W_TRIGGERED: u8 = 4;
+
+#[derive(Clone, Copy)]
+struct HostKqWatch {
+    bits: u8,
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    udata: u64,
+}
+
+impl HostKqWatch {
+    fn live(self) -> bool {
+        self.bits & W_LIVE != 0
+    }
+    fn armed(self) -> bool {
+        self.bits & W_ARMED != 0
+    }
+    fn triggered(self) -> bool {
+        self.bits & W_TRIGGERED != 0
+    }
+    fn set(&mut self, mask: u8, on: bool) {
+        if on {
+            self.bits |= mask;
+        } else {
+            self.bits &= !mask;
+        }
+    }
+}
+
+fn new_watch(ident: u64, filter: i16, flags: u16, fflags: u32, udata: u64, triggered: bool) -> HostKqWatch {
+    let mut bits = W_LIVE | W_ARMED;
+    if triggered {
+        bits |= W_TRIGGERED;
+    }
+    HostKqWatch {
+        bits,
+        ident,
+        filter,
+        flags,
+        fflags,
+        udata,
+    }
+}
+
+static HOST_KQ: std::sync::Mutex<Vec<HostKqWatch>> = std::sync::Mutex::new(Vec::new());
+
+fn host_kq_lock() -> std::sync::MutexGuard<'static, Vec<HostKqWatch>> {
+    HOST_KQ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Host pipe that unblocks a parked `kevent` wait when `NOTE_TRIGGER` arrives
+/// on another thread (tokio `Handle::unpark` / `wake_arc_raw`).
+fn kq_wake_fds() -> Option<(i32, i32)> {
+    static PIPE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *PIPE.get_or_init(host::pipe_fds)
+}
+
+fn poke_kq_wake() {
+    if let Some((_, w)) = kq_wake_fds() {
+        drop(host::write_fd(w, &[1_u8]));
+    }
+}
+
+fn drain_kq_wake(rfd: i32) {
+    let mut buf = [0_u8; 32];
+    while matches!(host::read_fd(rfd, &mut buf), Ok(n) if n > 0) {}
+}
+
+/// Returns true if a waiter must be woken (`NOTE_TRIGGER`).
+fn apply_host_kevent(ident: u64, filter: i16, flags: u16, fflags: u32, udata: u64) -> bool {
+    let trigger = filter == EVFILT_USER && fflags & NOTE_TRIGGER != 0;
+    let mut g = host_kq_lock();
+    if flags & EV_DELETE != 0 {
+        for w in g.iter_mut() {
+            if w.live() && w.ident == ident && w.filter == filter {
+                w.set(W_LIVE | W_TRIGGERED, false);
+            }
+        }
+        return false;
+    }
+    if flags & EV_ADD != 0 {
+        if let Some(w) = g
+            .iter_mut()
+            .find(|w| w.live() && w.ident == ident && w.filter == filter)
+        {
+            // A later `EV_ADD|NOTE_TRIGGER` is a poke: keep the original
+            // `udata`/`EV_CLEAR` from `Driver::new` (rustup ident=0, udata=0).
+            if !trigger {
+                w.flags = flags;
+                w.fflags = fflags;
+                w.udata = udata;
+            }
+            w.set(W_ARMED, true);
+            if trigger {
+                w.set(W_TRIGGERED, true);
+            }
+            return trigger;
+        }
+        if let Some(w) = g.iter_mut().find(|w| !w.live()) {
+            *w = new_watch(ident, filter, flags, fflags & !NOTE_TRIGGER, udata, trigger);
+            return trigger;
+        }
+        g.push(new_watch(
+            ident,
+            filter,
+            flags,
+            fflags & !NOTE_TRIGGER,
+            udata,
+            trigger,
+        ));
+        return trigger;
+    }
+    if trigger {
+        for w in g.iter_mut() {
+            if w.live() && w.ident == ident && w.filter == EVFILT_USER {
+                w.set(W_TRIGGERED, true);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn snapshot_rw_watches() -> Vec<HostKqWatch> {
+    host_kq_lock()
+        .iter()
+        .copied()
+        .filter(|w| {
+            w.live() && w.armed() && (w.filter == EVFILT_READ || w.filter == EVFILT_WRITE)
+        })
+        .collect()
+}
+
+fn has_user_watch() -> bool {
+    host_kq_lock()
+        .iter()
+        .any(|w| w.live() && w.filter == EVFILT_USER)
+}
+
+fn take_triggered_user() -> Vec<HostKqWatch> {
+    let mut out = Vec::new();
+    for w in host_kq_lock().iter_mut() {
+        if w.live() && w.filter == EVFILT_USER && w.triggered() {
+            out.push(*w);
+            if w.flags & EV_CLEAR != 0 {
+                w.set(W_TRIGGERED, false);
+            }
+        }
+    }
+    out
+}
+
+fn wait_host_kevent(eventlist: u64, max_out: usize, timeout_ms: i32) -> Result<usize, i32> {
+    let snaps = snapshot_rw_watches();
+    let user_live = has_user_watch();
+    let user_ready = host_kq_lock()
+        .iter()
+        .any(|w| w.live() && w.filter == EVFILT_USER && w.triggered());
+    let wake = kq_wake_fds();
+
+    if snaps.is_empty() && !user_live {
+        // No interest at all — do not sleep forever (empty kq hung rustup).
+        return Ok(0);
+    }
+
+    let mut host_fds = Vec::with_capacity(snaps.len().saturating_add(1));
+    for w in &snaps {
+        let gfd = i32::try_from(w.ident).unwrap_or(-1);
+        let hfd = guest_to_host_fd(u64::from(gfd.cast_unsigned())).unwrap_or(-1);
+        let events = if w.filter == EVFILT_WRITE {
+            libc::POLLOUT
+        } else {
+            libc::POLLIN
+        };
+        host_fds.push(libc::pollfd {
+            fd: hfd,
+            events,
+            revents: 0,
+        });
+    }
+    let wake_idx = if user_live {
+        if let Some((rfd, _)) = wake {
+            host_fds.push(libc::pollfd {
+                fd: rfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            Some(host_fds.len().saturating_sub(1))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let wait_ms = if user_ready { 0 } else { timeout_ms };
+    if host_fds.is_empty() {
+        return Ok(0);
+    }
+    let nready = host::poll(&mut host_fds, wait_ms)?;
+    if let Some(i) = wake_idx
+        && let Some(h) = host_fds.get(i)
+        && h.revents != 0
+        && let Some((rfd, _)) = wake
+    {
+        drain_kq_wake(rfd);
+    }
+
+    let mut out_n = 0_usize;
+    for w in take_triggered_user() {
+        if out_n >= max_out {
+            break;
+        }
+        let slot = kev_slot(eventlist, out_n);
+        if !registry_check_range(slot, KEV_SIZE, true) {
+            break;
+        }
+        let ev_flags = w.flags & EV_CLEAR;
+        write_host_kevent(slot, w.ident, w.filter, ev_flags, NOTE_TRIGGER, 0, w.udata);
+        net_log(&format!(
+            "kevent out ident={} filt={} fl={:#x} data=0 udata={:#x}",
+            w.ident, w.filter, ev_flags, w.udata
+        ));
+        out_n = out_n.saturating_add(1);
+    }
+
+    if nready == 0 && out_n == 0 {
+        return Ok(0);
+    }
+
+    for (i, h) in host_fds.iter().enumerate() {
+        if out_n >= max_out || h.revents == 0 {
+            continue;
+        }
+        if wake_idx == Some(i) {
+            continue;
+        }
+        let Some(w) = snaps.get(i) else {
+            continue;
+        };
+        let mut ev_flags = w.flags & EV_CLEAR;
+        if h.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            ev_flags |= EV_EOF;
+            if h.revents & libc::POLLERR != 0 {
+                ev_flags |= EV_ERROR;
+            }
+        }
+        let data = if h.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            0_i64
+        } else if w.filter == EVFILT_WRITE {
+            65_536
+        } else {
+            1
+        };
+        let slot = kev_slot(eventlist, out_n);
+        if !registry_check_range(slot, KEV_SIZE, true) {
+            break;
+        }
+        write_host_kevent(slot, w.ident, w.filter, ev_flags, w.fflags, data, w.udata);
+        disarm_watch(w.ident, w.filter);
+        net_log(&format!(
+            "kevent out ident={} filt={} fl={:#x} data={data} udata={:#x}",
+            w.ident, w.filter, ev_flags, w.udata
+        ));
+        out_n = out_n.saturating_add(1);
+    }
+    Ok(out_n)
+}
+
+/// After a guest `write`/`send`, EV_CLEAR WRITE can fire again (send buffer).
+pub(crate) fn rearm_kevent_write(gfd: i32) {
+    let ident = u64::from(gfd.cast_unsigned());
+    let mut g = HOST_KQ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for w in g.iter_mut() {
+        if w.live() && w.ident == ident && w.filter == EVFILT_WRITE {
+            w.set(W_ARMED, true);
+        }
+    }
+}
+
+fn disarm_watch(ident: u64, filter: i16) {
+    let mut g = HOST_KQ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for w in g.iter_mut() {
+        if w.live() && w.ident == ident && w.filter == filter && w.flags & EV_CLEAR != 0 {
+            w.set(W_ARMED, false);
+        }
+    }
+}
+
+fn timespec_va_to_ms(va: u64) -> i32 {
+    if va == 0 || !registry_check_range(va, 16, false) {
+        return -1;
+    }
+    let raw = guest_slice(va, 16);
+    let sec = i64::from_le_bytes(
+        raw.get(..8)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 8]),
+    );
+    let nsec = i64::from_le_bytes(
+        raw.get(8..16)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0; 8]),
+    );
+    let ms = sec
+        .saturating_mul(1000)
+        .saturating_add(nsec.saturating_div(1_000_000));
+    if ms <= 0 {
+        0
+    } else {
+        i32::try_from(ms).unwrap_or(i32::MAX)
+    }
+}
+
+fn kev_slot(eventlist: u64, index: usize) -> u64 {
+    let off = u64::try_from(index.saturating_mul(KEV_SIZE)).unwrap_or(0);
+    eventlist.wrapping_add(off)
+}
+
+fn write_host_kevent(
+    dst: u64,
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: i64,
+    udata: u64,
+) {
+    let mut buf = [0_u8; KEV_SIZE];
+    copy_at(&mut buf, 0, &ident.to_le_bytes());
+    copy_at(&mut buf, 8, &filter.to_le_bytes());
+    copy_at(&mut buf, 10, &flags.to_le_bytes());
+    copy_at(&mut buf, 12, &fflags.to_le_bytes());
+    copy_at(&mut buf, 16, &data.to_le_bytes());
+    copy_at(&mut buf, 24, &udata.to_le_bytes());
+    guest_write(dst, &buf);
+}
+
+fn copy_at(buf: &mut [u8], off: usize, src: &[u8]) {
+    if let Some(dst) = buf.get_mut(off..off.saturating_add(src.len())) {
+        dst.copy_from_slice(src);
+    }
+}
+
+fn read_kev_u64(ev: &[u8], off: usize) -> u64 {
+    ev.get(off..off.saturating_add(8))
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
+fn read_kev_u32(ev: &[u8], off: usize) -> u32 {
+    ev.get(off..off.saturating_add(4))
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u32::from_le_bytes)
+}
+
+fn read_kev_u16(ev: &[u8], off: usize) -> u16 {
+    ev.get(off..off.saturating_add(2))
+        .and_then(|s| s.try_into().ok())
+        .map_or(0, u16::from_le_bytes)
+}
+
+fn read_kev_i16(ev: &[u8], off: usize) -> i16 {
+    i16::from_le_bytes(read_kev_u16(ev, off).to_le_bytes())
+}
+
 /// Minimal `select` via `poll` (guest FDs are not host FDs).
 pub(crate) fn handle_select(args: SyscallArgs) -> SyscallResult {
     let name = "select";

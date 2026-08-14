@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// High non-null handle base so guest pointers never look like small integers.
 /// (`0x4B48` = "KH"; low 16 bits hold 1-based image index.)
@@ -35,8 +36,23 @@ struct ImageEntry {
 
 static TABLE: Mutex<Vec<ImageEntry>> = Mutex::new(Vec::new());
 
+/// When set, `dlsym` of executable VAs is signed IA / disc 0 (arm64e `braaz`).
+static DLSYM_SIGN_IA: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable IA signing of `dlsym` function results for this guest run.
+pub fn set_dlsym_sign_ia(on: bool) {
+    DLSYM_SIGN_IA.store(on, Ordering::Release);
+}
+
+/// True when this guest's main image is arm64e (`dlsym` must return PAC'd FPs).
+#[must_use]
+pub fn dlsym_sign_ia() -> bool {
+    DLSYM_SIGN_IA.load(Ordering::Acquire)
+}
+
 /// Drop all registered images (start of each `kh run`).
 pub fn clear() {
+    DLSYM_SIGN_IA.store(false, Ordering::Release);
     if let Ok(mut g) = TABLE.lock() {
         g.clear();
     }
@@ -241,5 +257,13 @@ mod tests {
         assert!(handle_basename_is(h, "libLTO.dylib"));
         assert!(!handle_basename_is(h, "libc++.1.dylib"));
         clear();
+    }
+
+    #[test]
+    fn dlsym_sign_ia_flag_clears_with_table() {
+        set_dlsym_sign_ia(true);
+        assert!(dlsym_sign_ia());
+        clear();
+        assert!(!dlsym_sign_ia());
     }
 }

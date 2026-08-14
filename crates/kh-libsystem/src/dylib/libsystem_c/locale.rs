@@ -1,9 +1,12 @@
-//! Minimal Darwin locale / rune surface for guests that link `_DefaultRuneLocale`.
+//! Darwin locale / rune surface (`_DefaultRuneLocale`, `mbrtowc`, `nl_langinfo`).
 //!
-//! Driven by curl probe G1: `unresolved symbol __DefaultRuneLocale` before any
-//! BSD syscall. ASCII-only; enough for ctype macros and `setlocale("C")` guests.
+//! Default encoding is **UTF-8** (macOS interactive default). ASCII-only "C"
+//! made Apple `zsh`/`zle` treat Cyrillic bytes as non-print (`?<xx>`) and
+//! scramble column width / spaces.
 
 use core::ffi::{c_char, c_int, c_void};
+
+use super::utf8;
 
 /// Cached rune table width (`_CACHED_RUNES` in Darwin `runetype.h`).
 const CACHED_RUNES: usize = 256;
@@ -167,12 +170,13 @@ unsafe impl Sync for RuneLocale {}
 
 const RUNE_MAGIC: [u8; 8] = *b"RuneMagi";
 
-const fn encoding_c() -> [u8; 32] {
+const fn encoding_utf8() -> [u8; 32] {
     let mut e = [0_u8; 32];
-    e[0] = b'N';
-    e[1] = b'O';
-    e[2] = b'N';
-    e[3] = b'E';
+    e[0] = b'U';
+    e[1] = b'T';
+    e[2] = b'F';
+    e[3] = b'-';
+    e[4] = b'8';
     e
 }
 
@@ -181,7 +185,7 @@ const fn encoding_c() -> [u8; 32] {
 #[used]
 static DEFAULT_RUNE_LOCALE: RuneLocale = RuneLocale {
     magic: RUNE_MAGIC,
-    encoding: encoding_c(),
+    encoding: encoding_utf8(),
     sgetrune: core::ptr::null_mut(),
     sputrune: core::ptr::null_mut(),
     invalid_rune: -1,
@@ -216,17 +220,37 @@ const _: () = assert!(core::mem::offset_of!(RuneLocale, runetype) == 0x3c);
 const _: () = assert!(core::mem::offset_of!(RuneLocale, maplower) == 1084);
 const _: () = assert!(core::mem::offset_of!(RuneLocale, runetype_ext) == 3136);
 
-/// Darwin `___maskrune` → nlist `___maskrune` (ctype backend).
-#[unsafe(export_name = "__maskrune")]
-pub(crate) unsafe extern "C" fn __maskrune(c: c_int, f: usize) -> c_int {
+fn rune_bits(c: c_int) -> u32 {
     if c < 0 {
         return 0;
     }
     let idx = usize::try_from(c.cast_unsigned()).unwrap_or(usize::MAX);
-    let Some(bits_u32) = DEFAULT_RUNE_LOCALE.runetype.get(idx).copied() else {
-        return 0;
-    };
-    let bits = usize::try_from(bits_u32).unwrap_or(0);
+    if let Some(bits) = DEFAULT_RUNE_LOCALE.runetype.get(idx).copied() {
+        return bits;
+    }
+    let mut f = 0_u32;
+    if utf8::is_print(c) {
+        f |= CTYPE_R | CTYPE_G;
+    }
+    if utf8::is_alpha(c) {
+        f |= CTYPE_A;
+        if utf8::to_lower(c) != c {
+            f |= CTYPE_U;
+        }
+        if utf8::to_upper(c) != c {
+            f |= CTYPE_L;
+        }
+    }
+    if utf8::is_digit(c) {
+        f |= CTYPE_D | CTYPE_X;
+    }
+    f
+}
+
+/// Darwin `___maskrune` → nlist `___maskrune` (ctype backend).
+#[unsafe(export_name = "__maskrune")]
+pub(crate) unsafe extern "C" fn __maskrune(c: c_int, f: usize) -> c_int {
+    let bits = usize::try_from(rune_bits(c)).unwrap_or(0);
     c_int::from((bits & f) != 0)
 }
 
@@ -238,91 +262,80 @@ pub(crate) unsafe extern "C" fn __maskrune(c: c_int, f: usize) -> c_int {
 #[unsafe(no_mangle)]
 #[used]
 #[allow(non_upper_case_globals)]
-pub(crate) static mut __mb_cur_max: c_int = 1;
+pub(crate) static mut __mb_cur_max: c_int = 6;
 
-/// Darwin `___mb_cur_max_l` → nlist `____mb_cur_max_l` (always 1 for "C").
+/// Darwin `___mb_cur_max_l` → nlist `____mb_cur_max_l`.
 #[unsafe(export_name = "___mb_cur_max_l")]
 pub(crate) unsafe extern "C" fn ___mb_cur_max_l(_locale: *mut core::ffi::c_void) -> c_int {
-    1
+    6
 }
 
 /// Darwin `___mb_cur_max` → nlist `____mb_cur_max` (callers that use a fn).
 #[unsafe(export_name = "___mb_cur_max")]
 pub(crate) unsafe extern "C" fn ___mb_cur_max() -> c_int {
-    1
+    6
 }
 
-/// C `mblen` → nlist `_mblen` ("C" locale: one byte per character).
+/// C `mblen` → nlist `_mblen`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mblen(s: *const c_char, n: usize) -> c_int {
-    if s.is_null() {
-        return 0;
-    }
-    if n == 0 {
-        return -1;
-    }
-    // SAFETY: caller provided at least one readable byte when n > 0.
-    i32::from(unsafe { s.read() } != 0)
+    unsafe { mbtowc(core::ptr::null_mut(), s, n) }
 }
 
-/// C `mbtowc` → nlist `_mbtowc` ("C" locale).
+/// C `mbtowc` → nlist `_mbtowc` (UTF-8, non-restartable).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mbtowc(pwc: *mut i32, s: *const c_char, n: usize) -> c_int {
     if s.is_null() {
         return 0;
     }
-    if n == 0 {
+    let r = unsafe { mbrtowc(pwc, s, n, core::ptr::null_mut()) };
+    if r == utf8::MB_ILLEGAL || r == utf8::MB_INCOMPLETE {
         return -1;
     }
-    let b = unsafe { s.read() };
-    if !pwc.is_null() {
-        unsafe {
-            pwc.write(i32::from(b.cast_unsigned()));
-        }
-    }
-    i32::from(b != 0)
+    c_int::try_from(r).unwrap_or(-1)
 }
 
-/// C `wctomb` → nlist `_wctomb` ("C" locale).
+/// C `wctomb` → nlist `_wctomb` (UTF-8).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn wctomb(s: *mut c_char, wc: i32) -> c_int {
     if s.is_null() {
         return 0;
     }
-    if !(0..=0xff).contains(&wc) {
+    let n = unsafe { wcrtomb(s, wc, core::ptr::null_mut()) };
+    if n == utf8::MB_ILLEGAL {
         return -1;
     }
-    let byte = u8::try_from(wc).unwrap_or(0);
-    unsafe {
-        s.write(byte.cast_signed());
-    }
-    i32::from(wc != 0)
+    c_int::try_from(n).unwrap_or(-1)
 }
 
 /// Darwin `wchar_t` for locale conversion (32-bit).
 type Wchar = i32;
 
-/// C `mbrtowc` → nlist `_mbrtowc` ("C" locale).
+/// C `mbrtowc` → nlist `_mbrtowc` (UTF-8, restartable).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn mbrtowc(
     pwc: *mut Wchar,
     s: *const c_char,
     n: usize,
-    _ps: *mut c_void,
+    ps: *mut c_void,
 ) -> usize {
     if s.is_null() {
+        utf8::MbState::initial().store(ps);
         return 0;
     }
-    if n == 0 {
-        return usize::MAX;
-    }
-    let b = unsafe { s.read() };
-    if !pwc.is_null() {
+    let mut st = utf8::MbState::load(ps);
+    // SAFETY: caller guarantees `n` readable bytes at `s`.
+    let bytes = unsafe { core::slice::from_raw_parts(s.cast::<u8>(), n) };
+    let (r, wc) = utf8::mbrtowc(bytes, &mut st);
+    st.store(ps);
+    if let Some(w) = wc
+        && !pwc.is_null()
+    {
         unsafe {
-            pwc.write(i32::from(b.cast_unsigned()));
+            pwc.write(w);
         }
     }
-    usize::from(b != 0)
+    r
 }
 
 /// C `mbrlen` → nlist `_mbrlen`.
@@ -346,13 +359,10 @@ pub(crate) unsafe extern "C" fn mbsinit(ps: *const c_void) -> c_int {
     i32::from(word == 0)
 }
 
-/// C `btowc` → nlist `_btowc`.
+/// C `btowc` → nlist `_btowc` (UTF-8: only 0..=127).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn btowc(c: c_int) -> Wchar {
-    if c == -1 || !(0..=255).contains(&c) {
-        return -1;
-    }
-    c
+    if (0..=127).contains(&c) { c } else { -1 }
 }
 
 /// C `wctob` → nlist `_wctob`.
@@ -361,19 +371,25 @@ pub(crate) unsafe extern "C" fn wctob(c: Wchar) -> c_int {
     if (0..=127).contains(&c) { c } else { -1 }
 }
 
-/// C `wcrtomb` → nlist `_wcrtomb` ("C" locale).
+/// C `wcrtomb` → nlist `_wcrtomb` (UTF-8).
 #[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn wcrtomb(s: *mut c_char, wc: Wchar, _ps: *mut c_void) -> usize {
+pub(crate) unsafe extern "C" fn wcrtomb(s: *mut c_char, wc: Wchar, ps: *mut c_void) -> usize {
+    utf8::MbState::initial().store(ps);
     if s.is_null() {
         return 1;
     }
-    let Some(b) = u8::try_from(wc).ok() else {
-        return usize::MAX;
+    let mut buf = [0_u8; 4];
+    let Some(n) = utf8::encode(wc, &mut buf) else {
+        return utf8::MB_ILLEGAL;
     };
     unsafe {
-        s.write(b.cast_signed());
+        for i in 0..n {
+            if let Some(&b) = buf.get(i) {
+                s.add(i).write(b.cast_signed());
+            }
+        }
     }
-    1
+    n
 }
 
 /// C `mbsrtowcs` → nlist `_mbsrtowcs`.
@@ -382,22 +398,62 @@ pub(crate) unsafe extern "C" fn mbsrtowcs(
     dst: *mut Wchar,
     src: *mut *const c_char,
     len: usize,
-    _ps: *mut c_void,
+    ps: *mut c_void,
 ) -> usize {
     if src.is_null() {
-        return usize::MAX;
+        return utf8::MB_ILLEGAL;
     }
-    let s = unsafe { src.read() };
+    let mut s = unsafe { src.read() };
     if s.is_null() {
         return 0;
     }
-    let n = unsafe { super::string::mbstowcs(dst, s, len) };
-    if !dst.is_null() && n < len {
-        unsafe {
-            src.write(core::ptr::null());
+    let mut out = 0_usize;
+    loop {
+        if !dst.is_null() && out >= len {
+            unsafe {
+                src.write(s);
+            }
+            return out;
+        }
+        let mut wc: Wchar = 0;
+        let avail = unsafe { cstr_avail(s) };
+        let n = unsafe { mbrtowc(core::ptr::from_mut(&mut wc), s, avail, ps) };
+        if n == utf8::MB_ILLEGAL || n == utf8::MB_INCOMPLETE {
+            unsafe {
+                src.write(s);
+            }
+            return utf8::MB_ILLEGAL;
+        }
+        if n == 0 {
+            if !dst.is_null() && out < len {
+                unsafe {
+                    dst.add(out).write(0);
+                }
+            }
+            unsafe {
+                src.write(core::ptr::null());
+            }
+            return out;
+        }
+        if !dst.is_null() {
+            unsafe {
+                dst.add(out).write(wc);
+            }
+        }
+        s = unsafe { s.add(n) };
+        out = out.saturating_add(1);
+    }
+}
+
+unsafe fn cstr_avail(s: *const c_char) -> usize {
+    let mut n = 0_usize;
+    loop {
+        let b = unsafe { s.add(n).read() };
+        n = n.saturating_add(1);
+        if b == 0 || n == usize::MAX {
+            return n;
         }
     }
-    n
 }
 
 // Darwin `nl_item` values from public `<langinfo.h>` / `<_langinfo.h>`.
@@ -427,7 +483,7 @@ const CRNCYSTR: c_int = 56;
 const D_MD_ORDER: c_int = 57;
 
 const EMPTY: &[u8] = b"\0";
-const CODESET_C: &[u8] = b"US-ASCII\0";
+const CODESET_UTF8: &[u8] = b"UTF-8\0";
 const DT_FMT: &[u8] = b"%a %b %e %H:%M:%S %Y\0";
 const DATE_FMT: &[u8] = b"%m/%d/%y\0";
 const TIME_FMT: &[u8] = b"%H:%M:%S\0";
@@ -476,7 +532,7 @@ const ABMONTHS: [&[u8]; 12] = [
 
 fn c_locale_nl(item: c_int) -> &'static [u8] {
     if item == CODESET {
-        return CODESET_C;
+        return CODESET_UTF8;
     }
     if item == D_T_FMT {
         return DT_FMT;
@@ -547,7 +603,7 @@ fn c_locale_nl(item: c_int) -> &'static [u8] {
     EMPTY
 }
 
-/// C `nl_langinfo` → nlist `_nl_langinfo` ("C" locale static strings).
+/// C `nl_langinfo` → nlist `_nl_langinfo` (UTF-8 codeset + POSIX date strings).
 ///
 /// curl hits this after the first network poll (codeset / date formats).
 #[unsafe(no_mangle)]
@@ -679,7 +735,7 @@ pub(crate) unsafe extern "C" fn iswlower(wc: Wchar) -> c_int {
 /// C `iswprint` → nlist `_iswprint`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn iswprint(wc: Wchar) -> c_int {
-    unsafe { __maskrune(wc, usize::try_from(CTYPE_R).unwrap_or(0)) }
+    c_int::from(utf8::is_print(wc))
 }
 
 /// C `iswpunct` → nlist `_iswpunct`.
@@ -709,21 +765,13 @@ pub(crate) unsafe extern "C" fn iswxdigit(wc: Wchar) -> c_int {
 /// C `towlower` → nlist `_towlower`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn towlower(wc: Wchar) -> Wchar {
-    if (i32::from(b'A')..=i32::from(b'Z')).contains(&wc) {
-        wc.wrapping_add(32)
-    } else {
-        wc
-    }
+    utf8::to_lower(wc)
 }
 
 /// C `towupper` → nlist `_towupper`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn towupper(wc: Wchar) -> Wchar {
-    if (i32::from(b'a')..=i32::from(b'z')).contains(&wc) {
-        wc.wrapping_sub(32)
-    } else {
-        wc
-    }
+    utf8::to_upper(wc)
 }
 
 /// C `wctrans` → nlist `_wctrans`.
@@ -760,15 +808,16 @@ pub(crate) unsafe extern "C" fn getwchar() -> Wchar {
 /// C `putwchar` → nlist `_putwchar`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn putwchar(wc: Wchar) -> Wchar {
-    let Ok(b) = u8::try_from(wc) else {
+    let mut buf = [0_u8; 4];
+    let Some(len) = utf8::encode(wc, &mut buf) else {
         return -1;
     };
     let n = unsafe {
         crate::kh_core::sys::syscall3(
             crate::kh_core::sys::SYS_WRITE,
             1,
-            u64::try_from(core::ptr::from_ref(&b).addr()).unwrap_or(0),
-            1,
+            u64::try_from(core::ptr::from_ref(&buf).addr()).unwrap_or(0),
+            u64::try_from(len).unwrap_or(0),
         )
     };
     if n <= 0 { -1 } else { wc }
@@ -807,17 +856,10 @@ pub(crate) unsafe extern "C" fn ungetwc(wc: Wchar, stream: *mut c_void) -> Wchar
     if c < 0 { -1 } else { wc }
 }
 
-/// C `wcwidth` → nlist `_wcwidth` ("C" locale column width).
+/// C `wcwidth` → nlist `_wcwidth`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn wcwidth(wc: Wchar) -> c_int {
-    if wc == 0 {
-        return 0;
-    }
-    if unsafe { iswprint(wc) } != 0 {
-        1
-    } else {
-        -1
-    }
+    utf8::width(wc)
 }
 
 /// C `wcswidth` → nlist `_wcswidth`.

@@ -41,6 +41,8 @@ pub struct MachOSummary {
     pub is_64: bool,
     /// Little-endian image.
     pub little_endian: bool,
+    /// Thin slice is `CPU_SUBTYPE_ARM64E` (PAC function pointers / `braaz`).
+    pub is_arm64e: bool,
 }
 
 /// One segment from the image.

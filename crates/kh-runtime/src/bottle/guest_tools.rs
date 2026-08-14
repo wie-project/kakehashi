@@ -35,7 +35,7 @@ pub const DARWIN_7ZZ_URL: &str =
 ///
 /// Archive root contains a single `curl` Mach-O. Prefer this over Apple
 /// `/usr/bin/curl` (which needs `libcurl.4.dylib`). Still may link Apple
-/// frameworks for TLS — probe will surface that; see `docs/curl.md`.
+/// frameworks for TLS — probe will surface that; see `docs/utilities.md`.
 pub const DARWIN_CURL_URL: &str = "https://github.com/stunnel/static-curl/releases/download/8.21.0/curl-macos-arm64-8.21.0.tar.xz";
 
 /// Cache object names under `data/cache/downloads/`.
@@ -57,9 +57,9 @@ pub const GUEST_CURL_REL: &str = "usr/local/bin/curl";
 pub enum InstallPackage {
     /// Darwin 7-Zip console (`7zz`).
     SevenZip,
-    /// Darwin `curl` (downloaded arm64 Mach-O; see `docs/curl.md`).
+    /// Darwin `curl` (downloaded arm64 Mach-O; see `docs/utilities.md`).
     Curl,
-    /// Apple Command Line Tools (includes Apple `git`; see `docs/git.md`).
+    /// Apple Command Line Tools (includes Apple `git`; see `docs/utilities.md`).
     XcodeTools,
 }
 

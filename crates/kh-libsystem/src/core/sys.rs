@@ -64,6 +64,10 @@ pub(crate) const SYS_MUNMAP: u32 = 73;
 pub(crate) const SYS_MPROTECT: u32 = 74;
 /// BSD `fsync`.
 pub(crate) const SYS_FSYNC: u32 = 95;
+/// BSD `readv`.
+pub(crate) const SYS_READV: u32 = 120;
+/// BSD `writev`.
+pub(crate) const SYS_WRITEV: u32 = 121;
 /// BSD `gettimeofday`.
 pub(crate) const SYS_GETTIMEOFDAY: u32 = 116;
 /// BSD `rename`.
@@ -136,6 +140,8 @@ pub(crate) const SYS_ACCEPT: u32 = 30;
 pub(crate) const SYS_SELECT: u32 = 93;
 /// BSD `poll`.
 pub(crate) const SYS_POLL: u32 = 230;
+/// BSD `kevent`.
+pub(crate) const SYS_KEVENT: u32 = 363;
 /// BSD `getpeername`.
 pub(crate) const SYS_GETPEERNAME: u32 = 31;
 /// BSD `getsockname`.

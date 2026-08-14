@@ -104,6 +104,12 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     maybe_seed_otool_liblto(&mut session, path, &opts.guest_args);
     // Sub-phases recorded inside `map_process` (map_main / walk_deps / rebase / bind).
     let _ = session.map_process()?;
+    // Remember before `install_trap_handlers` → `reset_run` clears the dyld table.
+    // Late `dlopen` sessions treat the plugin as "main" — do not recompute there.
+    let main_is_arm64e = session.images().first().is_some_and(|img| {
+        img.role == crate::session::ImageRole::Main
+            && img.image.as_ref().is_some_and(|m| m.summary.is_arm64e)
+    });
 
     let slide = session
         .images()
@@ -165,6 +171,10 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         // as a Darwin startup file.
         "BASH_ENV=/dev/null".to_owned(),
         "ENV=/dev/null".to_owned(),
+        // Apple zsh/zle need a UTF-8 codeset (host LANG is not forwarded).
+        "LANG=en_US.UTF-8".to_owned(),
+        "LC_CTYPE=en_US.UTF-8".to_owned(),
+        "TERM=xterm-256color".to_owned(),
     ];
     // Apple clang without a working `xcrun` does not auto-pick
     // `…/SDKs/MacOSX.sdk` (see `clang -v`: only CLT usr/include). Point the
@@ -178,6 +188,13 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
         // `ld` stages `libLTO` under `/tmp/ld-support-*` and re-execs with
         // `DYLD_LIBRARY_PATH` set; dropping that var caused an infinite re-exec.
         let keep = k.starts_with("GIT_")
+            || k.starts_with("LC_")
+            || k == "LANG"
+            || k == "LANGUAGE"
+            || k == "TERM"
+            || k == "COLORTERM"
+            || k == "COLUMNS"
+            || k == "LINES"
             || k == "DYLD_LIBRARY_PATH"
             || k == "DYLD_FALLBACK_LIBRARY_PATH"
             || k == "DYLD_FRAMEWORK_PATH"
@@ -293,6 +310,8 @@ pub fn run_micro(path: &Path, opts: &RunOptions) -> Result<RunResult, LoadError>
     // Publish mapped images for freestanding `dlopen`/`dlsym` (e.g. clang's
     // `-lto_library` re-open of already-loaded `@rpath/libLTO.dylib`).
     crate::load_timing::time("dyld_table", || register_dyld_images(&session));
+    // After trap install / `reset_run` (which clears the dyld table + this flag).
+    kh_runtime::dyld_set_dlsym_sign_ia(main_is_arm64e);
 
     // Dump load phases before guest entry (guest may noreturn via `_exit`).
     crate::load_timing::dump("pre-entry");

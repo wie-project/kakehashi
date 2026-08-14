@@ -2177,15 +2177,18 @@ pub(crate) unsafe extern "C" fn __darwin_check_fd_set_overflow(
     0
 }
 
-/// C `setlocale` → nlist `_setlocale` (always "C").
+/// C `setlocale` → nlist `_setlocale`.
+///
+/// Always reports a UTF-8 locale (macOS interactive default). Returning `"C"`
+/// made Apple `zsh` treat input as US-ASCII (`?<xx>` on Cyrillic, broken spaces).
 ///
 /// tcsh/`csh` call this before walking `_environ`; seed so `environ` is not
 /// NULL (`blk2short(environ)` SEGV).
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn setlocale(_category: c_int, _locale: *const c_char) -> *mut c_char {
-    static mut C_LOCALE: [u8; 2] = *b"C\0";
+    static mut UTF8_LOCALE: [u8; 12] = *b"en_US.UTF-8\0";
     soft_env_seed_defaults();
-    core::ptr::addr_of_mut!(C_LOCALE).cast()
+    core::ptr::addr_of_mut!(UTF8_LOCALE).cast()
 }
 
 // ── Soft process environment (`getenv` / `setenv` / `unsetenv` / `environ`) ─
@@ -2301,6 +2304,9 @@ fn soft_env_seed_defaults() {
         (b"TMPDIR\0".as_slice(), tmp),
         (b"SDKROOT\0".as_slice(), sdkroot.as_slice()),
         (b"DEVELOPER_DIR\0".as_slice(), developer_dir.as_slice()),
+        (b"LANG\0".as_slice(), b"en_US.UTF-8\0".as_slice()),
+        (b"LC_CTYPE\0".as_slice(), b"en_US.UTF-8\0".as_slice()),
+        (b"TERM\0".as_slice(), b"xterm-256color\0".as_slice()),
         (b"BASH_ENV\0".as_slice(), b"/dev/null\0".as_slice()),
         (b"ENV\0".as_slice(), b"/dev/null\0".as_slice()),
     ] {
@@ -2316,6 +2322,16 @@ fn soft_env_seed_defaults() {
     // so dyld would pick the staged `libLTO.dylib`. Without seeding, each nested
     // `kh run` starts with a soft env that lacks DYLD_* → infinite re-exec (P1).
     soft_env_seed_dyld_from_host();
+    soft_env_seed_keys_from_host(&[
+        b"LANG\0",
+        b"LC_ALL\0",
+        b"LC_CTYPE\0",
+        b"LC_MESSAGES\0",
+        b"TERM\0",
+        b"COLORTERM\0",
+        b"COLUMNS\0",
+        b"LINES\0",
+    ]);
     soft_env_rebuild_environ();
 }
 
