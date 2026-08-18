@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> Thank you everyone for supporting the project in the form of stars, but I will no longer be able to maintain the project.
+> Too many things to keep track of, the need to manually transfer macOS binaries, and most importantly, the lack of issues and PRs to understand what interests people — these are the reasons for ending it.
+> I don’t blame anyone, as I understand how hard it is to maintain such a project (which also uses AI in development). If someone is still interested in continuing to support the project through PRs, creating forks, or proposing ideas for new projects (which I don’t have right now) — I’ll be glad.
+> Thanks again for everything.
+
 # Kakehashi
 
 Userspace **macOS ARM64 → Linux aarch64** translation layer. CLI-first, no JIT, no instruction emulator.
